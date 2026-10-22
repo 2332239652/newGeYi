@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Local sensitive configuration
+config.json.local
+*.local
+.env
+.env.*
+
+# Local SQLite databases & backups
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.bak
+*.tmp
+*.log
+导出/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db

@@ -1,0 +1,29 @@
+{
+    "name": "歌伊圣堂",
+    "author": "歌靡",
+    "namespace": "newGeYi",
+    "info": "模块化角色扮演 AI 聊天插件：四层自动记忆 / 多渠道故障转移 / 世界书 / 图片理解 / 表情包",
+    "version": "2.5.0",
+    "svn": 1,
+    "compatible_svn": 190,
+    "priority": 10000,
+    "message_mode": "olivos_string",
+    "support": [
+        {
+            "sdk": "onebot",
+            "platform": "qq",
+            "model": "all"
+        },
+        {
+            "sdk": "all",
+            "platform": "all",
+            "model": "all"
+        }
+    ],
+    "menu_config": [
+        {
+            "title": "歌伊菜单",
+            "event": "newGeYi_Menu_001"
+        }
+    ]
+}
