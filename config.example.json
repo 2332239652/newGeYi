@@ -5,7 +5,9 @@
   "reasoner_model": "gpt-4o",
   "fast_temperature": 0.7,
   "fast_max_tokens": 800,
-  "triggers": ["歌伊"],
+  "triggers": [
+    "歌伊"
+  ],
   "owner_ids": [],
   "private_enabled": false,
   "passive_enabled": true,

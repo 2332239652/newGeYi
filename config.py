@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
     # 实测（歌伊 582 次提炼 + 904 次聊天）分流后比纯中转站便宜 4~10%，
     # 且聊天快 5 倍（1.7s vs 8.6s）。见 _research/final_cost_v2.py。
     #
-    # 分流配置示例（例如聊天走轻量模型、提炼走更强模型）：
+    # 分流配置示例（聊天走官方、提炼走中转站）：
     #   [
     #     {"name": "openai-chat", "kinds": ["chat"], "priority": 1,
     #      "endpoint": "https://api.openai.com/v1/chat/completions",
