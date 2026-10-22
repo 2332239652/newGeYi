@@ -1,4 +1,4 @@
-# newGeYi (歌伊圣堂)
+# newGeYi (歌伊ai）
 
 [![OlivOS Plugin](https://img.shields.io/badge/OlivOS-Plugin-blue.svg)](https://github.com/OlivOS-Team/OlivOS)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
