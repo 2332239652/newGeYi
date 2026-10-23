@@ -604,11 +604,13 @@ class Renderer:
             candidate = re.sub(r'字数\s*[:：][^。！？\n]*[。！？\n]?', '', candidate)
 
             # D. 处理修改重构导致的双重动作拼接（例如 "(草稿)...(定稿)"，提取最后一段真正的最终回复）
-            actions = list(re.finditer(r'([（(][^）)]+[）)][^（(]+)', candidate))
-            if len(actions) >= 2:
-                last_action = actions[-1].group(0).strip()
-                if len(last_action) >= 10:
-                    candidate = last_action
+            # 仅在文本包含草稿/修改等提示词时才裁剪，避免误伤正常的连续动作 RP 描写
+            if re.search(r'(?:草稿|定稿|拟定|修改|重构|思路|思考)', candidate):
+                actions = list(re.finditer(r'([（(][^）)]+[）)][^（(]+)', candidate))
+                if len(actions) >= 2:
+                    last_action = actions[-1].group(0).strip()
+                    if len(last_action) >= 10:
+                        candidate = last_action
 
             # E. 若结尾仍有残余引号草稿粘连，摘掉引号草稿部分
             candidate = re.sub(r'^[“"『「][^”"』」]+[”"』」]\s*', '', candidate)

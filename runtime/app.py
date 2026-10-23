@@ -521,6 +521,7 @@ class Runtime:
                 return
             owner_id = next(iter(self.permissions._owner_set()), '')
             if not owner_id:
+                self.log(2, '点击了菜单，但尚未配置主人 QQ (owner_ids)，无法发送私聊菜单')
                 return
             import OlivOS  # noqa: PLC0415 - 仅菜单事件需要
 

@@ -298,15 +298,18 @@ class ImageContext:
                 return b'', ''
             mime = _guess_mime(ref, resp.headers.get('Content-Type', ''))
             return resp.content or b'', mime
-        # 本地路径（支持 file:/// 协议与常规绝对路径）
+        # 本地路径（支持跨平台 file:/// 协议与常规绝对路径）
         import os
         import urllib.parse
+        import urllib.request
         local = ref
-        if local.startswith('file:///'):
-            local = local[8:]
-        elif local.startswith('file://'):
-            local = local[7:]
-        local = urllib.parse.unquote(local)
+        if local.startswith('file://'):
+            parsed = urllib.parse.urlparse(local)
+            local = urllib.request.url2pathname(parsed.path)
+            if os.name == 'nt' and local.startswith('\\') and len(local) > 2 and local[2] == ':':
+                local = local[1:]
+        else:
+            local = urllib.parse.unquote(local)
         if os.path.isfile(local):
             with open(local, 'rb') as handle:
                 return handle.read(), _guess_mime(local)

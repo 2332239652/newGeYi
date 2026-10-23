@@ -219,6 +219,9 @@ class CommandRouter:
         self.r.prompt_builder.set_role_prompt(role)
         self.r.worldbook.load()
         self.r.renderer.config = self.r.config
+        self.r.permissions.config = self.r.config
+        if getattr(self.r, 'group_profile', None):
+            self.r.group_profile.config = self.r.config
         if self.r.gateway:
             self.r.gateway.reload(self.r.config)
         if getattr(self.r, 'curator', None):
@@ -488,9 +491,14 @@ class CommandRouter:
                 return True
             cfg = self.r.config
             cfg['api_key'] = key
+            if isinstance(cfg.get('providers'), list):
+                for p in cfg['providers']:
+                    if isinstance(p, dict):
+                        p['api_key'] = key
             plugin_config.save_config(cfg)
             self.r.config = plugin_config.load_config()
-            self.r.gateway.config = self.r.config
+            if getattr(self.r, 'gateway', None):
+                self.r.gateway.reload(self.r.config)
             self.r.reply(msg, f'✅ 已设置 API Key（{_mask_key(key)}），立即生效\n数据保存在 data 目录 config.json')
             return True
         if text == '全局被动开':

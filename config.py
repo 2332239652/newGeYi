@@ -331,9 +331,11 @@ def load_config() -> dict:
         # 「改了 config.json 却不生效」这种极难排查的情况
         # （实测踩过：数据目录里只有 geyi.sqlite3，配置却躺在插件目录）。
         legacy = BASE_DIR / 'config.json'
-        if legacy.exists():
+        example = BASE_DIR / 'config.example.json'
+        source = legacy if legacy.exists() else (example if example.exists() else None)
+        if source:
             try:
-                loaded = json.loads(legacy.read_text(encoding='utf-8'))
+                loaded = json.loads(source.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
                     value.update(loaded)
             except (OSError, UnicodeError, json.JSONDecodeError):

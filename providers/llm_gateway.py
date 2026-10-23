@@ -150,7 +150,10 @@ def build_providers(config: dict) -> list[Provider]:
             if not endpoint or not model:
                 logger.warning('渠道 %s 缺少 endpoint 或 model，已跳过', name)
                 continue
-            api_key = str(item.get('api_key') or '').strip() or _env_key_for(name)
+            p_key = str(item.get('api_key') or '').strip()
+            if p_key == 'sk-your-openai-api-key':
+                p_key = ''
+            api_key = p_key or _env_key_for(name) or LLMGateway.resolve_api_key(config)
             extra_body = dict(blocking)
             extra_body.update(item.get('extra_body') if isinstance(item.get('extra_body'), dict) else {})
             protocol = str(item.get('protocol') or '').strip().lower()
@@ -549,6 +552,22 @@ class LLMGateway:
             if anthropic_messages and anthropic_messages[0]['role'] == 'assistant':
                 anthropic_messages.insert(0, {'role': 'user', 'content': '...'})
 
+            # Anthropic 严格要求角色交替（user 与 assistant 轮流），合并连续同角色的消息
+            merged_anthropic = []
+            for am in anthropic_messages:
+                if merged_anthropic and merged_anthropic[-1]['role'] == am['role']:
+                    p_cnt = merged_anthropic[-1]['content']
+                    c_cnt = am['content']
+                    if isinstance(p_cnt, list) or isinstance(c_cnt, list):
+                        p_list = p_cnt if isinstance(p_cnt, list) else [{'type': 'text', 'text': str(p_cnt)}]
+                        c_list = c_cnt if isinstance(c_cnt, list) else [{'type': 'text', 'text': str(c_cnt)}]
+                        merged_anthropic[-1]['content'] = p_list + c_list
+                    else:
+                        merged_anthropic[-1]['content'] = f"{p_cnt}\n{c_cnt}"
+                else:
+                    merged_anthropic.append(am)
+            anthropic_messages = merged_anthropic
+
             body = {
                 'model': provider.model,
                 'messages': anthropic_messages,
@@ -774,6 +793,7 @@ class LLMGateway:
                     state.fail_count = 0
                     old = self._current_name
                     self._current_name = provider.name
+                    current_rank = provider.priority
                     self._append_history_locked(old, provider.name, 'probe_recover')
                     self._persist_locked()
                     recovered.append(provider.name)

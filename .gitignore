@@ -9,6 +9,7 @@ venv/
 .venv/
 
 # Local sensitive configuration
+config.json
 config.json.local
 *.local
 .env

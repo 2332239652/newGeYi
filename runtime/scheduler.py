@@ -154,6 +154,13 @@ class SessionScheduler:
                     with self._lock:
                         if state.pending and state.pending[0][0] is msg:
                             state.pending.popleft()
+                    # 被取代的消息也是用户真实说过的话，记入上下文，避免私聊或后续语境断裂
+                    try:
+                        self.runtime.store.add_turn(
+                            msg.session.as_text(), 'user', msg.text, msg.sender_id, msg.sender_name
+                        )
+                    except Exception:
+                        pass
                     continue
                 with self._lock:
                     if not state.pending:
@@ -166,7 +173,9 @@ class SessionScheduler:
                     logger.exception('session %s job failed', key)
         finally:
             with self._lock:
-                if not state.pending:
+                if state.pending:
+                    self._executor.submit(self._drain, key)
+                else:
                     state.worker_active = False
 
     def shutdown(self) -> None:
