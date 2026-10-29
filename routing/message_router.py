@@ -57,6 +57,14 @@ class MessageRouter:
         if msg.sender_is_bot:
             self._debug(msg, False, False, '发送者被判定为机器人账号')
             return
+        # 自我保护静默：她判断这个群待不下去，静默期内不接话、也不主动搭话。
+        # 消息照常进旁观窗口和记忆缓冲（只是在 route 之前就已经写完了），
+        # 所以静默一结束她仍然知道这十分钟里群里发生了什么。
+        session_key = msg.session.as_text()
+        is_resting = getattr(self.r, 'is_resting', None)
+        if callable(is_resting) and is_resting(session_key):
+            self._debug(msg, False, False, '歌伊在本群自我保护静默中')
+            return
         directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text))
         gate = self._gate() if msg.is_group else None
         if gate is not None:

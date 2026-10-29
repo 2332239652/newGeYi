@@ -8,14 +8,14 @@ env/
 venv/
 .venv/
 
-# Local sensitive configuration
+# 本地真实配置（含 API Key / QQ 号），仓库里只放 config.example.json
 config.json
 config.json.local
 *.local
 .env
 .env.*
 
-# Local SQLite databases & backups
+# 运行时数据库、备份与导出
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
@@ -24,6 +24,7 @@ config.json.local
 *.tmp
 *.log
 导出/
+emote-cache/
 
 # IDE & Editor
 .vscode/

@@ -114,7 +114,11 @@ class ImageContext:
 
     # ==================== 记忆 ====================
     def remember(self, msg) -> None:
-        """消息到达时记下它的图（只记来源，等真要用了才下载）。"""
+        """消息到达时记下它的图（只记来源，等真要用了才下载）。
+
+        必须连**发送者**一起记：后来别人说「这张图怎么样」时，图是从别人的消息里
+        回溯出来的，如果只留 ref，提示词里图的归属就会错成当前说话的人。
+        """
         if not self.config.get('image_enabled', True):
             return
         refs = self.extract_refs(getattr(msg, 'raw_text', '') or '')
@@ -123,7 +127,12 @@ class ImageContext:
         session = msg.session.as_text()
         with self._lock:
             bucket = self._recent.setdefault(session, deque(maxlen=RECENT_IMAGE_MESSAGES))
-            bucket.append((str(msg.sender_id or ''), refs, self._clock()))
+            bucket.append((
+                str(msg.sender_id or ''),
+                str(getattr(msg, 'sender_name', '') or ''),
+                refs,
+                self._clock(),
+            ))
             if len(self._recent) > 200:      # 会话太多时清一点，别无限涨
                 self._recent.clear()
                 self._recent[session] = bucket
@@ -132,7 +141,7 @@ class ImageContext:
         """机器人自己发出图片（立绘/表情包）时，也记进最近可视图队列。
 
         这样群友追问「你刚才发的图是什么 / 刚才的立绘好看吗」时，她能像看到群友发的图一样，
-        通过视觉模型看到自己发出的立绘。
+        通过视觉模型看到自己发出的立绘。发送者记为 `assistant`，提示词里会说「你自己发的」。
         """
         if not self.config.get('image_enabled', True):
             return
@@ -141,7 +150,7 @@ class ImageContext:
             return
         with self._lock:
             bucket = self._recent.setdefault(session_key, deque(maxlen=RECENT_IMAGE_MESSAGES))
-            bucket.append(('assistant', refs, self._clock()))
+            bucket.append(('assistant', '歌伊', refs, self._clock()))
             if len(self._recent) > 200:
                 self._recent.clear()
                 self._recent[session_key] = bucket
@@ -175,29 +184,34 @@ class ImageContext:
           ③ @ 了她/叫了她名字，且图是**刚刚**发的（默认 90 秒内）—— 别人甩张图就喊她看。
         窗口本身仍与消息窗口一致（②用的就是它），只是不再无差别地往每条消息上挂。
 
-        返回 {'refs': [...], 'total': N, 'skipped': M}，refs 按时间由近到远。
+        返回 {'items': [...], 'refs': [...], 'total': N, 'skipped': M}：
+        items 里每一项是 {'ref', 'sender_id', 'sender_name', 'ts'}，
+        按时间由近到远；refs 只是 items 的来源列表（向后兼容）。
         """
         if not self.config.get('image_enabled', True):
-            return {'refs': [], 'total': 0, 'skipped': 0}
+            return {'items': [], 'refs': [], 'total': 0, 'skipped': 0}
         limit = max(0, int(self.config.get('image_max_per_turn', 3) or 0))
         if limit == 0:
-            return {'refs': [], 'total': 0, 'skipped': 0}
+            return {'items': [], 'refs': [], 'total': 0, 'skipped': 0}
         window = self._window_seconds(msg)
         now = self._clock()
         with self._lock:
             bucket = list(self._recent.get(msg.session.as_text(), ()))
-        ordered: list[str] = []
+        items: list[dict] = []
         seen: set = set()
 
-        def _add(ref: str) -> None:
+        def _add(ref: str, sender_id: str, sender_name: str, ts: float) -> None:
             if ref and ref not in seen:
                 seen.add(ref)
-                ordered.append(ref)
+                items.append({'ref': ref, 'sender_id': str(sender_id or ''),
+                              'sender_name': str(sender_name or ''), 'ts': float(ts)})
 
         # ① 当前这条自己的图永远算数（它们就是这条消息的内容）
+        cur_sender = str(getattr(msg, 'sender_id', '') or '')
+        cur_name = str(getattr(msg, 'sender_name', '') or '')
         for ref in self.extract_refs(getattr(msg, 'raw_text', '') or ''):
-            _add(ref)
-        if not ordered:
+            _add(ref, cur_sender, cur_name, now)
+        if not items:
             # ②③ 只有「在说图」或「刚被叫到且图很新」才回溯
             fresh = float(self.config.get('image_fresh_seconds', 90) or 0)
             if self._talks_about_image(msg):
@@ -205,14 +219,15 @@ class ImageContext:
             elif getattr(msg, 'mentioned_bot', False) and fresh > 0:
                 reach = fresh
             else:
-                return {'refs': [], 'total': 0, 'skipped': 0}
-            for _owner, refs, ts in reversed(bucket):          # 由近到远
+                return {'items': [], 'refs': [], 'total': 0, 'skipped': 0}
+            for sender_id, sender_name, refs, ts in reversed(bucket):   # 由近到远
                 if (now - ts) > reach:
                     continue
                 for ref in refs:                                # 同一条消息内的多张按原顺序
-                    _add(ref)
-        return {'refs': ordered[:limit], 'total': len(ordered),
-                'skipped': max(0, len(ordered) - limit)}
+                    _add(ref, sender_id, sender_name, ts)
+        kept = items[:limit]
+        return {'items': kept, 'refs': [item['ref'] for item in kept],
+                'total': len(items), 'skipped': max(0, len(items) - limit)}
 
     @staticmethod
     def _talks_about_image(msg) -> bool:
@@ -236,7 +251,9 @@ class ImageContext:
 
     # ==================== 取图 ====================
     def plan_for(self, msg) -> dict:
-        """返回喂给 prompt 的东西：{'urls': [...], 'total': N, 'skipped': M}。
+        """返回喂给 prompt 的东西：{'urls': [...], 'items': [...], 'total': N, 'skipped': M}。
+
+        `items` 与 `urls` 一一对应，带上发送者，调用方据此在正文里写明「图几是谁发的」。
 
         skipped > 0 时调用方要在消息里补一句「还有几张没收到」——
         否则模型会以为对方只发了一张，把「哪张好看」这种问题答错。
@@ -247,9 +264,10 @@ class ImageContext:
         plan = self.collect(msg)
         budget = int(self.config.get('image_total_max_bytes', DEFAULT_TOTAL_MAX_BYTES) or 0)
         urls: list[str] = []
+        items: list[dict] = []
         used = 0
-        for ref in plan['refs']:
-            data_url = self._to_data_url(ref)
+        for item in plan['items']:
+            data_url = self._to_data_url(item['ref'])
             if not data_url:
                 continue                       # 取不到（下载失败/单张过大）＝ 没收到
             size = len(data_url) * 3 // 4      # base64 反推原始字节，粗算即可
@@ -257,8 +275,9 @@ class ImageContext:
                 logger.info('图片总体积超预算，跳过一张（%.0f KB）', size / 1024)
                 continue
             urls.append(data_url)
+            items.append(item)
             used += size
-        return {'urls': urls, 'total': plan['total'],
+        return {'urls': urls, 'items': items, 'total': plan['total'],
                 'skipped': max(0, plan['total'] - len(urls))}
 
     def images_for(self, msg) -> list[str]:
@@ -298,16 +317,16 @@ class ImageContext:
                 return b'', ''
             mime = _guess_mime(ref, resp.headers.get('Content-Type', ''))
             return resp.content or b'', mime
-        # 本地路径（支持跨平台 file:/// 协议与常规绝对路径）
+        # 本地路径（支持 file:/// 协议与常规绝对路径，自动适配 Windows 盘符与 Linux 根路径）
         import os
         import urllib.parse
         import urllib.request
         local = ref
-        if local.startswith('file://'):
+        if local.startswith(('file:///', 'file://')):
             parsed = urllib.parse.urlparse(local)
-            local = urllib.request.url2pathname(parsed.path)
-            if os.name == 'nt' and local.startswith('\\') and len(local) > 2 and local[2] == ':':
-                local = local[1:]
+            local = urllib.request.url2pathname(urllib.parse.unquote(parsed.path))
+            if not local and parsed.netloc:
+                local = urllib.request.url2pathname(urllib.parse.unquote(parsed.netloc))
         else:
             local = urllib.parse.unquote(local)
         if os.path.isfile(local):

@@ -154,13 +154,14 @@ class SessionScheduler:
                     with self._lock:
                         if state.pending and state.pending[0][0] is msg:
                             state.pending.popleft()
-                    # 被取代的消息也是用户真实说过的话，记入上下文，避免私聊或后续语境断裂
-                    try:
-                        self.runtime.store.add_turn(
-                            msg.session.as_text(), 'user', msg.text, msg.sender_id, msg.sender_name
-                        )
-                    except Exception:
-                        pass
+                    # 私聊消息被取代时补写进 SQLite turns，防止私聊上下文永久丢失
+                    if not getattr(msg, 'is_group', True) and hasattr(self.runtime, 'store'):
+                        try:
+                            self.runtime.store.add_turn(
+                                msg.session.as_text(), 'user', msg.text, msg.sender_id, msg.sender_name
+                            )
+                        except Exception:
+                            pass
                     continue
                 with self._lock:
                     if not state.pending:
@@ -174,6 +175,7 @@ class SessionScheduler:
         finally:
             with self._lock:
                 if state.pending:
+                    # 若因异常退出但仍有积压任务，重新提交 worker，杜绝死锁卡死
                     self._executor.submit(self._drain, key)
                 else:
                     state.worker_active = False

@@ -131,6 +131,9 @@ class PromptBuilder:
         self.images = images
         # 立绘表挂在 renderer 上，这里只读它来生成【可用立绘】。允许为空（测试用的最小构造）。
         self.renderer = renderer
+        self.video_context = None
+        self.web_context = None
+        self.voice_manager = None
         self.role_prompt = ''
 
     def set_role_prompt(self, text: str) -> None:
@@ -213,6 +216,50 @@ class PromptBuilder:
             return []
         return [str(turn.get('content') or '') for turn in history if turn.get('role') == 'user']
 
+    def _image_owner_note(self, msg: IncomingMessage, items: list) -> str:
+        """附图归属说明：这几张图分别是谁发的。
+
+        为什么必须有：图片在多模态请求里只能挂在**当前这条 user 消息**上，
+        模型默认会认为「和这条消息一起给的图 = 发消息的人发的」。但回溯出来的图
+        可能来自别人、甚至来自歌伊自己发的立绘——实测她会把小明发的图认成小刚发的。
+
+        全部都是当前发言人自己发的就不加任何说明（自然读法本来就对，省 token）。
+        """
+        if not items:
+            return ''
+        cur_id = str(getattr(msg, 'sender_id', '') or '')
+        cur_label = speaker_label(getattr(msg, 'sender_name', ''), cur_id)
+        now = time.time()
+        parts: list[str] = []
+        mixed = False
+        for index, item in enumerate(items, 1):
+            sender_id = str(item.get('sender_id') or '')
+            if sender_id == 'assistant':
+                parts.append(f'图{index} 是你自己之前发的')
+                mixed = True
+                continue
+            if sender_id and sender_id == cur_id:
+                parts.append(f'图{index} 是 {cur_label} 发的')
+                continue
+            mixed = True
+            age = max(0, int(now - float(item.get('ts') or now)))
+            if age < 60:
+                when = '刚刚'
+            elif age < 3600:
+                when = f'{age // 60} 分钟前'
+            else:
+                when = '更早'
+            parts.append(
+                '图%d 是 %s %s发的' % (
+                    index,
+                    speaker_label(item.get('sender_name') or '某人', sender_id),
+                    when,
+                )
+            )
+        if not mixed:
+            return ''
+        return '（附图来源：' + '；'.join(parts) + '。别把别人的图记成当前说话的这个人发的）'
+
     def build(self, msg: IncomingMessage, is_active: bool = False) -> list[dict]:
         cfg = self.config
         messages: list[dict] = []
@@ -282,6 +329,16 @@ class PromptBuilder:
             except Exception:
                 pass
 
+        # 全网搜索与抓取感知：若当前消息包含查证意图或外部网页链接（通过 web_context 注入）
+        web_ctx = getattr(self, 'web_context', None)
+        if web_ctx is not None and hasattr(web_ctx, 'resolve_for_message'):
+            try:
+                w_brief = web_ctx.resolve_for_message(msg)
+                if w_brief:
+                    system_parts.append(w_brief)
+            except Exception:
+                pass
+
         # 确实注入了资料才加反幻觉条款（没资料时它就是废话，省掉这点 token）
         if len(system_parts) > material_start:
             system_parts.append(ANTI_HALLUCINATION_CLAUSE)
@@ -347,6 +404,15 @@ class PromptBuilder:
             used += len(turn['content'])
         messages.extend(reversed(kept_reversed))
 
+        # 主动语音索求感知：对方明确希望歌伊发语音/说话
+        is_voice_req = False
+        v_mgr = getattr(self, 'voice_manager', None)
+        if v_mgr is not None and getattr(v_mgr, 'enabled', False) and hasattr(v_mgr, 'is_user_requesting_voice'):
+            try:
+                is_voice_req = v_mgr.is_user_requesting_voice(msg.text)
+            except Exception:
+                pass
+
         # 当前消息
         speaker = speaker_label(msg.sender_name, msg.sender_id)
         current = sanitize_user_text(msg.text)
@@ -354,9 +420,16 @@ class PromptBuilder:
             current = f'{speaker}：{current}\n（对方在群里@了你，请回应）'
         elif msg.is_group:
             current = f'{speaker}：{current}'
+
+        if is_voice_req:
+            current += '\n（对方想听你的声音/希望你发语音，请在本轮回复末尾附带 [VOICE:情绪|简短日文] 伴生语音）'
         # 图片理解：图片只能放在 user 消息里（放进 system/assistant 会 400）。
         # 拿不到图（没开、下载失败、太大）就退回纯文本，不影响正常回复。
         if plan['urls']:
+            # 图可能不是当前发言人发的（回溯来的旧图/她自己的立绘），必须在正文里点名
+            note = self._image_owner_note(msg, plan.get('items') or [])
+            if note:
+                current += '\n' + note
             content: list[dict] = [{'type': 'text', 'text': current}]
             content.extend(
                 {'type': 'image_url', 'image_url': {'url': url}} for url in plan['urls']

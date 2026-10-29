@@ -54,8 +54,8 @@ ROLE_PROMPT_PATH = BASE_DIR / 'data' / 'role_prompt.txt'
 
 DEFAULT_CONFIG = {
     'api_key': '',
-    'api_endpoint': 'https://api.openai.com/v1/chat/completions',
-    'api_protocol': 'openai',
+    'api_endpoint': 'http://localhost:8787/v1',
+    'api_protocol': 'anthropic',
     # 厂商专有请求参数，会原样合并进请求体；默认留空只发标准字段。
     # 例：用 DeepSeek 官方时关闭思考模式 {'thinking': {'type': 'disabled'}}
     # ——思考模式先输出思维链、挤占 max_tokens，且此时 temperature 不生效。
@@ -78,21 +78,27 @@ DEFAULT_CONFIG = {
     #
     # 分流配置示例（聊天走官方、提炼走中转站）：
     #   [
-    #     {"name": "openai-chat", "kinds": ["chat"], "priority": 1,
-    #      "endpoint": "https://api.openai.com/v1/chat/completions",
-    #      "model": "gpt-4o-mini", "api_key": "sk-..."},
-    #     {"name": "openai-curate", "kinds": ["memory_curate"], "priority": 1,
-    #      "endpoint": "https://api.openai.com/v1/chat/completions",
-    #      "model": "gpt-4o", "api_key": "sk-..."}
+    #     {"name": "official", "kinds": ["chat"], "priority": 1,
+    #      "endpoint": "https://api.deepseek.com/v1/chat/completions",
+    #      "model": "deepseek-flash", "api_key": "sk-...",
+    #      "extra_body": {"thinking": {"type": "disabled"}}},
+    #     {"name": "relay", "kinds": ["memory_curate"], "priority": 1,
+    #      "endpoint": "https://api.example.com/v1/chat/completions",
+    #      "model": "deepseek-v4.1-flash", "api_key": "sk-...",
+    #      "extra_body": {"reasoning_effort": "low"}}
     #   ]
     # 注意：中转站**关不掉思考**（12 种写法实测全无效），官方可以。
     #      官方的 temperature 在思考模式下无效，关掉思考才生效。
     # providers 留空则退回上面的 api_endpoint / api_key / fast_model 单渠道模式。
     'providers': [],
     'failover': {
-        'fail_threshold': 2,             # 连续失败几次判定该渠道不可用（防抖动）
-        'probe_interval_seconds': 900,   # 后台探测间隔（秒）：15 分钟
+        # 失败 1 次就把当前渠道判死、下一条消息直接走备用渠道。
+        # 之所以敢用 1：/chat 内部本身还对 429/5xx/超时重试过一次（max_retries），
+        # 到这里还失败基本就是渠道真的挂了，让下一条消息再陪它浪费时间没意义。
+        'fail_threshold': 1,             # 连续失败几次判定该渠道不可用（防抖动）
+        'probe_interval_seconds': 300,   # 后台探测间隔（秒）：5 分钟爬一级
         'probe_success_needed': 1,       # 探测成功几次算恢复并切回
+        'probe_repair_per_round': 2,     # 每轮顺手体检几个「挂着不可用标签」的低优先渠道
         'probe_timeout_seconds': 10,     # 单次探测超时
         'notify_owner': True,            # 所有渠道都挂时私聊通知骰主
         'notify_cooldown_seconds': 600,  # 同类通知节流间隔，防刷屏
@@ -107,6 +113,9 @@ DEFAULT_CONFIG = {
     'fast_max_tokens': 8192,
     # 触发词：子串匹配，命中任一即视为「在叫她」。默认给全名和两个常用简称。
     'triggers': ['歌伊'],
+    # 骰主 QQ 号：**通知类功能的唯一收件人**（「所有渠道都挂了」「自我保护静默」）。
+    # 留空 = 这些通知全部发不出去，只在日志里留一条 warning（2026-10 踩过：
+    # 歌伊触发退场、骰主却一条私信都没收到）。也可以改用环境变量 GEYI_OWNER_IDS。
     'owner_ids': [],
     'ignore_sender_ids': [],
     'private_enabled': False,
@@ -142,6 +151,20 @@ DEFAULT_CONFIG = {
     'emote_min_gap_seconds': 180,
     'emote_window_replies': 5,
     'emote_hourly_cap': 6,
+    # ===== 伴生语音（日语原声 · 本地极速TTS对接）=====
+    'voice_enabled': True,
+    'voice_gateway_url': 'http://127.0.0.1:9885/v1/voice/synthesize',
+    'voice_health_url': 'http://127.0.0.1:9885/health',
+    'voice_auth_token': '',
+    'voice_timeout': 10.0,
+    'voice_group_cooldown': 45,       # 单群语音常规冷却秒数（防刷屏）
+    'voice_poke_rate': 0.25,          # 戳一戳触发语音的概率（与表情包联动）
+    'voice_speed': 1.0,
+    # ===== 自我保护静默 =====
+    # 模型遇到谩骂/过当调戏/针对角色人格的侮辱/被连续纠缠时，可以输出 [REST:原因]
+    # 让**当前会话**安静一段时间，并私聊通知骰主。到期自动恢复。
+    'rest_enabled': True,
+    'rest_minutes': 10,
     'reply_audit_enabled': True,
     'reply_audit_fallback': '',
     'incomplete_hold_seconds': 8,
@@ -331,11 +354,9 @@ def load_config() -> dict:
         # 「改了 config.json 却不生效」这种极难排查的情况
         # （实测踩过：数据目录里只有 geyi.sqlite3，配置却躺在插件目录）。
         legacy = BASE_DIR / 'config.json'
-        example = BASE_DIR / 'config.example.json'
-        source = legacy if legacy.exists() else (example if example.exists() else None)
-        if source:
+        if legacy.exists():
             try:
-                loaded = json.loads(source.read_text(encoding='utf-8'))
+                loaded = json.loads(legacy.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
                     value.update(loaded)
             except (OSError, UnicodeError, json.JSONDecodeError):

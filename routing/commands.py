@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import re
+import threading
 import time
 
 from .. import config as plugin_config
@@ -42,7 +44,8 @@ class CommandRouter:
             '[对话] 记住 <内容> | 忘了我',
             '[世界书] 世界书状态',
             '',
-            '[骰主/主人] 渠道状态 | 切换渠道 <名称/序号>',
+            '[骰主/主人] 渠道状态 | 切换渠道 <名称/序号> | 切换渠道 自动',
+            '[骰主/主人] 解除静默（提前结束本群的自我保护静默） | 测试通知',
             '[骰主/主人] 记忆状态 | 导出记忆',
             '[骰主/主人] 全局被动开/关 | 开启/关闭私聊',
             '[骰主/主人] 主动搭话开/关（全局） | 搭话观察 | 搭话影子开/关',
@@ -51,13 +54,14 @@ class CommandRouter:
             '[骰主/主人] 世界书开/关 | 世界书重载',
             '[骰主/主人] 图片理解开/关',
             '[骰主/主人] 表情包状态 | 开启/关闭表情包 | 加载表情包 <路径> | 表情包重载',
+            '[骰主/主人] 语音状态 | 测试语音 [情绪] [日文] | 开启/关闭语音 | 语音重载',
             '',
             '[群管/主人] 本群被动开/关 | 本群主动开/关',
             '[群管/主人] 设置群背景 <文本> | 查看群背景',
             '',
             f'当前渠道: {channel}',
             f'世界书: {wb_state} | 主动搭话: {active_state} | 自动记忆: {memory_state}',
-            f'图片理解: {"开" if cfg.get("image_enabled", True) else "关"}',
+            f'图片理解: {"开" if cfg.get("image_enabled", True) else "关"} | 伴生语音: {"开" if cfg.get("voice_enabled", True) else "关"}',
         ]
         return '\n'.join(lines)
 
@@ -103,6 +107,17 @@ class CommandRouter:
             quota_line = profile.status_text(msg.session.as_text()) if profile else '本群额度: 未启用'
         except Exception:  # noqa: BLE001
             quota_line = '本群额度: 读取失败'
+        # 自我保护静默：她自己在群里退场时最容易被误判成「插件坏了」
+        try:
+            rest = getattr(self.r, 'rest', None)
+            left = rest.remaining(msg.session.as_text()) if rest else 0
+            if left:
+                reason = rest.reason(msg.session.as_text()) or '未说明'
+                rest_line = f'自我保护静默: 本群还剩 {left // 60} 分 {left % 60} 秒（{reason}）'
+            else:
+                rest_line = '自我保护静默: 未触发'
+        except Exception:  # noqa: BLE001
+            rest_line = '自我保护静默: 读取失败'
         return '\n'.join([
             f'--- 歌伊状态 v{plugin_config.PLUGIN_VERSION} ---',
             key_line,
@@ -113,10 +128,43 @@ class CommandRouter:
             f'图片理解: {state["image"]}（群里发图时她能不能看懂）',
             memory_line,
             quota_line,
+            rest_line,
             f'今日调用: {today["calls"]}/{budget} | 今日输出token: {today["output_tokens"]}',
             f'今日主动搭话: {today["active_calls"]} 次',
             f'触发词: {", ".join(cfg.get("triggers", [])) or "歌伊"}',
         ])
+
+    def _cmd_test_notify(self, msg: IncomingMessage) -> str:
+        """骰主自查：私聊通道到底通不通（退场通知、渠道全挂通知都走这条路）。"""
+        notify = getattr(self.r, '_notify_owner', None)
+        if not callable(notify):
+            return '通知模块未初始化'
+        owners = sorted(self.r.permissions._owner_set())
+        ok = notify(
+            '🔔 这是一条测试通知\n'
+            '如果你看到这句话，说明歌伊的骰主私聊通道是通的——'
+            '「自我保护静默」「所有模型渠道都挂了」都会用这条通道通知你。'
+        )
+        who = '、'.join(owners) if owners else '（未配置任何骰主）'
+        if ok:
+            return f'✅ 已尝试私聊 {who}，去私聊窗口看看有没有收到'
+        return (f'❌ 没发出去（收件人：{who}）\n'
+                f'原因看 OlivOS 日志里「通知发不出去」那条；最常见是 config.json 的 '
+                f'owner_ids 是空的，填上你的 QQ 号再「重载设定」')
+
+    def _cmd_clear_rest(self, msg: IncomingMessage) -> str:
+        """提前解除本会话的自我保护静默（骰主专用）。"""
+        rest = getattr(self.r, 'rest', None)
+        if rest is None:
+            return '静默模块未初始化'
+        session_key = msg.session.as_text()
+        left = rest.remaining(session_key)
+        reason = rest.reason(session_key)
+        had = rest.clear(session_key)
+        if not had:
+            return '本会话当前不在静默中'
+        return (f'✅ 已解除本会话的自我保护静默（原本还剩 {left // 60} 分 {left % 60} 秒'
+                f'{"，" + reason if reason else ""}）\n她现在会正常回话了')
 
     def _cmd_channels(self, msg: IncomingMessage) -> str:
         gateway = getattr(self.r, 'gateway', None)
@@ -155,7 +203,9 @@ class CommandRouter:
             return '网关未初始化'
         arg = arg.strip()
         if not arg:
-            return '格式: 切换渠道 <渠道名或序号>（用「渠道状态」查看可用列表）'
+            return ('格式: 切换渠道 <渠道名或序号>\n'
+                    '手动切换会把它设为「锚点」：故障时只在它以下的渠道里找备份，'
+                    '恢复也只回到这里。发「切换渠道 自动」取消锚点。')
         return gateway.switch_to(arg)
 
     def _cmd_usage(self, msg: IncomingMessage) -> str:
@@ -219,9 +269,6 @@ class CommandRouter:
         self.r.prompt_builder.set_role_prompt(role)
         self.r.worldbook.load()
         self.r.renderer.config = self.r.config
-        self.r.permissions.config = self.r.config
-        if getattr(self.r, 'group_profile', None):
-            self.r.group_profile.config = self.r.config
         if self.r.gateway:
             self.r.gateway.reload(self.r.config)
         if getattr(self.r, 'curator', None):
@@ -230,7 +277,11 @@ class CommandRouter:
             self.r.images.config = self.r.config
         if getattr(self.r, 'attention', None):
             self.r.attention.config = self.r.config
-        return '✅ 已重载 配置/角色设定/世界书'
+        if getattr(self.r, 'permissions', None):
+            self.r.permissions.config = self.r.config
+        if getattr(self.r, 'group_profile', None):
+            self.r.group_profile.config = self.r.config
+        return '✅ 已重载 配置/角色设定/世界书/权限/群额度'
 
     def _cmd_trigger_add(self, msg: IncomingMessage, arg: str) -> str:
         arg = arg.strip()
@@ -371,6 +422,74 @@ class CommandRouter:
         bg = self.r.store.get_background(msg.session.as_text())
         return f'本群背景:\n{bg}' if bg else '本群尚未设置背景'
 
+    # ------------- 伴生原声语音 -------------
+    def _cmd_voice_status(self, msg: IncomingMessage) -> str:
+        vm = getattr(self.r, 'voice_manager', None)
+        if vm is None:
+            return '语音子系统未加载'
+        return vm.get_status_report()
+
+    def _cmd_voice_test(self, msg: IncomingMessage, arg: str = '') -> str:
+        vm = getattr(self.r, 'voice_manager', None)
+        if vm is None:
+            return '语音子系统未加载'
+
+        from ..voice.presets import normalize_emotion, get_random_preset
+        parts = arg.strip().split(maxsplit=1)
+        if len(parts) == 0:
+            emotion = "日常"
+            japanese_text = get_random_preset(emotion)
+        elif len(parts) == 1:
+            emotion = normalize_emotion(parts[0])
+            japanese_text = get_random_preset(emotion)
+        else:
+            emotion = normalize_emotion(parts[0])
+            japanese_text = parts[1].strip()
+
+        self.r.reply(msg, f"正在向本地主机请求合成测试语音 [{emotion}|{japanese_text}]…")
+
+        def _worker():
+            group_id = str(msg.session.target_id) if msg.is_group else ""
+            sender_name = msg.sender_name
+            cq, info = vm.client.synthesize(
+                japanese_text,
+                emotion,
+                group_id=group_id,
+                sender_name=sender_name,
+            )
+            b64 = info.get("base64")
+            if not b64 and cq:
+                m = re.search(r'base64://([A-Za-z0-9+/=]+)', cq)
+                if m:
+                    b64 = m.group(1)
+
+            if b64:
+                sess_type = 'group' if msg.is_group else 'private'
+                sent = vm.send_voice_message(sess_type, msg.session.target_id, b64, event=msg.event)
+                if not sent:
+                    self.r.reply(msg, "❌ 语音发送失败（底层驱动未响应）")
+            else:
+                err = info.get('error', '未知错误')
+                self.r.reply(msg, f"❌ 测试语音合成失败: {err}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return ""
+
+    def _cmd_voice_toggle(self, msg: IncomingMessage, enable: bool) -> str:
+        cfg = self.r.config
+        cfg['voice_enabled'] = enable
+        plugin_config.save_config(cfg)
+        self.r.config = plugin_config.load_config()
+        if hasattr(self.r, 'voice_manager'):
+            self.r.voice_manager.reload(self.r.config)
+        return f"✅ 已{'开启' if enable else '关闭'}伴生语音输出"
+
+    def _cmd_voice_reload(self, msg: IncomingMessage) -> str:
+        self.r.config = plugin_config.load_config()
+        if hasattr(self.r, 'voice_manager'):
+            self.r.voice_manager.reload(self.r.config)
+        return "✅ 已重新加载语音配置与预设词库"
+
     # ------------- 分发 -------------
     _OWNER_CMD_EXACT = {
         '全局被动开', '全局被动关', '开启私聊', '关闭私聊',
@@ -379,12 +498,16 @@ class CommandRouter:
         '表情包状态', '表情包重载', '开启表情包', '关闭表情包',
         '主动搭话开', '主动搭话关',
         '图片理解开', '图片理解关',
+        '语音状态', '开启语音', '关闭语音', '语音重载', '测试语音',
+        '.voice status', '.voice test',
         '渠道状态', '记忆状态', '导出记忆', '搭话观察',
+        '解除静默', '解除本群静默', '测试通知', '通知测试',
         '搭话影子开', '搭话影子关',
         '切换模型',
     }
     _OWNER_CMD_PREFIX = (
         '添加触发词 ', '删除触发词 ', '加载立绘 ', '加载表情包 ', '设置key ', '切换渠道 ', '切换模型 ',
+        '测试语音 ', '.voice test ',
     )
 
     @classmethod
@@ -399,11 +522,15 @@ class CommandRouter:
             return False
 
         # B站漫游专属指令互斥拦截：交由附属插件处理，本体直接让出不回复
-        v_ctx = getattr(self.r, 'video_context', None)
-        if v_ctx is not None and hasattr(v_ctx, 'is_wander_command') and v_ctx.is_wander_command(text):
-            return True
-        if any(cmd in text.lower() for cmd in ('.bili', '歌伊刷个视频', '歌伊看个视频', '歌伊看视频', '歌伊随机看个视频', '歌伊去刷b站', '歌伊去刷会儿b站', '歌伊看b站', '歌伊去摸鱼', '歌伊摸鱼')):
-            return True
+        # 核心防误判：如果含有视频链接、卡片或BV号，说明是视频分享，必须由本体回复，不得拦截
+        is_video_share = bool(re.search(r'(?:BV[0-9A-Za-z]{10}|b23\.tv|bilibili\.com)', text, re.I))
+        if not is_video_share:
+            v_ctx = getattr(self.r, 'video_context', None)
+            if v_ctx is not None and hasattr(v_ctx, 'is_wander_command') and v_ctx.is_wander_command(text):
+                return True
+            triggers = ('.bili wander', '歌伊刷个视频', '歌伊看个视频', '歌伊看视频', '歌伊随机看个视频', '歌伊去刷b站', '歌伊去刷会儿b站', '歌伊看b站', '歌伊去摸鱼', '歌伊摸鱼')
+            if any(cmd in text.lower() for cmd in triggers):
+                return True
 
         p = self.r.permissions
         deny = '这个只有骰主或主人能用哦~'
@@ -466,6 +593,12 @@ class CommandRouter:
         if text == '渠道状态':
             self.r.reply(msg, self._cmd_channels(msg))
             return True
+        if text in ('解除静默', '解除本群静默'):
+            self.r.reply(msg, self._cmd_clear_rest(msg))
+            return True
+        if text in ('测试通知', '通知测试'):
+            self.r.reply(msg, self._cmd_test_notify(msg))
+            return True
         if text == '记忆状态':
             self.r.reply(msg, self._cmd_memory_status(msg))
             return True
@@ -491,15 +624,20 @@ class CommandRouter:
                 return True
             cfg = self.r.config
             cfg['api_key'] = key
-            if isinstance(cfg.get('providers'), list):
-                for p in cfg['providers']:
-                    if isinstance(p, dict):
-                        p['api_key'] = key
+            # 同步更新当前正在使用的渠道中的 api_key
+            current_provider_name = getattr(self.r.gateway, 'current_provider_name', None) or getattr(self.r.gateway, '_current_name', None)
+            if 'providers' in cfg and isinstance(cfg['providers'], list):
+                for prov in cfg['providers']:
+                    if isinstance(prov, dict):
+                        if current_provider_name and prov.get('name') == current_provider_name:
+                            prov['api_key'] = key
+                        elif not prov.get('api_key'):
+                            prov['api_key'] = key
             plugin_config.save_config(cfg)
             self.r.config = plugin_config.load_config()
-            if getattr(self.r, 'gateway', None):
+            if self.r.gateway:
                 self.r.gateway.reload(self.r.config)
-            self.r.reply(msg, f'✅ 已设置 API Key（{_mask_key(key)}），立即生效\n数据保存在 data 目录 config.json')
+            self.r.reply(msg, f'✅ 已设置 API Key（{_mask_key(key)}），已重载网关并立即生效\n数据保存在 data 目录 config.json')
             return True
         if text == '全局被动开':
             self.r.reply(msg, self._cmd_global_passive(msg, True))
@@ -562,5 +700,29 @@ class CommandRouter:
             return True
         if text == '图片理解关':
             self.r.reply(msg, self._cmd_image_toggle(msg, False))
+            return True
+        # 伴生原声语音指令
+        if text in ('语音状态', '.voice status'):
+            self.r.reply(msg, self._cmd_voice_status(msg))
+            return True
+        if text in ('测试语音', '.voice test'):
+            res = self._cmd_voice_test(msg, '')
+            if res:
+                self.r.reply(msg, res)
+            return True
+        for prefix in ('测试语音 ', '.voice test '):
+            if text.startswith(prefix):
+                res = self._cmd_voice_test(msg, text[len(prefix):])
+                if res:
+                    self.r.reply(msg, res)
+                return True
+        if text == '开启语音':
+            self.r.reply(msg, self._cmd_voice_toggle(msg, True))
+            return True
+        if text == '关闭语音':
+            self.r.reply(msg, self._cmd_voice_toggle(msg, False))
+            return True
+        if text == '语音重载':
+            self.r.reply(msg, self._cmd_voice_reload(msg))
             return True
         return False

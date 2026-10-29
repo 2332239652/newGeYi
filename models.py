@@ -65,3 +65,6 @@ class RenderedReply:
     text: str
     emote: str = ''
     mention_current_user: bool = False
+    voice_payload: tuple[str, str] | None = None  # (emotion, japanese_text)
+    # 自我保护：模型要求「这个群我先待不下去」，非空即为原因（可能没有正文）
+    rest_reason: str = ''

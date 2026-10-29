@@ -97,7 +97,17 @@ def load_emote_table(paths) -> dict:
 
 OP_TAG_RE = re.compile(r'\[OP:[^\]]*\]')
 CQ_TAG_RE = re.compile(r'\[CQ:[^\]]*\]')
-EMOTE_RE = re.compile(r'\[EMOTE:([^\]]+)\]')
+EMOTE_RE = re.compile(r'[\[【［]\s*(?:EMOTE|emote|发送了表情包|表情包|立绘)\s*[:：]\s*([^\]】］]+)[\]】］]')
+VOICE_TAG_RE = re.compile(
+    r'[\[【［]\s*(?:VOICE|语音|voice)\s*[:：]\s*(?:(?P<emotion>[^|\]】］]+)\s*\|\s*)?(?P<text>[^\]】］]+)[\]】］]',
+    re.I,
+)
+# 自我保护：模型判断「这个群我待不下去」时可以退场。
+# 允许几种写法，防止模型换了个词就整条漏进群里（[REST] 后面没有原因也算触发）。
+REST_TAG_RE = re.compile(
+    r'[\[【［]\s*(?:REST|rest|休息|回避)\s*(?:[:：]\s*)?([^\]】］]*)[\]】］]',
+    re.I,
+)
 # 模型可能写 OP 或 CQ 两种形态的 @，统一归一化
 AT_TAG_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)[^\]]*\]')
 FENCE_RE = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
@@ -145,6 +155,10 @@ AUDIT_RULES = (
                 r'content management policy|content filter|'
                 r'HARM_CATEGORY_|SAFETY_RATING|'
                 r'Request was rejected due to safety policies)'), '上游服务商安全策略拦截报错'),
+    # 模型思考前言漏网：整行只有一个 **粗体标题**（线上实测形如 **My Response**）。
+    # strip_english_preamble 会先尝试把它连同后面的英文计划一起砍掉；
+    # 走到这里说明还有残留，那就整条不发——发出去就是把思考过程发进群。
+    (re.compile(r'(?m)^\s*\*\*[^*\n]{2,80}\*\*\s*$'), '模型思考前言'),
 )
 
 
@@ -169,6 +183,99 @@ def audit_reply(text: str) -> str:
 INNER_MONOLOGUE_RE = re.compile(
     r'[（(]\s*(?:内心|心里|心想|暗想|心理活动|心声|脑内|os|OS|旁白)\s*[:：]?[^）)]*[）)]'
 )
+
+
+# ===== 英文推理前言 =====
+# 线上实测（2026-10-28，Gemini 系走中转站）：模型会把「先写一段英文计划、再给中文台词」
+# 整段吐出来，形如
+#
+#     **My Response**
+#     Okay, so the user thinks I and 伊尔达 are cute... I need to sound cute.
+#     （叉腰气鼓鼓）才不是什么外国歌伊啦！
+#
+# 它既不是 <think> 标签，也不是【…】方括号，原来的规则一条都拦不住。
+# 特征很稳定：开头是纯英文（或 **粗体标题**）的行，回复本体在后面。
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff]')
+_BOLD_LINE_RE = re.compile(r'^\*\*[^*\n]{2,80}\*\*$')
+_LATIN_RE = re.compile(r'[A-Za-z]')
+# 判「这一行是英文写的」：字母够多，且中文字数远少于字母数
+# （不能要求纯 ASCII——“I and 伊尔达”这种夹了人名的英文句也得认出来）
+_REASON_OPENERS_RE = re.compile(
+    r'^\s*(?:Okay|Ok|Alright|So|The user|User |They|He |She |I need|I should|I must'
+    r'|I\'ll|Let me|Now|Given|Since|This is|We |Looking)', re.I)
+
+
+def looks_english_line(line: str) -> bool:
+    """这一行像不像「用英文写的推理」。"""
+    stripped = str(line or '').strip()
+    if not stripped:
+        return False
+    if _BOLD_LINE_RE.match(stripped):
+        return True
+    letters = len(_LATIN_RE.findall(stripped))
+    cjk = len(_CJK_RE.findall(stripped))
+    if letters >= 12 and letters > cjk * 3:
+        return True
+    # 很短的英文导语（"Okay, so..."）也算——它在中文回复里几乎不可能自然出现
+    if letters >= 6 and cjk == 0 and _REASON_OPENERS_RE.match(stripped):
+        return True
+    return False
+
+
+def strip_english_preamble(text: str) -> str:
+    """砍掉回复开头的英文推理前言；整条都是前言时返回空串。
+
+    保守原则：找不到「中文回复本体」就一个字都不动（她偶尔真的会说英文），
+    只有确认后面还有中文台词时才整段砍掉前面。
+    """
+    if not text:
+        return text
+    lines = text.split('\n')
+    first_reply = None
+    for index, line in enumerate(lines):
+        # 「有中文」还不够——英文前言里常夹着人名（"I and 伊尔达 are cute"），
+        # 所以要求这一行有中文**且不像英文**才算回复本体。
+        if _CJK_RE.search(line) and not looks_english_line(line):
+            first_reply = index
+            break
+    if first_reply is not None and first_reply == 0:
+        return text
+    head = lines[:first_reply] if first_reply is not None else lines
+    # 头部只要有一行「既不是英文、也不是粗体标题」，就认为不是前言，不动
+    if any(not looks_english_line(line) for line in head if line.strip()):
+        return text
+    if first_reply is None:
+        # 通篇英文：整条丢弃（发出去就是把思考过程发进群）
+        joined = '\n'.join(lines).strip()
+        if len(joined) >= 60:
+            logger.warning('模型输出整条都是英文推理前言，已丢弃：%r', joined[:120])
+            return ''
+        return text
+    logger.warning('已剥掉英文推理前言 %d 行：%r',
+                   first_reply, '\n'.join(head).strip()[:120])
+    kept = '\n'.join(lines[first_reply:]).strip()
+    # 残留草稿：砍完前言后剩下的还是一大段英文（形如 I'm thinking... something like, "…"），
+    # 说明模型从头到尾就没正经写台词——整条丢弃，绝不发出去。
+    if len(_LATIN_RE.findall(kept)) > 30 and not _CJK_RE.match(kept):
+        logger.warning('砍掉前言后仍是英文草稿，整条丢弃：%r', kept[:120])
+        return ''
+    return kept
+
+
+def collapse_duplicate_lines(text: str) -> str:
+    """连续重复的同一行只留一行。
+
+    模型在「先想、再答」时容易把答案抄两遍（**My Response** 后面接两段一模一样的中文），
+    发进群里就像复读机。
+    """
+    if not text:
+        return text
+    kept: list[str] = []
+    for line in text.split('\n'):
+        if kept and line.strip() and line.strip() == kept[-1].strip():
+            continue
+        kept.append(line)
+    return '\n'.join(kept)
 
 
 def op_codes_to_plain(text: str) -> str:
@@ -412,8 +519,41 @@ class Renderer:
         text = self._strip_thinking_process(text).strip()
         # 括号内心戏：先摘掉，免得它既被当成正式消息发出去、又去触发下面的审计
         text = INNER_MONOLOGUE_RE.sub('', text).strip()
+        # 自我保护：捕获 [REST:原因]。放在这里是因为它可能**没有正文**
+        # （她直接退场），后面所有「空正文就返回 None」的分支都要认这个标记。
+        rest_reason = ''
+        rest_hit = False
+        rest_match = REST_TAG_RE.search(text)
+        if rest_match:
+            rest_hit = True
+            rest_reason = (rest_match.group(1) or '').strip().strip('：: 　')
+            if not rest_reason:
+                # 只写了 [REST] 没写原因：照样认，别让她想退场却只换来一条空消息
+                rest_reason = '未说明'
+            text = REST_TAG_RE.sub('', text).strip()
+
+        def _drop() -> RenderedReply | None:
+            """正文为空时的返回：有退场要求就带上，否则整轮丢弃。"""
+            return RenderedReply(text='', rest_reason=rest_reason) if rest_hit else None
+
+        # 伴生语音：捕获并分离 [VOICE:情绪|简短日文]，确保正文不残留任何日文音标或方括号
+        voice_payload: tuple[str, str] | None = None
+        voice_match = VOICE_TAG_RE.search(text)
+        if voice_match:
+            raw_emotion = (voice_match.group('emotion') or '撒娇').strip()
+            raw_voice_text = voice_match.group('text').strip()
+            if raw_voice_text:
+                voice_payload = (raw_emotion, raw_voice_text)
+            text = VOICE_TAG_RE.sub('', text).strip()
         if not text:
-            return None
+            return _drop()
+        # 英文推理前言（**My Response** + 英文计划）：放在标签剥离之后，
+        # 这样即使英文段里夹着 [REST:...]/[VOICE:...] 也已经先被摘走了
+        text = strip_english_preamble(text)
+        if not text:
+            return _drop()
+        # 同一句话被抄了两遍（「先想、再答」的典型副作用）
+        text = collapse_duplicate_lines(text)
         # 回复审计：必须放在表情码替换**之前**——替换之后正文里会带上我们自己生成的
         # file:/// 本机路径，那时候再审计就是自己拦自己。
         if self.config.get('reply_audit_enabled', True):
@@ -421,7 +561,9 @@ class Renderer:
             if hit:
                 logger.warning('回复被审计拦截（%s）：%r', hit, text[:120])
                 fallback = str(self.config.get('reply_audit_fallback', '') or '').strip()
-                return RenderedReply(text=fallback) if fallback else None
+                if fallback or rest_hit:
+                    return RenderedReply(text=fallback, rest_reason=rest_reason)
+                return None
         # 先归一化 @：仅允许 @ 当前发送者，且最多一次
         allowed_at = SEND_AT % msg.sender_id
         text = AT_TAG_RE.sub(
@@ -437,7 +579,7 @@ class Renderer:
         # 再剥离模型自带的其余所有码（OP 与 CQ 都剥，防止模型注入图片/路径）
         text = OP_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
         text = CQ_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
-        # 剥除称呼时误带的纯数字 QQ 账号（例如 "张三(123456789)" -> "张三"）
+        # 剥除称呼时误带的纯数字 QQ 账号（例如 "伊尔达(2397087988)" -> "伊尔达"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张
         session = msg.session.as_text()
@@ -461,8 +603,8 @@ class Renderer:
             return op
 
         text = EMOTE_RE.sub(_emote, text)
-        # 彻底清除模型输出的任何裸【图片】/【表情】/（图片）占位文字，杜绝将占位符发进群聊
-        text = re.sub(r'[【\[［(（]\s*(?:图片|表情|立绘|image|pic)\s*[】\]］)）]', '', text)
+        # 彻底清除模型输出的任何裸【图片】/【表情】/（图片）及【发送了表情包:...】占位文字，杜绝将占位符发进群聊
+        text = re.sub(r'[【\[［(（]\s*(?:发送了(?:表情包|表情|图片|立绘|语音)|图片|表情|立绘|image|pic)[^】\]］)）]*[】\]］)）]', '', text)
         # 记一笔「这条回复带没带图」——节流的滑动窗口要用
         self._note_reply(session, state['used'])
         # 形态整备：折叠空行、去掉重复的开头省略号（见方法上的说明）
@@ -473,8 +615,9 @@ class Renderer:
             text = text[:max_len].rstrip() + '…'
         text = text.strip()
         if not text:
-            return None
-        return RenderedReply(text=text)
+            return _drop()
+        return RenderedReply(text=text, voice_payload=voice_payload,
+                             rest_reason=rest_reason)
 
     # ---------------- 输出形态整备 ----------------
     # 为什么要用代码兜：这两件事提示词里都写了，但**模型不一定听**——
@@ -603,9 +746,8 @@ class Renderer:
             candidate = re.sub(r'约\d+字[。！？\s]*(?:符合|达标|合适)?[。！？\s]*', '', candidate)
             candidate = re.sub(r'字数\s*[:：][^。！？\n]*[。！？\n]?', '', candidate)
 
-            # D. 处理修改重构导致的双重动作拼接（例如 "(草稿)...(定稿)"，提取最后一段真正的最终回复）
-            # 仅在文本包含草稿/修改等提示词时才裁剪，避免误伤正常的连续动作 RP 描写
-            if re.search(r'(?:草稿|定稿|拟定|修改|重构|思路|思考)', candidate):
+            # D. 处理修改重构导致的双重动作拼接（仅在明确出现草稿/拟定等构思痕迹时才触发裁剪，保护连贯的正常角色多动作不被误删）
+            if re.search(r'(?:草稿|定稿|拟定|修改|重构|思路|思考|字数)', text):
                 actions = list(re.finditer(r'([（(][^）)]+[）)][^（(]+)', candidate))
                 if len(actions) >= 2:
                     last_action = actions[-1].group(0).strip()

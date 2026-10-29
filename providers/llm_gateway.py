@@ -54,6 +54,7 @@ _UPSTREAM_SAFETY_RE = re.compile(
 _KEY_CURRENT = 'gw.current'
 _KEY_UNHEALTHY = 'gw.unhealthy'
 _KEY_HISTORY = 'gw.history'
+_KEY_ANCHOR = 'gw.anchor'
 
 
 def _env_key_for(name: str) -> str:
@@ -79,10 +80,11 @@ class Provider:
     """
 
     __slots__ = ('name', 'endpoint', 'api_key', 'model', 'priority', 'timeout',
-                 'extra_headers', 'extra_body', 'legacy', 'kinds', 'protocol')
+                 'extra_headers', 'extra_body', 'legacy', 'kinds', 'protocol', 'manual_only')
 
     def __init__(self, name, endpoint, api_key, model, priority=1, timeout=25.0,
-                 extra_headers=None, extra_body=None, legacy=False, kinds=None, protocol='openai'):
+                 extra_headers=None, extra_body=None, legacy=False, kinds=None,
+                 protocol='openai', manual_only=False):
         self.name = name
         self.endpoint = endpoint
         self.api_key = api_key
@@ -95,6 +97,9 @@ class Provider:
         raw_kinds = kinds if isinstance(kinds, (list, tuple, set)) else None
         self.kinds = {str(k).strip() for k in raw_kinds if str(k).strip()} if raw_kinds else None
         self.protocol = str(protocol).strip().lower() or 'openai'
+        # manual_only：可选渠道。会加载、可「切换渠道」选中，但**永不参与自动故障转移**，
+        # 也不会被恢复探测自动切回去——只有骰主手动切换才会启用。
+        self.manual_only = bool(manual_only)
 
     def serves(self, kind: str) -> bool:
         """这个渠道接不接某类调用。kinds 为空 = 全都接。"""
@@ -109,7 +114,8 @@ class Provider:
 
     def __repr__(self) -> str:
         tag = '' if self.kinds is None else f' kinds={sorted(self.kinds)}'
-        return f'<Provider {self.name} {self.model} p{self.priority}{tag}>'
+        manual = ' manual_only' if self.manual_only else ''
+        return f'<Provider {self.name} {self.model} p{self.priority}{tag}{manual}>'
 
 
 class ProviderState:
@@ -150,10 +156,7 @@ def build_providers(config: dict) -> list[Provider]:
             if not endpoint or not model:
                 logger.warning('渠道 %s 缺少 endpoint 或 model，已跳过', name)
                 continue
-            p_key = str(item.get('api_key') or '').strip()
-            if p_key == 'sk-your-openai-api-key':
-                p_key = ''
-            api_key = p_key or _env_key_for(name) or LLMGateway.resolve_api_key(config)
+            api_key = str(item.get('api_key') or '').strip() or _env_key_for(name)
             extra_body = dict(blocking)
             extra_body.update(item.get('extra_body') if isinstance(item.get('extra_body'), dict) else {})
             protocol = str(item.get('protocol') or '').strip().lower()
@@ -170,6 +173,7 @@ def build_providers(config: dict) -> list[Provider]:
                 extra_body=extra_body,
                 kinds=item.get('kinds'),
                 protocol=protocol,
+                manual_only=bool(item.get('manual_only', False)),
             ))
 
     if not providers:
@@ -205,6 +209,7 @@ class LLMGateway:
         self._lock = threading.RLock()
         self._pairs: list[tuple[Provider, ProviderState]] = []
         self._current_name = ''
+        self._anchor_name = ''
         self._history: list[dict] = []
         self._last_down_notify = 0.0
         self._notify_cb = None
@@ -243,12 +248,44 @@ class LLMGateway:
         """注入「通知骰主」的回调：callback(text) -> None。"""
         self._notify_cb = callback
 
+    # ==================== 手动锚点 ====================
+    def _anchor_priority_locked(self) -> int | None:
+        """手动锚点渠道的优先级；None 表示没有锚点（纯按优先级顺序）。
+
+        语义（2026-10 起，需求来自「中转站靠不住、反代额度会用完」）：
+
+        - 骰主用「切换渠道 X」手动指定的那个渠道是**顶**；
+        - 自动故障转移只在锚点**及其以下**的渠道里挑备份，绝不自作主张往上跳；
+        - 后台探测也只爬回到锚点为止，不会去碰比它更高优先级的渠道
+          （典型：免费反代额度用完了，探测偶尔还能通，但一上去就又 429）。
+
+        没有锚点时行为和以前完全一致（按 priority 从高到低自动恢复）。
+        """
+        with self._lock:
+            name = self._anchor_name
+            if not name:
+                return None
+            for provider, _ in self._pairs:
+                if provider.name == name:
+                    return provider.priority
+            return None
+
+    def anchor_name(self) -> str:
+        with self._lock:
+            return self._anchor_name
+
     def _ordered_pairs(self, kind: str = '') -> list[tuple[Provider, ProviderState]]:
         """候选顺序：当前渠道 → 其他健康渠道 → 不健康渠道兜底（同级按 priority）。
 
         `kind` 非空时先按渠道的 `kinds` 过滤（提炼可以走另一家）。
         过滤后为空则**退回全部渠道**——配置写错不该让整个机器人哑掉，
         宁可走错渠道也不要一条都发不出去。
+
+        `manual_only` 的可选渠道不进入自动候选：除非它正是被骰主手动选中的当前渠道，
+        否则永远不参与故障转移。
+
+        有手动锚点时，排在锚点**之上**的渠道全部不参与——这就是「反代额度用完了
+        别再去碰它」的实现方式。
         """
         with self._lock:
             pairs = list(self._pairs)
@@ -260,6 +297,25 @@ class LLMGateway:
                 pairs = scoped
             else:
                 logger.warning('没有渠道声明服务 %s，退回全部渠道', kind)
+
+        # 可选渠道只在「它就是当前渠道」时保留，其余一律排除出自动顺序
+        auto_pairs = [p for p in pairs if (not p[0].manual_only) or p[0].name == current]
+        if auto_pairs:
+            pairs = auto_pairs
+        elif pairs:
+            # 全是 manual_only 且当前不在其中：宁可退回全部，也别让机器人哑掉
+            logger.warning('仅剩 manual_only 渠道可用，临时退回全部渠道以免无法回复')
+
+        # 手动锚点：备份只在锚点及其以下挑。锚点下面一个都没有时（例如锚点选的是
+        # 最后一个渠道），宁可越过锚点兜底——回复优先级永远高于「别乱花钱」。
+        ceiling = self._anchor_priority_locked()
+        if ceiling is not None:
+            scoped = [p for p in pairs if p[0].priority >= ceiling or p[0].name == current]
+            if any(p[0].name != current for p in scoped):
+                pairs = scoped
+            else:
+                logger.warning('手动锚点 %s 之下没有其他渠道，本轮忽略锚点限制',
+                               self._anchor_name)
 
         def rank(pair):
             provider, state = pair
@@ -295,11 +351,14 @@ class LLMGateway:
         with self._lock:
             pairs = list(self._pairs)
             current = self._current_name
+            anchor = self._anchor_name
         if not pairs:
             return '未配置'
         provider = next((p for p, _ in pairs if p.name == current), pairs[0][0])
         unhealthy = [p.name for p, st in pairs if not st.healthy]
         text = f'{provider.name}（{provider.model}）'
+        if anchor and anchor != provider.name:
+            text += f' | 锚点 {anchor}'
         if unhealthy:
             text += f' | ⚠ 不可用: {"、".join(unhealthy)}'
         return text
@@ -309,16 +368,29 @@ class LLMGateway:
         with self._lock:
             pairs = list(self._pairs)
             current = self._current_name
+            anchor = self._anchor_name
             history = list(self._history)
         if not pairs:
             return '尚未配置任何模型渠道（config.json 的 providers 为空且缺少 api_endpoint/api_key）'
         lines = ['--- 模型渠道 ---']
+        if anchor:
+            anchor_provider = next((p for p, _ in pairs if p.name == anchor), None)
+            model = anchor_provider.model if anchor_provider is not None else '?'
+            lines.append(f'手动锚点: {anchor}（{model}）'
+                         f' → 故障只在它以下找备份，恢复只回到这里；「切换渠道 自动」取消')
+        else:
+            lines.append('手动锚点: 无（按优先级自动恢复，会一路爬回最上面）')
         for index, (provider, state) in enumerate(pairs, 1):
-            mark = ' ← 当前' if provider.name == current else ''
+            marks = ''
+            if provider.name == current:
+                marks += ' ← 当前'
+            if provider.name == anchor:
+                marks += ' ⇤ 锚点'
             health = '正常' if state.healthy else f'不可用({state.last_error or "未知"})'
+            tag = '可选·手动' if provider.manual_only else f'优先级{provider.priority}'
             lines.append(
-                f'{index}. {provider.name} | {provider.model} | 优先级{provider.priority} | '
-                f'{health} | 连败{state.fail_count}{mark}'
+                f'{index}. {provider.name} | {provider.model} | {tag} | '
+                f'{health} | 连败{state.fail_count}{marks}'
             )
         if history:
             lines.append('')
@@ -333,11 +405,34 @@ class LLMGateway:
         return '\n'.join(lines)
 
     def switch_to(self, name_or_index: str) -> str:
-        """手工切换渠道，返回结果文本。"""
+        """手工切换渠道，返回结果文本。
+
+        手动切换会同时把目标设为**手动锚点**：之后自动故障转移只在它及其以下找备份，
+        后台探测也只爬回到它为止。传「自动」则取消锚点，恢复成按优先级自动恢复。
+        """
         with self._lock:
             pairs = list(self._pairs)
-            target = None
             key = str(name_or_index or '').strip()
+
+            if key in ('自动', 'auto', 'AUTO', 'Auto', '自动选择', '取消锚点'):
+                self._anchor_name = ''
+                best = None
+                for provider, state in sorted(pairs, key=lambda x: (x[0].priority, x[0].name)):
+                    if provider.manual_only or not state.healthy:
+                        continue
+                    best = provider
+                    break
+                if best is None:
+                    self._persist_locked()
+                    return '已取消手动锚点，但当前没有健康渠道可选，保持原渠道'
+                old = self._current_name
+                self._current_name = best.name
+                self._append_history_locked(old, best.name, 'manual', '取消锚点')
+                self._persist_locked()
+                return (f'✅ 已取消手动锚点，当前渠道 {best.name}（{best.model}），'
+                        f'恢复成按优先级自动恢复')
+
+            target = None
             if key.isdigit() and 1 <= int(key) <= len(pairs):
                 target = pairs[int(key) - 1][0]
             else:
@@ -347,16 +442,22 @@ class LLMGateway:
                         break
             if target is None:
                 return f'找不到渠道：{key}（用「渠道状态」看可用列表）'
-            if target.name == self._current_name:
-                return f'当前已经是渠道 {target.name}'
             old = self._current_name
+            same = (target.name == old)
             self._current_name = target.name
+            self._anchor_name = target.name
             state = next(st for p, st in pairs if p.name == target.name)
             state.healthy = True
             state.fail_count = 0
-            self._append_history_locked(old, target.name, 'manual')
+            state.last_error = ''
+            self._append_history_locked(old, target.name, 'manual', '锚点')
             self._persist_locked()
-            return f'✅ 已切换到渠道 {target.name}（{target.model}）'
+            if same:
+                return (f'✅ {target.name}（{target.model}）本来就是当前渠道，'
+                        f'已设为手动锚点，自动恢复只会回到这里')
+            return (f'✅ 已切换到渠道 {target.name}（{target.model}）\n'
+                    f'已设为手动锚点：故障时只在它以下的渠道里找备份，'
+                    f'恢复也只回到这里（「切换渠道 自动」可取消）')
 
     # ==================== 调用 ====================
     def chat(self, req: ModelRequest, kind: str = 'chat', session_key: str = '') -> ModelResult:
@@ -549,24 +650,27 @@ class LLMGateway:
                 else:
                     anthropic_messages.append({'role': role, 'content': content or ''})
 
+            # Anthropic 协议要求角色严格交替：合并连续同角色消息，防止 400 roles must alternate 错误
+            merged_messages = []
+            for m in anthropic_messages:
+                if merged_messages and merged_messages[-1]['role'] == m['role']:
+                    prev = merged_messages[-1]
+                    prev_c = prev['content']
+                    curr_c = m['content']
+                    if isinstance(prev_c, str) and isinstance(curr_c, str):
+                        prev['content'] = (prev_c + '\n\n' + curr_c).strip()
+                    elif isinstance(prev_c, list) and isinstance(curr_c, list):
+                        prev['content'].extend(curr_c)
+                    elif isinstance(prev_c, list) and isinstance(curr_c, str):
+                        prev['content'].append({'type': 'text', 'text': curr_c})
+                    elif isinstance(prev_c, str) and isinstance(curr_c, list):
+                        prev['content'] = [{'type': 'text', 'text': prev_c}] + curr_c
+                else:
+                    merged_messages.append(m)
+            anthropic_messages = merged_messages
+
             if anthropic_messages and anthropic_messages[0]['role'] == 'assistant':
                 anthropic_messages.insert(0, {'role': 'user', 'content': '...'})
-
-            # Anthropic 严格要求角色交替（user 与 assistant 轮流），合并连续同角色的消息
-            merged_anthropic = []
-            for am in anthropic_messages:
-                if merged_anthropic and merged_anthropic[-1]['role'] == am['role']:
-                    p_cnt = merged_anthropic[-1]['content']
-                    c_cnt = am['content']
-                    if isinstance(p_cnt, list) or isinstance(c_cnt, list):
-                        p_list = p_cnt if isinstance(p_cnt, list) else [{'type': 'text', 'text': str(p_cnt)}]
-                        c_list = c_cnt if isinstance(c_cnt, list) else [{'type': 'text', 'text': str(c_cnt)}]
-                        merged_anthropic[-1]['content'] = p_list + c_list
-                    else:
-                        merged_anthropic[-1]['content'] = f"{p_cnt}\n{c_cnt}"
-                else:
-                    merged_anthropic.append(am)
-            anthropic_messages = merged_anthropic
 
             body = {
                 'model': provider.model,
@@ -688,12 +792,32 @@ class LLMGateway:
             self._persist_locked()
 
     def _switch_locked(self, reason: str, detail: str = '') -> bool:
-        """切到下一个健康渠道（调用方需持锁）。"""
+        """切到下一个可用渠道（调用方需持锁）。
+
+        顺序：健康、不是当前渠道、**不越过手动锚点**，按 priority 从小到大。
+        `manual_only` 的可选渠道不是自动切换的目标；锚点下方全挂时才越过锚点兜底。
+        """
+        with self._lock:
+            pairs = list(self._pairs)
+            ceiling = self._anchor_priority_locked()
+
+        def pick(seq):
+            for provider, state in sorted(seq, key=lambda x: (x[0].priority, x[0].name)):
+                if provider.manual_only or not state.healthy:
+                    continue
+                if provider.name == self._current_name:
+                    continue
+                return provider
+            return None
+
         target = None
-        for provider, state in sorted(self._pairs, key=lambda x: (x[0].priority, x[0].name)):
-            if state.healthy and provider.name != self._current_name:
-                target = provider
-                break
+        if ceiling is not None:
+            target = pick([p for p in pairs if p[0].priority >= ceiling])
+            if target is None:
+                logger.warning('手动锚点 %s 以下没有健康渠道，越过锚点兜底',
+                               self._anchor_name)
+        if target is None:
+            target = pick(pairs)
         if target is None:
             return False
         old = self._current_name
@@ -765,22 +889,60 @@ class LLMGateway:
                 logger.exception('渠道探测异常')
 
     def probe_once(self) -> list[str]:
-        """探测「比当前渠道优先级更高、但被标记不可用」的渠道；恢复则切回。
+        """探测「比当前渠道优先级更高」的渠道；恢复则切回去。
 
         只探测优先级更高的渠道：备用渠道坏掉不影响当前使用，没必要为它花钱。
+
+        三种情况下完全不介入：
+        - 当前渠道是 `manual_only` 手动渠道、且它不是锚点（老语义：不抢回自动链路）；
+        - 候选是 `manual_only` 渠道、且它不是锚点——可选渠道永不自动启用；
+        - 候选站在**手动锚点之上**——一律不碰（例如额度已用完的反代）。
+
+        有锚点时目标就是锚点：按 priority 从高到低逐个试，**第一个通的立刻切过去
+        并停下**，剩下的留到下一轮。所以「隔一阵子自动爬回手动设置的渠道」是逐级
+        发生的，不会一次跳到底，也不会越过锚点。
+
+        往上爬完之后，还会顺带体检几个「比当前低、但还挂着不可用标签」的渠道，
+        只复位健康状态、不切换（见 probe_repair_per_round）。
         """
         cfg = self._failover_cfg
         need = max(1, int(cfg.get('probe_success_needed', 1) or 1))
         with self._lock:
             pairs = list(self._pairs)
-            current_rank = next(
-                (p.priority for p, _ in pairs if p.name == self._current_name), 10 ** 6
-            )
-        recovered: list[str] = []
+            current = self._current_name
+            anchor = self._anchor_name
+            current_p = next((p for p, _ in pairs if p.name == current), None)
+            current_rank = current_p.priority if current_p is not None else 10 ** 6
+            ceiling = self._anchor_priority_locked()
+
+        if current_p is not None and current_p.manual_only and current_p.name != anchor:
+            return []  # 手动选中的可选渠道：不被自动链路抢回
+
+        targets = []
         for provider, state in pairs:
-            if state.healthy or provider.priority >= current_rank:
+            if provider.name == current or provider.priority >= current_rank:
                 continue
+            if provider.manual_only and provider.name != anchor:
+                continue  # 可选渠道不参与自动恢复
+            if ceiling is not None and provider.priority < ceiling:
+                continue  # 不越过手动锚点
+            targets.append((provider, state))
+        targets.sort(key=lambda x: (x[0].priority, x[0].name))
+
+        recovered: list[str] = []
+        for provider, state in targets:
+            # 已经健康、只是当前站在它下面的渠道：直接切回，不用再花钱探测
+            if not provider.manual_only and state.healthy:
+                with self._lock:
+                    old = self._current_name
+                    self._current_name = provider.name
+                    self._append_history_locked(old, provider.name, 'priority_recover')
+                    self._persist_locked()
+                    recovered.append(provider.name)
+                break
+
             ok = self._probe_provider(provider)
+            switched = False
             with self._lock:
                 state.last_probe_at = time.time()
                 if ok:
@@ -791,14 +953,44 @@ class LLMGateway:
                 if ok and state.probe_ok_streak >= need:
                     state.healthy = True
                     state.fail_count = 0
+                    state.last_error = ''
                     old = self._current_name
                     self._current_name = provider.name
-                    current_rank = provider.priority
                     self._append_history_locked(old, provider.name, 'probe_recover')
                     self._persist_locked()
                     recovered.append(provider.name)
+                    switched = True
+            if switched:
+                break
         if recovered:
             self._persist_locked()
+
+        # 体检：顺手复位「比当前低、却还挂着不可用标签」的渠道。
+        # 不复位的话标志会永远留着——真需要它兜底时会被排到更差的渠道后面，
+        # 「按顺序往下开」就名不副实了。每轮最多查 probe_repair_per_round 个，
+        # 按上次探测时间从旧到新，**不切换渠道**。
+        limit = max(0, int(cfg.get('probe_repair_per_round', 2) or 0))
+        if limit:
+            with self._lock:
+                cur_name = self._current_name
+                cur_p2 = next((p for p, _ in pairs if p.name == cur_name), None)
+                cur_rank2 = cur_p2.priority if cur_p2 is not None else 10 ** 6
+                stale = [
+                    (p, st) for p, st in pairs
+                    if not p.manual_only and not st.healthy
+                    and p.name != cur_name and p.priority > cur_rank2
+                ]
+            stale.sort(key=lambda x: ((x[1].last_probe_at or 0), x[0].priority))
+            for provider, state in stale[:limit]:
+                ok = self._probe_provider(provider)
+                with self._lock:
+                    state.last_probe_at = time.time()
+                    if ok:
+                        state.healthy = True
+                        state.fail_count = 0
+                        state.last_error = ''
+                        self._persist_locked()
+                        logger.info('渠道 %s 体检通过，已复位为可用', provider.name)
         return recovered
 
     def _probe_provider(self, provider: Provider) -> bool:
@@ -824,6 +1016,7 @@ class LLMGateway:
     def _persist_locked(self) -> None:
         try:
             self.store.set_setting(_KEY_CURRENT, self._current_name)
+            self.store.set_setting(_KEY_ANCHOR, self._anchor_name)
             unhealthy = [p.name for p, st in self._pairs if not st.healthy]
             self.store.set_setting(_KEY_UNHEALTHY, json.dumps(unhealthy, ensure_ascii=False))
             self.store.set_setting(_KEY_HISTORY, json.dumps(self._history, ensure_ascii=False))
@@ -831,16 +1024,19 @@ class LLMGateway:
             logger.exception('渠道状态持久化失败')
 
     def _apply_persisted_locked(self) -> None:
-        """启动时恢复上次的当前渠道与不可用标记（失败不影响启动）。"""
+        """启动时恢复上次的当前渠道、手动锚点与不可用标记（失败不影响启动）。"""
         try:
             names = [p.name for p, _ in self._pairs]
             current = str(self.store.get_setting(_KEY_CURRENT) or '').strip()
+            anchor = str(self.store.get_setting(_KEY_ANCHOR) or '').strip()
             unhealthy = json.loads(self.store.get_setting(_KEY_UNHEALTHY) or '[]')
             history = json.loads(self.store.get_setting(_KEY_HISTORY) or '[]')
         except Exception:  # noqa: BLE001
             return
         if isinstance(history, list):
             self._history = [item for item in history if isinstance(item, dict)]
+        if anchor and anchor in names:
+            self._anchor_name = anchor
         if current and current in names:
             self._current_name = current
         if isinstance(unhealthy, list):
@@ -852,6 +1048,41 @@ class LLMGateway:
         cur = next((st for p, st in self._pairs if p.name == self._current_name), None)
         if cur is not None and not cur.healthy:
             self._switch_locked('restore', '上次的当前渠道不可用')
+
+        # 当前渠道站在手动锚点之上（锚点改过、或老数据）：先退回锚点，否则锚点等于没设
+        ceiling = self._anchor_priority_locked()
+        cur_p = next((p for p, _ in self._pairs if p.name == self._current_name), None)
+        if ceiling is not None and cur_p is not None and cur_p.priority < ceiling:
+            anchor_p = next((p for p, st in self._pairs
+                             if p.name == self._anchor_name and st.healthy), None)
+            if anchor_p is not None:
+                old = self._current_name
+                self._current_name = anchor_p.name
+                self._append_history_locked(old, anchor_p.name, 'anchor',
+                                            '当前渠道高于手动锚点，退回锚点')
+                self._persist_locked()
+                cur_p = anchor_p
+
+        # 启动/重载时：恢复更高的健康渠道，但**不越过手动锚点**
+        # （若当前渠道是骰主手动选中、又不是锚点的 manual_only 渠道，就不抢回去）
+        if cur_p is not None and cur_p.manual_only and cur_p.name != self._anchor_name:
+            return
+        cur_rank = cur_p.priority if cur_p else 10**6
+        best_healthy = None
+        for p, st in sorted(self._pairs, key=lambda x: (x[0].priority, x[0].name)):
+            if p.manual_only and p.name != self._anchor_name:
+                continue
+            if ceiling is not None and p.priority < ceiling:
+                continue
+            if st.healthy and p.priority < cur_rank:
+                best_healthy = p
+                break
+        if best_healthy is not None:
+            old = self._current_name
+            self._current_name = best_healthy.name
+            self._append_history_locked(old, best_healthy.name, 'priority_restore',
+                                        '启动/重载切回更高优先级渠道')
+            self._persist_locked()
 
     # ==================== 指标 ====================
     def _record(self, session_key: str, kind: str, result: ModelResult) -> None:
