@@ -262,6 +262,70 @@ def strip_english_preamble(text: str) -> str:
     return kept
 
 
+# ===== 「条列提纲式」内心草稿（2026-10-30 线上实例）=====
+# 模型偶尔会把心里那份计划原样吐出来，而不是直接说话。方括号版草稿（【拟定回复】…）
+# 有专门规则拦，但纯文本提纲以前一条都拦不住：
+#
+#     赛博刀子：
+#     - 夸歌伊厉害，但安抚熠暗"你们的赛道暂时不相交"
+#     歌伊的反应：
+#     - 长度约 40-60 字。一条一段。
+#     - 是否发立绘？…
+#     - 别长篇大论。不用 Markdown。那当然啦～（得意地昂了昂下巴）…
+#
+# 最后一行里才藏着真正的台词。所以这里按「最后一个元信息短语」切开，只留后面的人话；
+# 切开后如果没剩下人话，就整条丢弃（宁可少说一句，也不把草稿发进群）。
+_OUTLINE_META_RE = re.compile(
+    r'(?:长度约|字数约|一条一段|是否发(?:立绘|表情)|不用\s*Markdown|别长篇大论|'
+    r'符合(?:性格|人设)|语气(?:轻松|自然)|先保持文字|可以来一个|也可以加一个|'
+    r'回复策略|思考过程|构思草稿)'
+)
+_OUTLINE_HEADER_RE = re.compile(r'^[^\s：:]{1,16}[：:]\s*$')
+_OUTLINE_BULLET_RE = re.compile(r'^[-*•·]\s+\S')
+# 同一行里「英文前言 + 中文台词」（"I should be straightforward. 诶？…"）
+_LEAD_EN_SENTENCE_RE = re.compile(
+    r'^\s*[A-Za-z][A-Za-z0-9 \'",.\-]{2,160}?[.?!]\s*(?=[\u4e00-\u9fff【])'
+)
+
+
+def _strip_outline_draft(text: str) -> tuple[str, bool]:
+    """剥掉「条列提纲式」草稿，只留最后的台词。返回 (新文本, 是否命中)。
+
+    保守约束（防止误伤正常回复）：
+      · 只看前 12 行（草稿只可能出现在开头）；
+      · 至少 2 个特征同时出现；
+      · 必须有短标题行（"xxx："）或 ≥2 个列表项，纯元信息短语不算数。
+    """
+    if not text:
+        return text, False
+    lines = text.split('\n')
+    signals = headers = bullets = 0
+    cut_line, cut_pos = -1, 0
+    for index, line in enumerate(lines[:12]):
+        stripped = line.strip()
+        if _OUTLINE_HEADER_RE.match(stripped):
+            headers += 1
+            signals += 1
+        if _OUTLINE_BULLET_RE.match(stripped):
+            bullets += 1
+            signals += 1
+        for match in _OUTLINE_META_RE.finditer(line):
+            signals += 1
+            cut_line, cut_pos = index, match.end()
+    if signals < 2 or cut_line < 0 or (headers < 1 and bullets < 2):
+        return text, False
+    tail = lines[cut_line][cut_pos:]
+    rest = ([tail] if tail.strip() else []) + lines[cut_line + 1:]
+    cleaned = '\n'.join(rest).strip()
+    cleaned = re.sub(r'^[-*•·\s：:，,。]+', '', cleaned).strip()
+    if len(re.findall(r'[\u4e00-\u9fff]', cleaned)) < 4:
+        logger.warning('模型输出整条都是条列提纲草稿，已丢弃：%r', text.strip()[:120])
+        return '', True
+    logger.warning('已剥掉条列提纲草稿（%d 行），保留台词：%r',
+                   cut_line + 1, cleaned[:80])
+    return cleaned, True
+
+
 def collapse_duplicate_lines(text: str) -> str:
     """连续重复的同一行只留一行。
 
@@ -696,6 +760,15 @@ class Renderer:
         """
         if not text:
             return text
+        # ⓪ 条列提纲式草稿（"角色：" + "- 长度约 xx 字" …）与行内英文前言
+        #    （"I should be straightforward. 诶？…"）——这两类既不是 <think> 也不是【…】，
+        #    2026-10-30 在线上各漏过一次，放在最前面先切掉。
+        text, _ = _strip_outline_draft(text)
+        if not text:
+            return ''
+        text = _LEAD_EN_SENTENCE_RE.sub('', text, count=1).strip()
+        if not text:
+            return ''
         # ① 去除 XML 思考标签
         text = re.sub(r'<(?:think|thought)>[\s\S]*?</(?:think|thought)>', '', text, flags=re.IGNORECASE)
         if re.match(r'^\s*<(?:think|thought)>', text, re.IGNORECASE):
