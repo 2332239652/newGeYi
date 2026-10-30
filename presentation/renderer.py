@@ -282,10 +282,38 @@ _OUTLINE_META_RE = re.compile(
 )
 _OUTLINE_HEADER_RE = re.compile(r'^[^\s：:]{1,16}[：:]\s*$')
 _OUTLINE_BULLET_RE = re.compile(r'^[-*•·]\s+\S')
-# 同一行里「英文前言 + 中文台词」（"I should be straightforward. 诶？…"）
-_LEAD_EN_SENTENCE_RE = re.compile(
-    r'^\s*[A-Za-z][A-Za-z0-9 \'",.\-]{2,160}?[.?!]\s*(?=[\u4e00-\u9fff【])'
-)
+# 同一行里「英文前言 + 中文台词」。两种真实形态都出现过：
+#   ① `I should be straightforward. 诶？今天是万圣节吗？`（句号收尾）
+#   ② `Here's what I'll say: "哼哼，这种事情不用搜也是…"`（**冒号 + 引号**收尾，2026-10-30 大群事故）
+# 以前按行判断（strip_english_preamble）抓不到——英文和中文在同一行里。
+_LEAD_EN_CHUNK_RE = re.compile(r'^\s*([^\u4e00-\u9fff【]{1,240})')
+_LEAD_EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")
+_LEAD_EN_TAIL_RE = re.compile(r'[.?!:：][\s"“\'』」]*$')
+
+
+def _strip_lead_english(text: str) -> str:
+    """摘掉同一行开头的英文前言，只留后面的中文台词。
+
+    保守约束：英文片段至少两个单词、且以 `.?!:` 之一收尾，才认为是前言——
+    这样 `Token Stamp 做圆形棋子…`（专有名词开头）不会被误删。
+    """
+    if not text:
+        return text
+    match = _LEAD_EN_CHUNK_RE.match(text)
+    if not match:
+        return text
+    chunk = match.group(1).strip()
+    if len(_LEAD_EN_WORD_RE.findall(chunk)) < 2 or not _LEAD_EN_TAIL_RE.search(chunk):
+        return text
+    rest = text[match.end():].lstrip(' \t"“\'『「')
+    if len(re.findall(r'[\u4e00-\u9fff]', rest)) < 2:
+        return text
+    # 台词可能被引号整体包住（"哼哼…吗～"）
+    if len(rest) >= 2 and rest[0] in '“"\'『「' and rest[-1] in '”"\'』」':
+        rest = rest[1:-1]
+    rest = rest.rstrip('"”\'』」').strip()      # 前言吞掉了开引号、台词尾部还留着闭引号
+    logger.warning('已剥掉行内英文前言：%r', chunk[:60])
+    return rest.strip()
 
 
 def _strip_outline_draft(text: str) -> tuple[str, bool]:
@@ -766,7 +794,7 @@ class Renderer:
         text, _ = _strip_outline_draft(text)
         if not text:
             return ''
-        text = _LEAD_EN_SENTENCE_RE.sub('', text, count=1).strip()
+        text = _strip_lead_english(text)
         if not text:
             return ''
         # ① 去除 XML 思考标签

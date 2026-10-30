@@ -62,10 +62,19 @@ class OutlineDraftTest(unittest.TestCase):
         self.assertEqual(self.renderer._strip_thinking_process(draft_only), '')
 
     def test_english_inline_preamble_is_stripped(self):
+        # ① 句号收尾（2026-10-30 小群）
         raw = 'I should be straightforward. 【引用消息】诶？今天是万圣节吗？'
         out = self.renderer._strip_thinking_process(raw)
         self.assertFalse(out.startswith('I should'), out)
         self.assertIn('诶？今天是万圣节吗？', out)
+
+        # ② 冒号 + 引号收尾（2026-10-30 大群 1013491196，原文照抄）
+        raw2 = ('Here\'s what I\'ll say: "哼哼，这种事情不用搜也是刻在直觉里的嘛！'
+                '而且歌靡难道不觉得现在的我才是最棒的吗～"')
+        out2 = self.renderer._strip_thinking_process(raw2)
+        self.assertTrue(out2.startswith('哼哼'), out2)
+        self.assertNotIn("Here's what", out2)
+        self.assertNotIn('"', out2)
 
     def test_normal_replies_untouched(self):
         samples = [
