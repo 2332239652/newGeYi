@@ -16,14 +16,61 @@ import requests
 logger = logging.getLogger("newGeYi.voice")
 
 
-def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
-    """对原始音频进行极速优化：
+# audioop 缺失只提醒一次（Python 3.13 起该模块已被移除，PEP 594）
+_AUDIOOP_MISSING_WARNED = False
 
-    1. 剥离头部无声死区（GPT-SoVITS 默认生成约 0.6s 前置静音，消除“前面空着点”的体感迟滞）；
-    2. 重采样至标准 24000Hz（对齐 QQ NT / Silk V3 官方最高保真采样率，杜绝不发声或解码卡死）。
+
+def _resample_pcm16(samples: list[int], src_rate: int, dst_rate: int) -> list[int]:
+    """纯 Python 线性插值重采样（16bit 单声道样本表）。
+
+    只在 `audioop` 不可用时走这条路。速度比 C 实现慢一两个数量级，
+    但一条 2~4 秒的语音也就是十几万点，放在语音线程池里完全够用。
     """
+    if src_rate == dst_rate or not samples:
+        return samples
+    ratio = src_rate / float(dst_rate)
+    out_len = max(1, int(len(samples) / ratio))
+    last = len(samples) - 1
+    out: list[int] = []
+    for i in range(out_len):
+        pos = i * ratio
+        left = int(pos)
+        if left > last:
+            break
+        frac = pos - left
+        right = left + 1 if left < last else left
+        out.append(int(samples[left] + (samples[right] - samples[left]) * frac))
+    return out
+
+
+def _interleave_pcm16(channels: list[list[int]]) -> bytes:
+    import struct
+
+    if not channels:
+        return b''
+    if len(channels) == 1:
+        return struct.pack(f'<{len(channels[0])}h', *channels[0])
+    length = min(len(ch) for ch in channels)
+    merged: list[int] = []
+    for i in range(length):
+        for ch in channels:
+            merged.append(ch[i])
+    return struct.pack(f'<{len(merged)}h', *merged)
+
+
+def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
+    """对原始音频做两件事：
+
+    1. 重采样至 24000Hz（QQ Silk V3 只支持 8k/12k/16k/24k，其它采样率会不发声）；
+    2. 裁掉首部静音（GPT-SoVITS 默认有约 0.6s 前置空白，听起来像"没声音"）。
+
+    优先用 `audioop`（C 实现）。**Python 3.13 起 audioop 被移除**（PEP 594），
+    所以这里有一条纯 Python 兜底路径，并且**兜底触发时打 warning**——
+    以前外层只 `logger.debug`，而日志桥接的级别是 INFO，等于坏了无声：
+    QQ 端表现就是"语音没声 / 前面空 0.6 秒"，日志里一个字都查不到。
+    """
+    global _AUDIOOP_MISSING_WARNED
     try:
-        import audioop
         import io
         import struct
         import wave
@@ -32,25 +79,43 @@ def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
             nchannels = w_in.getnchannels()
             sampwidth = w_in.getsampwidth()
             framerate = w_in.getframerate()
-            nframes = w_in.getnframes()
-            frames = w_in.readframes(nframes)
+            frames = w_in.readframes(w_in.getnframes())
 
-        # 1. 重采样至 24000Hz
+        try:
+            import audioop  # noqa: PLC0415 - 可选加速路径
+            audioop_missing = False
+        except Exception:  # noqa: BLE001 - 3.13+ 没有这个模块
+            audioop_missing = True
+            if not _AUDIOOP_MISSING_WARNED:
+                _AUDIOOP_MISSING_WARNED = True
+                logger.warning(
+                    '当前解释器没有 audioop（Python 3.13 起已移除），'
+                    '改用纯 Python 重采样：语音照常发送，只是每条多花一两百毫秒'
+                )
+
+        # ---- 1. 重采样至 24000Hz ----
         if framerate != 24000:
-            frames, _ = audioop.ratecv(frames, sampwidth, nchannels, framerate, 24000, None)
-            framerate = 24000
-            nframes = len(frames) // (sampwidth * nchannels)
+            if not audioop_missing:
+                frames, _ = audioop.ratecv(frames, sampwidth, nchannels, framerate, 24000, None)
+                framerate = 24000
+            elif sampwidth == 2:
+                total = len(frames) // 2
+                flat = struct.unpack(f'<{total}h', frames)
+                channels = [list(flat[ch::nchannels]) for ch in range(nchannels)]
+                channels = [_resample_pcm16(ch, framerate, 24000) for ch in channels]
+                frames = _interleave_pcm16(channels)
+                framerate = 24000
 
-        # 2. 剥离头部无声死区 (保留 30ms 呼吸头防止吃爆破音)
+        # ---- 2. 剥离头部无声死区（保留 30ms 呼吸头，防止吃爆破音）----
         if sampwidth == 2 and nchannels == 1:
-            samples = struct.unpack(f'<{nframes}h', frames)
+            count = len(frames) // 2
+            samples = list(struct.unpack(f'<{count}h', frames))
             start_idx = 0
-            for idx, s in enumerate(samples):
-                if abs(s) >= 600:
+            for idx, value in enumerate(samples):
+                if abs(value) >= 600:
                     start_idx = idx
                     break
-            pad_samples = int(framerate * 0.03)
-            start_idx = max(0, start_idx - pad_samples)
+            start_idx = max(0, start_idx - int(framerate * 0.03))
             if start_idx > 0:
                 samples = samples[start_idx:]
                 frames = struct.pack(f'<{len(samples)}h', *samples)
@@ -62,8 +127,9 @@ def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
             w_out.setframerate(framerate)
             w_out.writeframes(frames)
         return out_io.getvalue()
-    except Exception as e:
-        logger.debug("WAV 音频流优化异常，保留原音频: %s", e)
+    except Exception as e:  # noqa: BLE001 - 优化失败也要把原音频发出去
+        # 从 debug 提到 warning：这条一旦出现，语音很可能"能发但没声"
+        logger.warning('WAV 音频流优化失败，回退原始音频（可能无声或延迟）: %s', e)
         return wav_bytes
 
 
@@ -86,6 +152,13 @@ class VoiceClient:
         self._last_health_check_time: float = 0.0
         self._is_healthy: bool = True
         self._health_ttl: float = 45.0  # 健康状态缓存 45 秒
+        # 熔断退避：网关真挂掉时探测窗口逐次翻倍（60s → 120s → … → 300s）。
+        # 老版本固定 45 秒探一次，而探测是**同步**跑在回复路径上的（2 秒超时），
+        # 等于主力机一关机，每隔 45 秒就有一次回复平白多等 2 秒（2026-10 复盘）。
+        self._offline_ttl_min: float = 60.0
+        self._offline_ttl_max: float = 300.0
+        self._offline_ttl: float = 0.0
+        self._consecutive_fail: int = 0
         self._last_latency_ms: int = 0
         self._last_error: str = ""
 
@@ -116,22 +189,80 @@ class VoiceClient:
             self.timeout = max(1.0, float(timeout))
         if speed is not None:
             self.speed = float(speed)
-        # 重置健康缓存
+        # 重置健康缓存与熔断计数（换了地址就该重新判一次）
         self._last_health_check_time = 0.0
+        self._offline_ttl = 0.0
+        self._consecutive_fail = 0
+
+    # ---------------- 熔断状态（回复路径只读，绝不做网络 IO） ----------------
+    def health_cached(self) -> tuple[bool, str, int]:
+        """只读缓存，绝不发网络请求。回复路径只许调这个。"""
+        if self._is_healthy:
+            return True, "在线", self._last_latency_ms
+        return False, self._last_error or "离线", self._last_latency_ms
+
+    def is_offline_window(self) -> bool:
+        """是否还处在熔断保护期（此时连探测都不该做）。"""
+        if self._is_healthy:
+            return False
+        window = self._offline_ttl or self._health_ttl
+        return (time.time() - self._last_health_check_time) < window
+
+    def next_probe_in(self) -> float:
+        """距离允许下一次探测还有多少秒（健康时为 0）。"""
+        if self._is_healthy:
+            return 0.0
+        window = self._offline_ttl or self._health_ttl
+        return max(0.0, window - (time.time() - self._last_health_check_time))
+
+    def offline_stats(self) -> tuple[int, int]:
+        """(连续失败次数, 当前熔断窗口秒数)，给「语音状态」用。"""
+        return self._consecutive_fail, int(self._offline_ttl or self._health_ttl)
+
+    def reset_offline_window(self) -> None:
+        """手动索要语音时用：清零熔断窗口，允许立刻重试一次。"""
+        self._last_health_check_time = 0.0
+        self._offline_ttl = 0.0
+
+    def _note_online(self, latency_ms: int = 0) -> None:
+        self._is_healthy = True
+        self._last_error = ""
+        self._consecutive_fail = 0
+        self._offline_ttl = 0.0
+        self._last_latency_ms = latency_ms
+        self._last_health_check_time = time.time()
+
+    def _note_offline(self, error: str) -> None:
+        """记一次离线：失败次数 +1，探测窗口翻倍（60s → 120s → … → 300s 封顶）。"""
+        self._is_healthy = False
+        self._last_error = error
+        self._consecutive_fail += 1
+        if self._offline_ttl <= 0:
+            self._offline_ttl = self._offline_ttl_min
+        else:
+            self._offline_ttl = min(self._offline_ttl_max, self._offline_ttl * 2)
+        self._last_health_check_time = time.time()
+        logger.info(
+            "语音网关离线（连续 %d 次，熔断 %d 秒）: %s",
+            self._consecutive_fail, int(self._offline_ttl), error,
+        )
 
     def check_health(self, force: bool = False) -> tuple[bool, str, int]:
         """探测本地语音主机健康状态。
 
         返回: (is_healthy, message, latency_ms)
+
+        ⚠️ 这个函数会发网络请求，**只许在后台线程 / 运维指令里调**；
+        回复路径一律用 health_cached()，否则主力机一关机，回复就跟着卡。
         """
         now = time.time()
-        if not force and (now - self._last_health_check_time < self._health_ttl):
+        window = self._health_ttl if self._is_healthy else (self._offline_ttl or self._health_ttl)
+        if not force and (now - self._last_health_check_time < window):
             return self._is_healthy, ("在线" if self._is_healthy else self._last_error), self._last_latency_ms
 
         target_url = self.health_url or self.gateway_url
         if not target_url:
-            self._is_healthy = False
-            self._last_error = "未配置网关地址"
+            self._note_offline("未配置网关地址")
             return False, self._last_error, 0
 
         headers = {}
@@ -142,30 +273,21 @@ class VoiceClient:
         try:
             resp = requests.get(target_url, headers=headers, timeout=min(2.0, self.timeout))
             latency = int((time.perf_counter() - start_t) * 1000)
-            self._last_latency_ms = latency
-            self._last_health_check_time = now
-
             if resp.status_code == 200:
-                self._is_healthy = True
-                self._last_error = ""
+                self._note_online(latency)
                 return True, "在线", latency
-            else:
-                self._is_healthy = False
-                self._last_error = f"HTTP {resp.status_code}"
-                return False, self._last_error, latency
+            self._last_latency_ms = latency
+            self._note_offline(f"HTTP {resp.status_code}")
+            return False, self._last_error, latency
         except requests.Timeout:
             latency = int((time.perf_counter() - start_t) * 1000)
-            self._is_healthy = False
             self._last_latency_ms = latency
-            self._last_health_check_time = now
-            self._last_error = f"探测超时 ({self.timeout}s)"
+            self._note_offline(f"探测超时 ({min(2.0, self.timeout):.0f}s)")
             return False, self._last_error, latency
         except Exception as e:
             latency = int((time.perf_counter() - start_t) * 1000)
-            self._is_healthy = False
             self._last_latency_ms = latency
-            self._last_health_check_time = now
-            self._last_error = f"连接失败 ({type(e).__name__})"
+            self._note_offline(f"连接失败 ({type(e).__name__})")
             return False, self._last_error, latency
 
     def synthesize(
@@ -176,12 +298,16 @@ class VoiceClient:
         group_id: str = "",
         group_name: str = "",
         sender_name: str = "",
+        force: bool = False,
     ) -> tuple[str | None, dict[str, Any]]:
         """向本地主机请求日语原声语音合成。
 
         返回: (cq_code_or_none, extra_info)
         成功返回: ("[CQ:record,file=base64://...]", {"inference_time_ms": ..., "duration_est": ...})
         失败返回: (None, {"error": ...})
+
+        force=True 表示「用户明确索要 / 运维手动测试」：无视熔断窗口硬试一次，
+        否则用户喊「发个语音」，而熔断窗口还剩两分钟，就会莫名其妙一声不吭。
         """
         clean_text = (text or "").strip()
         # 1. 彻底清除违背歌伊人设的 "先生" / "せんせい" 称呼，回归歌伊原生设定
@@ -212,9 +338,8 @@ class VoiceClient:
         if not self.gateway_url:
             return None, {"error": "未配置网关地址"}
 
-        # 若处于离线缓存周期内，静默跳过，避免无效超时阻塞
-        now = time.time()
-        if not self._is_healthy and (now - self._last_health_check_time < self._health_ttl):
+        # 熔断保护期内静默跳过，避免每次回复都白等一次超时（主动索要时 force=True 绕过）
+        if not force and self.is_offline_window():
             return None, {"error": f"本地主机处于离线保护期: {self._last_error}"}
 
         headers = {
@@ -260,9 +385,7 @@ class VoiceClient:
                     except Exception as ex:
                         logger.debug("音频流优化失败，降级使用原音频: %s", ex)
 
-                    self._is_healthy = True
-                    self._last_error = ""
-                    self._last_health_check_time = now
+                    self._note_online(latency_ms)
                     cq_code = f"[CQ:record,file=base64://{b64}]"
                     return cq_code, {
                         "base64": b64,
@@ -276,23 +399,21 @@ class VoiceClient:
                     return None, {"error": msg, "latency_ms": latency_ms}
             else:
                 logger.warning("语音网关返回非 200: %s %s", resp.status_code, resp.text[:200])
-                self._last_error = f"HTTP {resp.status_code}"
+                # 非 200 也要计入熔断：以前只写 _last_error 不置不可用，
+                # 网关稳定返回 5xx 时会每次都陪它走一遍超时
+                self._note_offline(f"HTTP {resp.status_code}")
                 return None, {"error": self._last_error, "latency_ms": latency_ms}
 
         except requests.Timeout:
             latency_ms = int((time.perf_counter() - start_t) * 1000)
             logger.info("本地语音合成请求超时 (%.1fs)，平滑静默降级", self.timeout)
-            self._is_healthy = False
-            self._last_error = f"超时 ({self.timeout}s)"
-            self._last_health_check_time = now
+            self._note_offline(f"超时 ({self.timeout:.0f}s)")
             return None, {"error": self._last_error, "latency_ms": latency_ms}
 
         except requests.RequestException as e:
             latency_ms = int((time.perf_counter() - start_t) * 1000)
             logger.info("本地语音网络异常 (%s)，平滑静默降级", type(e).__name__)
-            self._is_healthy = False
-            self._last_error = f"连接异常: {type(e).__name__}"
-            self._last_health_check_time = now
+            self._note_offline(f"连接异常: {type(e).__name__}")
             return None, {"error": self._last_error, "latency_ms": latency_ms}
 
         except Exception as e:

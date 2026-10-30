@@ -68,7 +68,7 @@ class CommandRouter:
     def _cmd_status(self, msg: IncomingMessage) -> str:
         cfg = self.r.config
         today = self.r.store.today_stats()
-        budget = int(cfg.get('daily_call_budget', 500))
+        budget = int(cfg.get('daily_call_budget', 999999))
         state = {
             'private': '开' if cfg.get('private_enabled') else '关',
             'passive': '开' if cfg.get('passive_enabled') else '关',
@@ -210,8 +210,8 @@ class CommandRouter:
 
     def _cmd_usage(self, msg: IncomingMessage) -> str:
         today = self.r.store.today_stats()
-        budget = int(self.r.config.get('daily_call_budget', 500))
-        out_budget = int(self.r.config.get('daily_output_token_budget', 100000))
+        budget = int(self.r.config.get('daily_call_budget', 999999))
+        out_budget = int(self.r.config.get('daily_output_token_budget', 99999999))
         return (
             f'今日调用 {today["calls"]}/{budget} 次，输出 {today["output_tokens"]}/{out_budget} tokens\n'
             f'其中主动搭话触发 {today["active_calls"]} 次'
@@ -456,6 +456,8 @@ class CommandRouter:
                 emotion,
                 group_id=group_id,
                 sender_name=sender_name,
+                # 运维手动测试：无视熔断窗口硬试，否则网关刚挂时会直接回「离线保护期」
+                force=True,
             )
             b64 = info.get("base64")
             if not b64 and cq:
@@ -464,11 +466,15 @@ class CommandRouter:
                     b64 = m.group(1)
 
             if b64:
+                vm.note_probe_result(True)
                 sess_type = 'group' if msg.is_group else 'private'
                 sent = vm.send_voice_message(sess_type, msg.session.target_id, b64, event=msg.event)
                 if not sent:
                     self.r.reply(msg, "❌ 语音发送失败（底层驱动未响应）")
             else:
+                # 只有网关真的不可用才把状态翻成离线（业务类错误不该触发降级通知）
+                if not vm.client.health_cached()[0]:
+                    vm.note_probe_result(False, str(info.get('error') or '测试合成失败'))
                 err = info.get('error', '未知错误')
                 self.r.reply(msg, f"❌ 测试语音合成失败: {err}")
 

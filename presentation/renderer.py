@@ -610,7 +610,7 @@ class Renderer:
         # 形态整备：折叠空行、去掉重复的开头省略号（见方法上的说明）
         text = self._tidy_reply(text, session)
         # 长度上限
-        max_len = int(self.config.get('max_reply_chars', 500))
+        max_len = int(self.config.get('max_reply_chars', 1200))
         if len(text) > max_len:
             text = text[:max_len].rstrip() + '…'
         text = text.strip()

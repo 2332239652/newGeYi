@@ -141,7 +141,7 @@ def build_providers(config: dict) -> list[Provider]:
     - config['providers'] 非空：多渠道模式，每个渠道自己的 endpoint/key/model
     - 否则：退回 api_endpoint / api_key / fast_model 单渠道模式（兼容老配置）
     """
-    default_timeout = float(config.get('request_timeout_seconds', 25))
+    default_timeout = float(config.get('request_timeout_seconds', 45))
     blocking = config.get('extra_body') if isinstance(config.get('extra_body'), dict) else {}
     providers: list[Provider] = []
 

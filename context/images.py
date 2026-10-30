@@ -51,7 +51,8 @@ DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 # 一次附带的**总体积**上限。实测：3 张 1.1MB 的大图（base64 后 ~4.4MB 请求体）
 # 会直接把请求拖到超时；3 张 115KB 的小图完全没问题。
 # 所以限制「几张」不够，还得限制「多重」——超出的按「没收到」如实告诉她。
-DEFAULT_TOTAL_MAX_BYTES = 1536 * 1024
+# 7MB（2026-10-30 定）：3 张 2MB 的截图勉强收得下，再多就只留前几张。
+DEFAULT_TOTAL_MAX_BYTES = 7 * 1024 * 1024
 DEFAULT_TIMEOUT = 10
 DEFAULT_CACHE_SECONDS = 300
 DEFAULT_WINDOW_SECONDS = 1800
@@ -190,7 +191,7 @@ class ImageContext:
         """
         if not self.config.get('image_enabled', True):
             return {'items': [], 'refs': [], 'total': 0, 'skipped': 0}
-        limit = max(0, int(self.config.get('image_max_per_turn', 3) or 0))
+        limit = max(0, int(self.config.get('image_max_per_turn', 5) or 0))
         if limit == 0:
             return {'items': [], 'refs': [], 'total': 0, 'skipped': 0}
         window = self._window_seconds(msg)
@@ -213,7 +214,7 @@ class ImageContext:
             _add(ref, cur_sender, cur_name, now)
         if not items:
             # ②③ 只有「在说图」或「刚被叫到且图很新」才回溯
-            fresh = float(self.config.get('image_fresh_seconds', 90) or 0)
+            fresh = float(self.config.get('image_fresh_seconds', 120) or 0)
             if self._talks_about_image(msg):
                 reach = window
             elif getattr(msg, 'mentioned_bot', False) and fresh > 0:
@@ -271,9 +272,15 @@ class ImageContext:
             if not data_url:
                 continue                       # 取不到（下载失败/单张过大）＝ 没收到
             size = len(data_url) * 3 // 4      # base64 反推原始字节，粗算即可
+            # `used` 参与判断是**刻意的**：第一张不受总量预算约束。
+            # 理由：宁可多花点 token，也别让用户发一张大图就彻底看不到。
+            # 代价是总量预算可能被单张撑破，所以超过时留一条日志备查。
             if budget and used and used + size > budget:
                 logger.info('图片总体积超预算，跳过一张（%.0f KB）', size / 1024)
                 continue
+            if budget and not used and size > budget:
+                logger.info('单张图片超过总量预算（%.1f MB > %.1f MB），仍保留这一张',
+                            size / 1048576, budget / 1048576)
             urls.append(data_url)
             items.append(item)
             used += size

@@ -61,6 +61,10 @@ class VoiceManager:
         self._group_last_voice: dict[str, float] = {}  # target_id -> timestamp
         self._session_consecutive: dict[str, bool] = {}  # session_key -> 上一轮是否刚发过语音
 
+        # 熔断状态：网关掉线时**只记日志**，不发通知（见 _note_health 的说明）
+        self._healthy_seen: bool | None = None
+        self._probe_inflight: bool = False
+
         # 异步合成线程池（极轻量，最大 2 个并发线程）
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="GeYiVoice")
 
@@ -86,6 +90,53 @@ class VoiceManager:
             )
         logger.info("语音子系统配置已重载: enabled=%s, url=%s", self.enabled, self.gateway_url)
 
+    # ---------------- 熔断状态 ----------------
+
+    def note_probe_result(self, healthy: bool, reason: str = '') -> None:
+        """外部（运维指令 / 手动测试）拿到探测结果后回报，用于状态迁移。"""
+        self._note_health(healthy, reason)
+
+    def _note_health(self, healthy: bool, reason: str = '') -> None:
+        """记录一次健康判定：**只写日志，不发任何通知**。
+
+        TTS 跑在骰主自己的电脑上，晚上关机是常态 —— 以前这里会私聊骰主
+        「歌伊语音降级」，等于每天半夜给主人发一条已知的噪声（2026-10-30 骰主明确要求去掉）。
+        语音本来就是可选增强：网关不在，文字照常，`语音状态` 指令里能查到熔断详情，
+        日志里按状态跃变留一行就够。
+        """
+        prev = self._healthy_seen
+        self._healthy_seen = healthy
+        if healthy:
+            if prev is False:
+                logger.info('语音网关已恢复可用')
+            return
+        if prev is False:
+            return                       # 已经是离线状态，不重复刷日志
+        logger.info('语音网关不可用，静默降级（文字照常，仅语音暂停）：%s', reason or '未知原因')
+
+    def _refresh_health_async(self) -> None:
+        """后台探一次网关。回复路径上绝不发网络请求（老版本这里会阻塞 2 秒）。"""
+        with self._lock:
+            if self._probe_inflight:
+                return
+            self._probe_inflight = True
+
+        def _job():
+            try:
+                healthy, reason, _ = self.client.check_health(force=True)
+                self._note_health(healthy, reason)
+            except Exception as ex:  # noqa: BLE001
+                logger.debug('语音健康探测异常: %s', ex)
+            finally:
+                with self._lock:
+                    self._probe_inflight = False
+
+        try:
+            self._executor.submit(_job)
+        except RuntimeError:  # 线程池已关闭（插件正在卸载）
+            with self._lock:
+                self._probe_inflight = False
+
     # ---------------- 意图与频控 ----------------
 
     def is_user_requesting_voice(self, text: str) -> bool:
@@ -97,18 +148,31 @@ class VoiceManager:
     def can_send_voice(self, session_key: str, target_id: str, is_active_request: bool = False) -> tuple[bool, str]:
         """类似表情包的频控策略：
 
-        1. 用户明确主动要求：无条件放行（豁免冷却与连发限制）；
-        2. 主机不在线 / 离线保护期：跳过；
+        1. 用户明确主动要求：无条件放行（豁免冷却与连发限制，熔断也绕过一次）；
+        2. 主机熔断保护期内：快速跳过，**绝不在这里发网络请求**；
         3. 上一轮刚刚发过语音（连续连发）：拦截（保持自然对话间隔）；
         4. 群冷却 CD 未到（默认 45 秒）：拦截。
+
+        2026-10-30 改：以前第 2 步调的是 check_health(force=False)，缓存一过期就
+        同步发一次 GET（2 秒超时）。主力机一关机，等于每隔 45 秒就有一条回复
+        平白多等 2 秒——用户体感就是「歌伊怎么突然卡一下」。现在探测全走后台线程。
         """
         if not self.enabled:
             return False, "语音功能已关闭"
 
-        # 若本地主机已被标记为离线保护，快速静默跳过
-        healthy, reason, _ = self.client.check_health(force=False)
+        # 只读缓存判断，不做任何网络 IO
+        healthy, reason, _ = self.client.health_cached()
         if not healthy:
-            return False, f"本地主机未就绪: {reason}"
+            if is_active_request:
+                # 用户明确要语音：无视熔断硬试一次（合成在后台线程里），并清零窗口
+                self.client.reset_offline_window()
+                logger.info("用户主动索要语音，忽略熔断重试一次（%s）", reason)
+                return True, "用户主动触发，忽略熔断重试"
+            if self.client.is_offline_window():
+                return False, f"语音熔断中: {reason}"
+            # 保护期已过：后台探一次，本轮先跳过
+            self._refresh_health_async()
+            return False, "语音网关重连中，本轮跳过"
 
         # 用户主动索要语音，直接放行
         if is_active_request:
@@ -243,6 +307,8 @@ class VoiceManager:
                     group_id=group_id,
                     group_name=group_name,
                     sender_name=sender_name,
+                    # 用户明确索要时无视熔断硬试一次
+                    force=is_active_request,
                 )
                 b64 = info.get("base64")
                 if not b64 and cq_code:
@@ -251,8 +317,12 @@ class VoiceManager:
                         b64 = m.group(1)
 
                 if not b64:
+                    # 合成失败：如果是「网关连不上」，顺手把降级通知发出去（按跃变 + 冷却，不刷屏）
+                    if not self.client.health_cached()[0]:
+                        self._note_health(False, str(info.get("error") or "合成失败"))
                     logger.debug("语音合成未产出有效音频数据: %s", info.get("error", "未知"))
                     return
+                self._note_health(True)
 
                 # 调用平台底层接口发送 Base64 语音气泡
                 sent = self.send_voice_message(session_type, target_id, b64, event=event)
@@ -331,6 +401,8 @@ class VoiceManager:
     def get_status_report(self) -> str:
         """生成供中文运维指令查看的健康与状态报告（含 v2.1 统计数据）。"""
         healthy, status_str, latency = self.client.check_health(force=True)
+        # 人工查状态本身就是一次有效探测：同步状态迁移，但**不要再发私信**（人就在这儿）
+        self._healthy_seen = healthy
         status_icon = "🟢 在线" if healthy else "🔴 离线"
 
         lines = [
@@ -338,6 +410,17 @@ class VoiceManager:
             f"• 整体开关: {'开启' if self.enabled else '关闭'}",
             f"• 本地算力主机: {status_icon} ({status_str})",
             f"• 探测延迟: {latency} ms",
+        ]
+        if healthy:
+            lines.append("• 熔断状态: 🟢 正常")
+        else:
+            fails, window = self.client.offline_stats()
+            remain = int(self.client.next_probe_in())
+            lines.append(
+                f"• 熔断状态: 🟠 连续失败 {fails} 次 | 退避窗口 {window} 秒 | {remain} 秒后才重探"
+            )
+            lines.append("• 降级表现: 文字照常，语音静默（用户主动索要时会硬试一次）")
+        lines += [
             f"• 网关地址: {self.gateway_url}",
             f"• 请求硬超时: {self.timeout} 秒",
             f"• 单群冷却时间: {self.group_cooldown} 秒",

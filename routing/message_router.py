@@ -29,10 +29,9 @@ class MessageRouter:
         val = self.r.store.get_setting(f'group_passive:{msg.session.as_text()}')
         return val != '0'
 
-    def _group_active_on(self, msg: IncomingMessage) -> bool:
-        """本群主动搭话开关；未设置过时跟随全局 active_enabled。"""
-        val = self.r.store.get_setting(f'group_active:{msg.session.as_text()}')
-        return val != '0'
+    # 注：这里曾经还有一个 `_group_active_on()`，跟 attention.py 里
+    # `store.get_setting(f'group_active:{session_key}') == '0'` 是同一件事的两份实现，
+    # 而且零调用（真正的判断一直在闸门里）。2026-10-30 删除，避免两份实现走样。
 
     def _debug(self, msg: IncomingMessage, directed: bool,
                passive_allowed: bool, reason: str) -> None:

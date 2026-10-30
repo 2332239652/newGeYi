@@ -360,18 +360,18 @@ class PromptBuilder:
         messages.append({'role': 'system', 'content': '\n\n'.join(system_parts)})
 
         # 群聊只取实时旁观窗口；私聊才取 SQLite 连续历史
-        max_turns = int(cfg.get('max_recent_turns', 12))
+        max_turns = int(cfg.get('max_recent_turns', 20))
         if msg.is_group and self.live_context is not None:
             history = self.live_context.snapshot(
                 msg.session.as_text(),
                 before_source_seq=msg.arrival_seq,
                 window_seconds=int(cfg.get('group_live_window_seconds', 1800)),
-                max_messages=int(cfg.get('group_live_max_messages', 30)),
-                max_chars=int(cfg.get('group_live_max_chars', 6000)),
+                max_messages=int(cfg.get('group_live_max_messages', 60)),
+                max_chars=int(cfg.get('group_live_max_chars', 16000)),
             )
         else:
             history = self.store.recent_turns(msg.session.as_text(), limit=max_turns)
-        max_chars = int(cfg.get('max_context_chars', 12000))
+        max_chars = int(cfg.get('max_context_chars', 32000))
         used = sum(len(m['content']) for m in messages)
         formatted_history: list[dict] = []
         for turn in history:

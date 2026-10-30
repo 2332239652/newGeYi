@@ -116,7 +116,6 @@ class Runtime:
         self._poke_back_at: dict[str, float] = {}
         self.video_context = None
         self.web_context = None
-        self._suppressed_messages: set[str] = set()
         self._self_sent_lock = threading.Lock()
         self._recent_self_sent: deque[tuple[str, str, float]] = deque(maxlen=40)
         self.cross_plugin_observer = None
@@ -149,6 +148,11 @@ class Runtime:
             wb_state = '开启' if self.config.get('worldbook_enabled') else '关闭（「世界书开」启用）'
             self.log(2, f'角色设定: {role_path}')
             self.log(2, f'世界书: {wb_path}（{len(self.worldbook.entries)} 条，{wb_state}）')
+            # 两个版本号打架时最难排查（2026-10-30 就发生过：app.json 是 2.6.0、
+            # config.PLUGIN_VERSION 还停在 2.5.0，日志和状态里全是旧版本号）
+            mismatch = plugin_config.version_mismatch()
+            if mismatch:
+                self.log(1, f'⚠ 版本号不一致：{mismatch}（发布、排查时容易对不上）')
             if not cfg_path.exists():
                 self.log(1, f'⚠ 配置文件缺失：{cfg_path} —— 想改配置请把 config.json 放到这个路径下再「重载设定」')
             else:
@@ -178,6 +182,18 @@ class Runtime:
                     f'（代码时间戳 {plugin_config.code_stamp()}）')
 
     def init_after(self, Proc) -> None:
+        # 资源目录自愈：本机 OlivOS 的 release_data 每次加载都失败（WinError 183），
+        # data/ 会被清空却不再回填（见 config.sync_released_data 的注释）。
+        # 必须放在 init_after：release 恰好发生在 init 之后、init_after 之前。
+        try:
+            copied = plugin_config.sync_released_data(force=True)
+            if copied:
+                shown = '、'.join(copied[:5]) + ('…' if len(copied) > 5 else '')
+                self.log(2, f'资源目录自愈：从插件包补齐 {len(copied)} 个文件（{shown}）')
+            else:
+                self.log(2, '资源目录自愈：资源目录完整，无需补齐')
+        except Exception:  # noqa: BLE001 - 补齐失败不能让插件起不来
+            logger.exception('补齐资源目录失败')
         # 渠道恢复探测：只有存在「不可用但优先级更高」的渠道时才会真正发请求
         try:
             self.gateway.start_probe()
@@ -208,6 +224,12 @@ class Runtime:
             self.scheduler.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        # 还原猴补丁：跨插件钩子是直接替换别人模块属性，不还原就会随重载层层嵌套
+        try:
+            if self.cross_plugin_observer is not None:
+                self.cross_plugin_observer.detach()
+        except Exception:  # noqa: BLE001
+            logger.exception('卸载跨插件感知钩子失败')
         self.log(2, f'newGeYi v{plugin_config.PLUGIN_VERSION} save 完成（SQLite 已实时落盘）')
 
     def _attach_log_bridge(self) -> None:
@@ -352,14 +374,6 @@ class Runtime:
                 return
             if getattr(event.data, '_geyi_handled', False):
                 return
-            if hasattr(self, '_suppressed_messages') and self._suppressed_messages:
-                gid = str(getattr(event.data, 'group_id', '') or '')
-                uid = str(getattr(event.data, 'user_id', '') or '')
-                text_clean = raw.strip()
-                for key in list(self._suppressed_messages):
-                    if key in (f"{gid}:{text_clean}", f"{uid}:{text_clean}", text_clean):
-                        self._suppressed_messages.discard(key)
-                        return
             if not raw.strip():
                 return
             is_group = getattr(event.data, 'group_id', None) is not None
@@ -477,11 +491,11 @@ class Runtime:
             logger.warning('本群额度已满，跳过本轮：%s %s', msg.session.as_text()[-12:], why)
             return
         messages = self.prompt_builder.build(msg, is_active=is_active)
-        model = cfg.get('fast_model', 'deepseek-flash')
+        model = cfg.get('fast_model', 'gemini-3.8-flash-medium')
         temperature = float(cfg.get('fast_temperature', 0.7))
         # 兜底值要和 config.DEFAULT_CONFIG 保持一致：写小了会在配置缺键时
         # 悄悄退回小额度，而空回复的锅会记到模型头上（实测踩过）。
-        max_tokens = int(cfg.get('fast_max_tokens', 2000))
+        max_tokens = int(cfg.get('fast_max_tokens', 8192))
         req = ModelRequest(messages=messages, model=model, temperature=temperature, max_tokens=max_tokens)
         result = self.gateway.chat(req, kind=kind, session_key=msg.session.as_text())
         if not result.ok:
@@ -622,6 +636,36 @@ class Runtime:
         except Exception:  # noqa: BLE001
             logger.exception('reply failed')
 
+    def _track_self_sent(self, session, text: str, is_group: bool) -> None:
+        """把她自己发出的一句话记进「她说过什么」的账本。
+
+        正常回复走 reply() + process_job 那套（去重缓存 / turns / 旁观窗口）；
+        戳一戳回复、戳一戳语音彩蛋这类**不经过消息管道**的输出以前漏记，后果是：
+        ① `_recent_self_sent` 里没有它 → 出站钩子会把自己说的话当成别人说的记下来；
+        ② 她自己不记得刚回过这句，群友接着追问会一脸茫然。
+
+        这里只补**去重缓存 + turns + 旁观窗口**，**不写** curator 缓冲——
+        戳一戳回的是模板句，进了提炼器只会污染长期记忆。
+        """
+        plain = op_codes_to_plain(text).strip()
+        if not plain:
+            return
+        try:
+            with self._self_sent_lock:
+                self._recent_self_sent.append((str(session.target_id), plain, time.time()))
+        except Exception:  # noqa: BLE001 - 记账失败不能影响已经发出去的消息
+            pass
+        try:
+            self.store.add_turn(session.as_text(), 'assistant', plain)
+        except Exception:  # noqa: BLE001
+            logger.debug('戳一戳回复写入 turns 失败', exc_info=True)
+        if is_group:
+            try:
+                self.live_context.append_assistant(
+                    session.as_text(), self._next_arrival_seq(), plain)
+            except Exception:  # noqa: BLE001
+                logger.debug('戳一戳回复写入旁观窗口失败', exc_info=True)
+
     def is_recently_sent_by_self(self, target_id: str, text: str) -> bool:
         """检查指定文本是否为歌伊本体最近发出的回复。"""
         now = time.time()
@@ -675,7 +719,15 @@ class Runtime:
             payload = ''
             if random.random() < _POKE_EMOTE_PROB:
                 payload = self.renderer.emote_message(emote_key, session=f'poke:{key}')
-            event.reply(payload or text)
+            out = payload or text
+            event.reply(out)
+            # 记账：她要记得自己刚戳回去说过什么（详见 _track_self_sent）
+            self._track_self_sent(session, out, is_group)
+            # 万一回的是表情图，也进「她刚发过的图」，群友追问时能认出来
+            try:
+                self.images.remember_assistant(session.as_text(), out)
+            except Exception:  # noqa: BLE001
+                logger.debug('戳一戳表情图入库失败', exc_info=True)
             # 伴生语音彩蛋：被戳时低频概率触发一句原声语音
             if hasattr(self, 'voice_manager'):
                 try:

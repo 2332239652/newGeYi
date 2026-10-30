@@ -99,7 +99,7 @@ class AttentionGate:
 
     # ==================== 单条闸门 ====================
     def in_quiet_hours(self, now: float = 0) -> bool:
-        start, end = _parse_window(self.config.get('active_quiet_hours', '01:00-08:00'))
+        start, end = _parse_window(self.config.get('active_quiet_hours', ''))
         if start < 0:
             return False
         local = time.localtime(now or time.time())
@@ -119,7 +119,7 @@ class AttentionGate:
         return 1.0, count
 
     def cooldown_seconds(self, session_key: str, now: float = 0) -> int:
-        base = float(self.config.get('active_base_cooldown', 1800))
+        base = float(self.config.get('active_base_cooldown', 180))
         factor, _count = self.self_factor(session_key, now)
         return int(base * factor)
 
@@ -158,7 +158,7 @@ class AttentionGate:
         cfg = self.config
         now = now or time.time()
 
-        if not cfg.get('active_enabled', False):
+        if not cfg.get('active_enabled', True):
             return GateResult(False, 'disabled')
         if self.store.get_setting(f'group_active:{session_key}') == '0':
             return GateResult(False, 'group_off')
@@ -167,7 +167,7 @@ class AttentionGate:
         # 全局日预算：主动搭话不该把当天的调用额度吃光（被动回复优先）
         try:
             today = self.store.today_stats()
-            if today['calls'] >= int(cfg.get('daily_call_budget', 500)):
+            if today['calls'] >= int(cfg.get('daily_call_budget', 999999)):
                 return self._log_denied(session_key, GateResult(False, 'budget'), now)
         except Exception:  # noqa: BLE001 - 统计读不到不该阻断主动搭话
             pass
@@ -198,7 +198,7 @@ class AttentionGate:
             self._set('active_nr', session_key, 0)
             self._set('active_backoff_until', session_key, 0)
         spoken = self.store.count_active_spoken(session_key, _midnight(now))
-        cap = int(cfg.get('active_daily_cap', 8))
+        cap = int(cfg.get('active_daily_cap', 60))
         if spoken >= cap:
             return self._log_denied(session_key, GateResult(False, 'daily_cap'), now)
         cooldown = self.cooldown_seconds(session_key, now)
@@ -294,7 +294,7 @@ class AttentionGate:
             data = {}
         ts = float(data.get('ts') or 0)
         # 观察窗口：默认 5 分钟 (300s)
-        window = float(self.config.get('active_no_response_window', 300))
+        window = float(self.config.get('active_no_response_window', 600))
         if now - ts < window:
             return ''                                # 还在观察窗口里，等有人接话
         self.store.set_setting(key, '')
@@ -367,9 +367,9 @@ class AttentionGate:
             '--- 主动搭话观察（近 %g 小时）---' % hours,
             '模式: %s' % ('影子（只记录不真发）' if self.config.get('active_shadow', True) else '真发'),
             '今天已主动 %d/%s 条 | 连续无回应 %d 次'
-            % (spoken, self.config.get('active_daily_cap', 8), strikes),
+            % (spoken, self.config.get('active_daily_cap', 60), strikes),
             '当前冷却 %d 分钟（基础 %s 分钟 × 她发言系数 %g；最近 %g 分钟她说了 %d 条）'
-            % (cooldown // 60, int(float(self.config.get('active_base_cooldown', 1800)) // 60),
+            % (cooldown // 60, int(float(self.config.get('active_base_cooldown', 180)) // 60),
                factor, float(self.config.get('active_self_window', 1800)) / 60, recent),
         ]
         if until and until > now:

@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 PLUGIN_NAME = 'newGeYi'
@@ -15,8 +16,12 @@ NAMESPACE = 'newGeYi'
 MENU_EVENT = 'newGeYi_Menu_001'
 DATA_DIR_NAME = 'newGeYi'
 # 插件版本：只在这一处维护，日志 / 菜单 / 状态都引用它
-# （app.json 的 version 要跟它一致，有测试锁着——两个版本号打架时最难排查）
-PLUGIN_VERSION = '2.5.0'
+# （app.json 的 version 必须跟它一致 —— 有 `tests/test_config.py` 锁着：
+#   `python -m unittest discover -s newGeYi/tests -t .`，两个版本号打架时最难排查）
+# 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
+# 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
+# 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
+PLUGIN_VERSION = '2.6.3'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -51,6 +56,25 @@ def code_stamp() -> str:
 
 BASE_DIR = Path(__file__).resolve().parent
 ROLE_PROMPT_PATH = BASE_DIR / 'data' / 'role_prompt.txt'
+
+
+def app_json_version() -> str:
+    """app.json 里声明的版本（OlivOS 插件列表里显示的就是它）。"""
+    try:
+        data = json.loads((BASE_DIR / 'app.json').read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ''
+    if isinstance(data, dict):
+        return str(data.get('version') or '').strip()
+    return ''
+
+
+def version_mismatch() -> str:
+    """两个版本号打架时返回一句人话，一致（或读不到 app.json）时返回空串。"""
+    declared = app_json_version()
+    if declared and declared != PLUGIN_VERSION:
+        return f'app.json 写的是 v{declared}，config.PLUGIN_VERSION 是 v{PLUGIN_VERSION}'
+    return ''
 
 DEFAULT_CONFIG = {
     'api_key': '',
@@ -124,7 +148,9 @@ DEFAULT_CONFIG = {
     'route_debug': False,
     'worldbook_enabled': False,
     'memory_enabled': True,
-    'auto_memory_enabled': False,
+    # 注意：`auto_memory_enabled` 已经废除了——它从 v2.5 起就没有任何代码读，
+    # 用户设 true 以为开了自动记忆，实际生效的一直是 memory_curator_enabled。
+    # load_config 会把只写了旧键的老配置迁移成 memory_curator_enabled（见 _migrate_legacy_keys）。
     # ===== 自动记忆：批量提炼 =====
     'memory_curator_enabled': True,
     'memory_curate_messages': 40,
@@ -133,12 +159,26 @@ DEFAULT_CONFIG = {
     'memory_curate_min_interval': 120,
     'memory_curate_max_tokens': 3200,
     'memory_curate_tick_seconds': 60,
+    # 提炼单次输出上限（硬顶，防止一次吐 3 万字把预算烧光）
+    'memory_curate_max_tokens_cap': 8000,
+    # ===== 记忆注入条数（这些键以前只在代码里 .get() 兜底，没进默认值，
+    # 导致 missing_config_keys() 永远发现不了、用户也不知道能配）=====
+    'memory_inject_facts': 6,       # 每轮注入几条群友事实（L2）
+    'memory_inject_self': 3,        # 每轮注入几条她的自我记忆（L3）
+    'memory_inject_summaries': 2,   # 每轮注入几条群摘要（L1）
     'time_awareness_enabled': True,
+    # 记忆提炼里代表「她自己」的署名（也是「AI 说了什么」的行首标签）
+    'assistant_name': '歌伊',
+    # 全局附加请求头，会并进每个渠道（个别中转站要求自定义 header 时用）
+    'extra_headers': {},
     # ===== 图片理解（多模态大幅放宽）=====
     'image_enabled': True,
     'image_max_per_turn': 5,           # 每次最多附几张
-    'image_max_bytes': 10485760,       # 单张上限 10MB
-    'image_total_max_bytes': 20971520, # 总体积上限 20MB
+    # 单张上限 4 MB。注意：**首张即使超过总量预算也会保留**（见 images.plan_for）——
+    # 宁可多花点 token，也别让用户发一张大图就彻底看不到。
+    'image_max_bytes': 4 * 1024 * 1024,
+    # 单轮总量 7 MB：3 张 2 MB 的截图勉强收得下，再多就只留前几张。
+    'image_total_max_bytes': 7 * 1024 * 1024,
     'image_download_timeout': 15,
     'image_window_seconds': 0,
     'image_fresh_seconds': 120,
@@ -192,7 +232,9 @@ DEFAULT_CONFIG = {
     'active_escalation_max': 8,
     'active_escalation_cap': 0.98,
     'active_no_response_window': 600,
-    'active_stop_strikes': 10,
+    # 注意：曾经有个 `active_stop_strikes`（=10），但没有任何代码读它——
+    # 真正的退避档位在 attention._apply_backoff 里（连冷 3/4/5/6 次 → 30min/1h/2h/4h）。
+    # 键已删除：一个"看起来能调、实际没接上"的开关比没有更糟。
     'active_log_interval': 300,
     'daily_call_budget': 999999,               # 日调用预算完全放开
     'daily_output_token_budget': 99999999,     # 日输出 token 完全放开
@@ -300,6 +342,73 @@ def get_data_dir() -> Path:
     return path
 
 
+# ===== 资源目录自愈 =====
+# OlivOS 0.11.81 在这台机器上的 pluginAPI.run_plugin_data_release_by_name 每次加载都会失败：
+# 它先把 ./plugin/data/<ns>/data 建好，再用 shutil.copytree 往这个**已经存在**的目录上复制，
+# 于是抛 FileExistsError(WinError 183) 被上层 except 吞掉——
+# 结果是 data/ 被 rmtree 清空之后**再也没被填回来**（2026-10-30 日志实测：目录里 0 个文件）。
+#
+# 插件一直是「资源目录优先、插件包兜底」，所以功能没哑；但带来了两个坑：
+#   1) 启动日志打印的「角色设定: …/data/role_prompt.txt」指向一个不存在的文件，
+#      照着它去改会白改一场；
+#   2) 想在服务器上热改 role_prompt / 世界书的人，改了没反应也没提示。
+# 这里补上自愈：把插件包 data/ 里缺的（或比目标更新的）文件补进资源目录。
+_MIRROR_SKIP_SUFFIXES = ('.bak', '.pyc', '.tmp', '.log', '.swp')
+_MIRROR_SKIP_DIRS = {'__pycache__', '.git'}
+_MIRROR_MIN_INTERVAL = 60.0   # 懒同步节流：同一进程内 60 秒最多扫一次
+_last_mirror_at = 0.0
+
+
+def _copy_if_stale(src: Path, dst: Path) -> bool:
+    """目标缺失、或插件包那份更新时复制过去。返回是否真的复制了。"""
+    try:
+        if dst.exists():
+            # 1 秒容差：Windows 上 copy2 的 mtime 精度容易让人误判「包里的更新」
+            if src.stat().st_mtime <= dst.stat().st_mtime + 1.0:
+                return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+        return True
+    except OSError:
+        return False
+
+
+def sync_released_data(force: bool = False) -> list[str]:
+    """把插件包 data/ 补齐到资源目录，返回本次补上的相对路径（空列表 = 无需补）。
+
+    **只补不删**：目标里用户自己加的立绘、改过的设定一律不动；同名文件只有当
+    插件包里那份更新（升级插件）时才会覆盖——正好和 OlivOS 本来「每次加载用插件包
+    重建 data/」的语义一致，所以不会出现「改了包里却不生效」。
+    """
+    global _last_mirror_at
+    now = time.time()
+    if not force and (now - _last_mirror_at) < _MIRROR_MIN_INTERVAL:
+        return []
+    _last_mirror_at = now
+    source_root = BASE_DIR / 'data'
+    if not source_root.is_dir():
+        return []
+    try:
+        target_root = get_data_dir()
+    except OSError:
+        return []
+    if target_root.resolve() == source_root.resolve():
+        return []
+    copied: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        dirnames[:] = [d for d in dirnames if d not in _MIRROR_SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(_MIRROR_SKIP_SUFFIXES):
+                continue
+            src = Path(dirpath) / name
+            rel = src.relative_to(source_root)
+            if _copy_if_stale(src, target_root / rel):
+                copied.append(str(rel).replace('\\', '/'))
+    if copied:
+        _last_mirror_at = time.time()
+    return copied
+
+
 def get_config_path() -> Path:
     # 注意是 state 目录，不是 data —— 放 data 里会被 release_data 抹掉
     return get_state_dir() / 'config.json'
@@ -333,16 +442,51 @@ def get_resource_path(name: str) -> Path:
     OlivOS 首次部署会把插件包 data/ 整体复制到 plugin/data/newGeYi/data，
     因此“数据目录优先”能保证：改了数据目录里的角色/世界书文件后，
     「重载设定」「世界书重载」命令实际生效。
+
+    2026-10-30 补两件事：
+    1. 本机 OlivOS 的 release 每次都会失败（见 sync_released_data 注释），data/ 一直是空的，
+       所以这里要先补一次，否则日志里打印的路径跟实际读到的文件永远对不上；
+    2. **包内那份是源头**：它更新时要同步过去再读。少了这一步，改完包里 role_prompt.txt
+       再「重载设定」，读到的还是 data 目录里的旧副本——等于改了不生效。
+       （反方向仍然成立：谁改了 data 目录里那份、且比包里新，就按 data 那份来。）
     """
     candidate = get_data_dir() / name
+    source = BASE_DIR / 'data' / name
+    if source.exists():
+        _copy_if_stale(source, candidate)
     if candidate.exists():
         return candidate
-    return BASE_DIR / 'data' / name
+    return source
 
 
-def get_owner_ids() -> set[str]:
-    raw = os.environ.get('GEYI_OWNER_IDS', '')
-    return {item.strip() for item in raw.replace('，', ',').split(',') if item.strip().isdigit()}
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并配置：字典逐层合并，其他类型（含列表）整体替换。
+
+    为什么需要（2026-10-30 复盘）：以前是 `base.update(override)` 的**浅合并**。
+    用户只要在 config.json 里写半个字典，默认值就被整块抹掉：
+
+        "failover": {"probe_interval_seconds": 600}
+
+    DEFAULT_CONFIG 里 failover 的另外 7 个键会消失，`fail_threshold` 退回
+    `.get(..., 2)` —— 判死阈值从**刻意的 1** 静默变成 2（渠道挂了还要陪它多耗一轮）。
+    列表仍然整体替换（`providers`、`triggers` 这类必须能被清空，不能与默认合并）。
+    """
+    merged = copy.deepcopy(base if isinstance(base, dict) else {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _migrate_legacy_keys(loaded: dict, merged: dict) -> dict:
+    """把已废弃的旧键迁移成新键（只在磁盘上写了旧键、没写新键时生效）。"""
+    # auto_memory_enabled 从 v2.5 起就没人读了；老配置里只写它的人，
+    # 本意是「开启自动记忆」，所以按它的值补 memory_curator_enabled。
+    if 'auto_memory_enabled' in loaded and 'memory_curator_enabled' not in loaded:
+        merged['memory_curator_enabled'] = bool(loaded['auto_memory_enabled'])
+    return merged
 
 
 def load_config() -> dict:
@@ -358,7 +502,7 @@ def load_config() -> dict:
             try:
                 loaded = json.loads(legacy.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
-                    value.update(loaded)
+                    value = _migrate_legacy_keys(loaded, _deep_merge(value, loaded))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
         save_config(value)
@@ -366,7 +510,7 @@ def load_config() -> dict:
     try:
         loaded = json.loads(path.read_text(encoding='utf-8'))
         if isinstance(loaded, dict):
-            value.update(loaded)
+            value = _migrate_legacy_keys(loaded, _deep_merge(value, loaded))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return value
     return value

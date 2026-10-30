@@ -86,6 +86,10 @@ OlivOS/plugin/app/newGeYi/
 
 配置读的是 **`plugin/data/newGeYi/config.json`**（状态目录，重载不丢）。首次可直接把 `config.example.json` 复制过去再改。
 
+> `config.example.json` 里的值**等于代码里的默认值**（只有 api_key / endpoint / 语音口令做了脱敏，语音默认关）。
+> 也就是说：配置里漏掉某个键，行为与示例一致，不会突然跳一个数量级。
+> 默认值偏"放开"（`daily_call_budget` 很大、全天可主动搭话），要省钱请自行调小。
+
 最小可用配置（单渠道）：
 
 ```json
@@ -168,7 +172,9 @@ GET  /v1/voice/stats           # 可选：控制台统计
 
 配置项：`voice_enabled`、`voice_gateway_url`、`voice_health_url`、`voice_auth_token`、`voice_timeout`、`voice_group_cooldown`、`voice_poke_rate`。
 
-不发语音也能正常聊天——语音只是可选增强。
+不发语音也能正常聊天——语音只是可选增强。网关掉线时插件会**熔断**：回复路径只读健康缓存（不做网络 IO），
+探测退避 60s→300s，**只在日志里留一行**（不发通知——TTS 通常就跑在你自己的机器上，关机是常态）；
+用户主动索要语音或骰主手动「测试语音」时仍会硬试一次。
 
 ---
 
@@ -179,8 +185,12 @@ OlivOS 每次加载插件都会 `rmtree` + `copytree` 插件包里的 `data/`，
 | 目录 | 内容 | 说明 |
 |---|---|---|
 | `plugin/data/newGeYi/` | `config.json`、`geyi.sqlite3`、导出的记忆 | 永久保留 |
-| `plugin/data/newGeYi/data/` | `role_prompt.txt`、`worldbook.json`、`emotes.json`、`emote/` | 每次加载重建，改了会被覆盖 |
+| `plugin/data/newGeYi/data/` | `role_prompt.txt`、`worldbook.json`、`emotes.json`、`emote/` | 由 OlivOS 释放；加载后插件会自愈补齐（只补不删，包内文件更新时才覆盖） |
 | `plugin/app/newGeYi/data/` | 同上，**源头** | 想改提示词/世界书就改这里，重载后自动同步 |
+
+> v2.6.1 起：若 OlivOS 的 `release_data` 失败（部分版本会报 `WinError 183`，`data/` 被清空却不回填），
+> 插件会在 `init_after` 里从 `plugin/app/newGeYi/data/` 补齐缺失或过期的文件，
+> 启动日志会打印「资源目录自愈：从插件包补齐 N 个文件」。
 
 ---
 
@@ -190,6 +200,60 @@ OlivOS 每次加载插件都会 `rmtree` + `copytree` 插件包里的 `data/`，
 - `.gitignore` 已排除 `config.json`、`*.sqlite3`、`*.bak`、`导出/` 等运行时产物；
 - `data/role_prompt.txt` 里的主人 QQ 号是占位符 `123456789`，部署后请改成你自己的账号，并把 `owner_ids` 一起配上；
 - 插件里所有"绝对不能发生"的事（泄露本机路径、把思考过程发进群）都有代码层兜底，不只靠提示词。
+
+---
+
+## 更新日志
+
+### v2.6.2 (2026-10-30)
+
+外部代码审计反馈的一批隐患，逐条核实后修复：
+
+- **配置浅合并** → 递归深合并。写半个 `failover` 不再抹掉其余 7 个键（以前 `fail_threshold`
+  会静默退回 2，等于"失败一次就换备用"变成"失败两次"）。
+- **27 处兜底值与默认值打架** → 全部统一（`active_base_cooldown` 曾差 10 倍、
+  `active_daily_cap` 差 7.5 倍、`group_quota_enabled` 语义相反），并加**静态测试**锁死。
+- **6 个孤儿配置键**（`assistant_name`、`extra_headers`、`memory_inject_*`、
+  `memory_curate_max_tokens_cap`）补进默认值与示例 —— 以前它们被代码读、却查不到也配不到。
+- **两个暗键**：`auto_memory_enabled`（零消费）改为迁移兼容，`active_stop_strikes`（零消费）删除。
+- **图片预算**：单张 4 MB / 单轮 7 MB，明确"首张超总量也保留"的策略并留日志。
+- **audioop 兜底**：Python 3.13 移除该模块后，纯 Python 重采样顶上 + 打一次 warning
+  （以前会静默丢 24kHz 重采样与静音裁剪，表现为"语音没声"）。
+- **跨插件钩子**：幂等安装 + `save()` 还原 + 异常升到 warning。
+- **戳一戳回复入账**：她开始记得自己戳回去说过什么（仍不进长期记忆）。
+- 清理三处死代码；新增 `tests/test_config.py`（10 条离线断言）。
+
+跑测试：
+
+```bash
+cd plugin/app
+python -m unittest discover -s newGeYi/tests -t . -v
+```
+
+### v2.6.3 (2026-10-30)
+
+- **语音降级不再发通知**：TTS 一般跑在部署者自己的机器上，晚上关机是常态 ——
+  每次掉线都私聊「语音降级」等于每天半夜收一条已知的噪声。现在只在日志里记一行状态跃变，
+  详情用 `语音状态` 指令查。熔断、退避、主动索要时硬试一次等行为都保留。
+
+### v2.6.1 (2026-10-30)
+
+- **语音熔断**：`can_send_voice()` 不再同步探测健康（以前缓存一过期就发一次 2 秒超时的 GET，
+  主力机一关机就每隔 45 秒卡一条回复）；失败后退避窗口 60s→120s→240s→300s 封顶；
+  `语音状态` 显示熔断次数/窗口/剩余重探时间。
+  （v2.6.3 起**取消了私聊通知**，见上。）
+- **主动索要绕过熔断**：`synthesize(force=True)`——用户明确要语音、或骰主「测试语音」时硬试一次。
+- **资源目录自愈**：修复部分 OlivOS 版本 `release_data` 失败（`WinError 183`）导致
+  `plugin/data/<ns>/data/` 被清空却不回填的问题（详见下方「数据持久化」）。
+- **版本号对齐**：`config.PLUGIN_VERSION` 与 `app.json` 统一为 2.6.1，启动时不一致会打 warning。
+
+### v2.6.0 (2026-10-29)
+
+- 日语原声伴生语音（15 个情绪卡槽、重采样到 24kHz、首部静音裁剪）；
+- 自我保护静默 `[REST:原因]`（静默当前会话并通知骰主）；
+- 图片带发送者归属，回溯他人旧图不再认错人；
+- 渠道手动锚点 + 逐级爬回 + 低优先渠道体检；
+- 剥离英文推理前言、去重复行、思考前言硬拦截。
 
 ---
 

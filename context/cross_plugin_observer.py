@@ -56,6 +56,43 @@ class CrossPluginObserver:
         self._lock = threading.Lock()
         # 去重缓冲：(group_id, text_prefix) -> timestamp (TTL 10s)
         self._seen_messages: dict[tuple[str, str], float] = {}
+        # 卸载钩子用的回调（install 时登记，save 时反向执行）
+        self._detachers: list = []
+        self._last_warn = 0.0
+
+    def _warn(self, text: str, exc: Any = None) -> None:
+        """钩子内部异常：限流后打 **warning**。
+
+        以前这里是 `logger.debug`，而 newGeYi 的日志桥接级别是 INFO —— 钩子坏掉
+        在线上完全无声（跨插件感知悄悄失效，谁也不知道）。改成 warning 并限流，
+        避免一次异常风暴把日志刷满。
+        """
+        now = time.time()
+        if now - self._last_warn < 60.0:
+            return
+        self._last_warn = now
+        if exc is None:
+            logger.warning('跨插件感知: %s', text)
+        else:
+            logger.warning('跨插件感知: %s: %s', text, exc)
+
+    def add_detacher(self, fn) -> None:
+        """登记一个"卸载钩子"的回调（插件 save 时执行）。"""
+        self._detachers.append(fn)
+
+    def detach(self) -> None:
+        """还原所有被替换的钩子。
+
+        为什么要还原：这两个钩子是**直接替换别人的模块属性**（猴补丁）。不还原的话，
+        同一进程里每次重载都会再套一层——旧 runtime 被包在新闭包里，重复记账 + 泄漏。
+        本机靠"重载=重启插件进程"兜住了，但那是运气，不是设计。
+        """
+        while self._detachers:
+            fn = self._detachers.pop()
+            try:
+                fn()
+            except Exception as ex:  # noqa: BLE001 - 还原失败也不能拦着退出
+                logger.debug('还原跨插件钩子失败: %s', ex)
 
     def _cleanup_seen(self, now: float) -> None:
         for k in list(self._seen_messages.keys()):
@@ -162,64 +199,79 @@ class CrossPluginObserver:
 
 
 def install_cross_plugin_observer(runtime: Any) -> CrossPluginObserver:
-    """在运行时挂载跨插件感知钩子。"""
+    """在运行时挂载跨插件感知钩子。
+
+    幂等：已经挂过的钩子带 `_geyi_hooked` 标记，重载时跳过（不套娃）；
+    可撤销：每个替换都登记了还原回调，`Runtime.save()` 会调 `observer.detach()`。
+    """
     observer = CrossPluginObserver(runtime)
 
     # 1. 钩入 OlivaDiceCore.crossHook (捕获骰娘专属检定/理智/掷骰等输出)
     try:
         import OlivaDiceCore  # type: ignore
 
-        orig_msg_hook = OlivaDiceCore.crossHook.dictHookFunc.get("msgHook")
+        holder = OlivaDiceCore.crossHook.dictHookFunc
+        orig_msg_hook = holder.get("msgHook")
+        if getattr(orig_msg_hook, "_geyi_hooked", False):
+            logger.info("骰娘消息感知钩子已在位，跳过重复挂载")
+        else:
+            @wraps(orig_msg_hook)
+            def _hooked_dice_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs):
+                res = orig_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs) if orig_msg_hook else None
+                try:
+                    if funcType in ("reply", "send_group") and dectData and len(dectData) >= 2:
+                        group_id = str(dectData[1] or "")
+                        if group_id:
+                            bot_id = str((sender or {}).get("id", ""))
+                            observer.on_other_plugin_sent(group_id, message, bot_id=bot_id)
+                except Exception as ex:  # noqa: BLE001 - 绝不能打断骰娘自己的发信
+                    observer._warn("OlivaDiceCore msgHook 捕获失败", ex)
+                return res
 
-        @wraps(orig_msg_hook)
-        def _hooked_dice_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs):
-            res = orig_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs) if orig_msg_hook else None
-            try:
-                if funcType in ("reply", "send_group") and dectData and len(dectData) >= 2:
-                    group_id = str(dectData[1] or "")
-                    if group_id:
-                        bot_id = str((sender or {}).get("id", ""))
-                        observer.on_other_plugin_sent(group_id, message, bot_id=bot_id)
-            except Exception as ex:
-                logger.debug("OlivaDiceCore msgHook 捕获异常: %s", ex)
-            return res
+            _hooked_dice_msg_hook._geyi_hooked = True  # type: ignore[attr-defined]
+            holder["msgHook"] = _hooked_dice_msg_hook
+            observer.add_detacher(lambda: holder.__setitem__("msgHook", orig_msg_hook))
+            logger.info("已成功装载 OlivaDiceCore 骰娘消息感知钩子")
+    except Exception as e:  # noqa: BLE001
+        # 从 debug 提到 info：钩子没挂上时，跨插件感知会**悄悄失效**
+        logger.info("未装载 OlivaDiceCore 骰娘钩子（模块不存在或结构变化）：%s", e)
 
-        OlivaDiceCore.crossHook.dictHookFunc["msgHook"] = _hooked_dice_msg_hook
-        logger.info("已成功装载 OlivaDiceCore 骰娘消息感知钩子")
-    except Exception as e:
-        logger.debug("未发现 OlivaDiceCore 模块或装载失败: %s", e)
-
-    # 2. 钩入 OlivOSOnebotV11.eventRouter.txEvent.doRouter (捕获包含今日运势、签到等所有 OneBot 出站消息)
+    # 2. 钩入 OlivOSOnebotV11.eventRouter.txEvent.doRouter（捕获运势/签到等所有出站消息）
     try:
         import OlivOSOnebotV11  # type: ignore
 
-        orig_do_router = OlivOSOnebotV11.eventRouter.txEvent.doRouter
+        tx_event = OlivOSOnebotV11.eventRouter.txEvent
+        orig_do_router = tx_event.doRouter
+        if getattr(orig_do_router, "_geyi_hooked", False):
+            logger.info("OneBot 出站感知钩子已在位，跳过重复挂载")
+        else:
+            @wraps(orig_do_router)
+            def _hooked_do_router(self_arg, *args, **kwargs):
+                res = orig_do_router(self_arg, *args, **kwargs)
+                try:
+                    func_type = getattr(self_arg, "funcType", "")
+                    params = getattr(self_arg, "params", {}) or {}
+                    group_id = ""
+                    if func_type == "send_group_msg":
+                        group_id = str(params.get("group_id", "") or "")
+                    elif func_type == "send_msg" and params.get("message_type") == "group":
+                        group_id = str(params.get("group_id", "") or "")
 
-        @wraps(orig_do_router)
-        def _hooked_do_router(self_arg, *args, **kwargs):
-            res = orig_do_router(self_arg, *args, **kwargs)
-            try:
-                func_type = getattr(self_arg, "funcType", "")
-                params = getattr(self_arg, "params", {}) or {}
-                group_id = ""
-                if func_type == "send_group_msg":
-                    group_id = str(params.get("group_id", "") or "")
-                elif func_type == "send_msg" and params.get("message_type") == "group":
-                    group_id = str(params.get("group_id", "") or "")
+                    if group_id:
+                        bot_id = ""
+                        if hasattr(self_arg, "plugin_event") and hasattr(self_arg.plugin_event, "bot_info"):
+                            bot_id = str(getattr(self_arg.plugin_event.bot_info, "id", "") or "")
+                        msg_content = params.get("message", "")
+                        observer.on_other_plugin_sent(group_id, msg_content, bot_id=bot_id)
+                except Exception as ex:  # noqa: BLE001 - 绝不能打断出站消息
+                    observer._warn("OlivOSOnebotV11 doRouter 捕获失败", ex)
+                return res
 
-                if group_id:
-                    bot_id = ""
-                    if hasattr(self_arg, "plugin_event") and hasattr(self_arg.plugin_event, "bot_info"):
-                        bot_id = str(getattr(self_arg.plugin_event.bot_info, "id", "") or "")
-                    msg_content = params.get("message", "")
-                    observer.on_other_plugin_sent(group_id, msg_content, bot_id=bot_id)
-            except Exception as ex:
-                logger.debug("OlivOSOnebotV11 doRouter 捕获异常: %s", ex)
-            return res
-
-        OlivOSOnebotV11.eventRouter.txEvent.doRouter = _hooked_do_router
-        logger.info("已成功装载 OlivOSOnebotV11 全局出站感知钩子")
-    except Exception as e:
-        logger.debug("未发现 OlivOSOnebotV11 模块或装载失败: %s", e)
+            _hooked_do_router._geyi_hooked = True  # type: ignore[attr-defined]
+            tx_event.doRouter = _hooked_do_router
+            observer.add_detacher(lambda: setattr(tx_event, "doRouter", orig_do_router))
+            logger.info("已成功装载 OlivOSOnebotV11 全局出站感知钩子")
+    except Exception as e:  # noqa: BLE001
+        logger.info("未装载 OlivOSOnebotV11 出站钩子（模块不存在或结构变化）：%s", e)
 
     return observer

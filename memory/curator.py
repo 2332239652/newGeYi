@@ -191,11 +191,11 @@ class MemoryCurator:
         # 尊重全局每日调用预算（提炼也算调用）
         try:
             today = self.store.today_stats()
-            if today['calls'] >= int(cfg.get('daily_call_budget', 500) or 500):
+            if today['calls'] >= int(cfg.get('daily_call_budget', 999999) or 999999):
                 return False
         except Exception:  # noqa: BLE001 - 读不到统计就不拦
             pass
-        if pending >= int(cfg.get('memory_curate_messages', 20) or 20):
+        if pending >= int(cfg.get('memory_curate_messages', 40) or 40):
             return True
         idle = float(cfg.get('memory_curate_idle_seconds', 900) or 900)
         last_at = self.store.buffer_last_at(session_key, cursor)
@@ -230,7 +230,7 @@ class MemoryCurator:
             return stats
         try:
             cursor = self.cursor(session_key)
-            limit = int(self.config.get('memory_curate_max_messages', 80) or 80)
+            limit = int(self.config.get('memory_curate_max_messages', 40) or 40)
             rows = self.store.buffer_fetch(session_key, cursor, limit=limit)
             if not rows:
                 return stats
@@ -324,7 +324,7 @@ class MemoryCurator:
         根本抓不住；而模型一眼就知道这是同一件事。
         代价可控：只带本批出现过的说话人，每人最多几条。
         """
-        per_user = int(self.config.get('memory_curate_known_facts', 8) or 0)
+        per_user = int(self.config.get('memory_curate_known_facts', 5) or 0)
         if per_user <= 0:
             return ''
         try:
@@ -411,7 +411,7 @@ class MemoryCurator:
         stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
             session_key, '',
             max_per_user=0,
-            max_per_group=int(self.config.get('memory_max_facts_per_group', 200) or 0),
+            max_per_group=int(self.config.get('memory_max_facts_per_group', 600) or 0),
         )
         return stats
 

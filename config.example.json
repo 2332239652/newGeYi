@@ -1,14 +1,8 @@
 {
-  "_说明": "把本文件复制到 plugin/data/newGeYi/config.json 再改。带 api_key 的字段请勿提交到任何仓库。",
-
+  "_说明": "把本文件复制到 plugin/data/newGeYi/config.json 再改。除 api_key / endpoint / 口令外，这里的值与代码默认值一致；要省钱请自行调小 daily_call_budget / active_daily_cap。",
   "api_endpoint": "https://api.example.com/v1/chat/completions",
   "api_key": "",
   "api_protocol": "openai",
-  "fast_model": "gemini-3.8-flash",
-  "curate_model": "",
-  "fast_temperature": 0.7,
-  "fast_max_tokens": 8192,
-
   "providers": [
     {
       "name": "primary",
@@ -18,8 +12,13 @@
       "protocol": "openai",
       "priority": 1,
       "timeout": 60,
-      "kinds": ["chat", "memory_curate"],
-      "extra_body": { "reasoning_effort": "low" }
+      "kinds": [
+        "chat",
+        "memory_curate"
+      ],
+      "extra_body": {
+        "reasoning_effort": "low"
+      }
     },
     {
       "name": "local-proxy",
@@ -29,7 +28,10 @@
       "protocol": "anthropic",
       "priority": 2,
       "timeout": 45,
-      "kinds": ["chat", "memory_curate"]
+      "kinds": [
+        "chat",
+        "memory_curate"
+      ]
     },
     {
       "name": "backup",
@@ -39,7 +41,10 @@
       "protocol": "openai",
       "priority": 3,
       "timeout": 60,
-      "kinds": ["chat", "memory_curate"]
+      "kinds": [
+        "chat",
+        "memory_curate"
+      ]
     },
     {
       "name": "opt-expensive",
@@ -50,10 +55,18 @@
       "priority": 4,
       "timeout": 60,
       "manual_only": true,
-      "kinds": ["chat", "memory_curate"]
+      "kinds": [
+        "chat",
+        "memory_curate"
+      ]
     }
   ],
-
+  "fast_model": "gemini-3.8-flash-medium",
+  "curate_model": "",
+  "fast_temperature": 0.7,
+  "fast_max_tokens": 8192,
+  "extra_body": {},
+  "extra_headers": {},
   "failover": {
     "fail_threshold": 1,
     "probe_interval_seconds": 300,
@@ -64,41 +77,42 @@
     "notify_cooldown_seconds": 600,
     "switch_history_limit": 50
   },
-
-  "triggers": ["歌伊"],
-  "owner_ids": ["100000001"],
+  "triggers": [
+    "歌伊"
+  ],
+  "owner_ids": [
+    "100000001"
+  ],
   "ignore_sender_ids": [],
-
   "private_enabled": false,
   "passive_enabled": true,
   "active_enabled": true,
   "active_shadow": true,
   "active_base_cooldown": 180,
   "active_daily_cap": 60,
-  "active_quiet_hours": "01:00-07:00",
-
-  "worldbook_enabled": true,
+  "active_quiet_hours": "",
+  "worldbook_enabled": false,
   "memory_enabled": true,
-  "auto_memory_enabled": true,
   "memory_curator_enabled": true,
   "memory_curate_messages": 40,
   "memory_curate_idle_seconds": 900,
   "memory_curate_min_interval": 120,
+  "memory_curate_max_tokens_cap": 8000,
+  "memory_inject_facts": 6,
+  "memory_inject_self": 3,
+  "memory_inject_summaries": 2,
   "memory_max_facts_per_user": 12,
-
+  "assistant_name": "歌伊",
   "time_awareness_enabled": true,
-
   "image_enabled": true,
-  "image_max_per_turn": 3,
+  "image_max_per_turn": 5,
   "image_max_bytes": 4194304,
-  "image_total_max_bytes": 1572864,
-  "image_download_timeout": 10,
-
+  "image_total_max_bytes": 7340032,
+  "image_download_timeout": 15,
   "emote_enabled": true,
   "emote_min_gap_seconds": 180,
   "emote_window_replies": 5,
   "emote_hourly_cap": 6,
-
   "voice_enabled": false,
   "voice_gateway_url": "http://127.0.0.1:9885/v1/voice/synthesize",
   "voice_health_url": "http://127.0.0.1:9885/health",
@@ -107,23 +121,53 @@
   "voice_group_cooldown": 45,
   "voice_poke_rate": 0.25,
   "voice_speed": 1.0,
-
   "rest_enabled": true,
   "rest_minutes": 10,
-
   "reply_audit_enabled": true,
   "reply_audit_fallback": "",
-
   "max_recent_turns": 20,
   "max_context_chars": 32000,
   "group_live_window_seconds": 1800,
   "group_live_max_messages": 60,
   "group_live_max_chars": 16000,
   "max_reply_chars": 1200,
-
-  "request_timeout_seconds": 25,
+  "request_timeout_seconds": 45,
   "max_retries": 1,
   "global_concurrency": 4,
-  "daily_call_budget": 500,
-  "daily_output_token_budget": 100000
+  "daily_call_budget": 999999,
+  "daily_output_token_budget": 99999999,
+  "group_quota_enabled": false,
+  "group_profile_ttl_seconds": 43200,
+  "group_quota_base": 30,
+  "group_quota_per_member": 0.4,
+  "group_quota_min": 40,
+  "group_quota_max": 250,
+  "group_quota_default": 60,
+  "route_debug": false,
+  "memory_curate_max_messages": 40,
+  "memory_curate_max_tokens": 3200,
+  "memory_curate_tick_seconds": 60,
+  "image_window_seconds": 0,
+  "image_fresh_seconds": 120,
+  "active_bare_image_factor": 0.3,
+  "image_cache_seconds": 300,
+  "collapse_short_multiline": false,
+  "strip_repeated_ellipsis": true,
+  "strip_trailing_period": true,
+  "incomplete_hold_seconds": 8,
+  "incomplete_tails": [],
+  "max_pending_per_session": 6,
+  "active_min_self_gap": 45,
+  "active_self_window": 1800,
+  "active_tier_probability": {
+    "2": 0.6,
+    "3": 0.3
+  },
+  "active_tier2_seconds": 180,
+  "active_escalation_max": 8,
+  "active_escalation_cap": 0.98,
+  "active_no_response_window": 600,
+  "active_log_interval": 300,
+  "memory_max_facts_per_group": 600,
+  "memory_curate_known_facts": 5
 }

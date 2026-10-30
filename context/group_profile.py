@@ -136,7 +136,7 @@ class GroupProfile:
 
     def allow(self, session_key: str) -> tuple:
         """这个群今天还能不能调模型。返回 (是否允许, 说明)。"""
-        if not self.config.get('group_quota_enabled', True):
+        if not self.config.get('group_quota_enabled', False):
             return True, ''
         info = self.quota_for(session_key)
         used = self.used_today(session_key)
