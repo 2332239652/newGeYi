@@ -46,7 +46,10 @@ class VoiceManager:
         self.group_cooldown: float = float(cfg.get("voice_group_cooldown", 45))
         self.poke_rate: float = float(cfg.get("voice_poke_rate", 0.25))
         self.speed: float = float(cfg.get("voice_speed", 1.0))
-        self.onebot_http_url: str = str(cfg.get("voice_onebot_http_url", "http://127.0.0.1:15991/send_msg"))
+        # OneBot HTTP 直发地址：默认**不带 token**（2026-11-03 之前这里硬编码了
+        # 一个本机 OneBot 的 access_token，等于把凭据写进源码、跟着 OPK 一起发出去）。
+        self.onebot_http_url: str = str(cfg.get("voice_onebot_http_url", "") or "")
+        self.onebot_access_token: str = str(cfg.get("voice_onebot_access_token", "") or "")
 
         self.client = VoiceClient(
             gateway_url=self.gateway_url,
@@ -79,7 +82,9 @@ class VoiceManager:
             self.group_cooldown = float(config.get("voice_group_cooldown", 45))
             self.poke_rate = float(config.get("voice_poke_rate", 0.25))
             self.speed = float(config.get("voice_speed", 1.0))
-            self.onebot_http_url = str(config.get("voice_onebot_http_url", self.onebot_http_url))
+            self.onebot_http_url = str(config.get("voice_onebot_http_url", self.onebot_http_url) or "")
+            self.onebot_access_token = str(
+                config.get("voice_onebot_access_token", self.onebot_access_token) or "")
 
             self.client.update_config(
                 gateway_url=self.gateway_url,
@@ -207,6 +212,16 @@ class VoiceManager:
 
     # ---------------- 异步发送调度 ----------------
 
+    def _onebot_send_url(self) -> str:
+        """拼出 OneBot HTTP 直发地址（token 只从配置来，源码里不留凭据）。"""
+        url = str(self.onebot_http_url or '').strip()
+        if not url:
+            return ''
+        token = str(self.onebot_access_token or '').strip()
+        if token and 'access_token=' not in url:
+            url += ('&' if '?' in url else '?') + 'access_token=' + token
+        return url
+
     def send_voice_message(self, session_type: str, target_id: str | int, base64_audio: str, event: Any = None) -> bool:
         """投递 Base64 语音：优先走本地 OneBot HTTP 接口（彻底杜绝 OlivOS OP 码 url='None' 导致的未知文件路径报错），若失败则退回 event.send。"""
         tid = str(target_id).strip()
@@ -220,7 +235,8 @@ class VoiceManager:
             return False
 
         # 方式 1: 直接通过 OneBot 11 HTTP API 投递标准 JSON（彻底杜绝 url="None" 异常与 [程心自定义] 标签）
-        if self.onebot_http_url:
+        url = self._onebot_send_url()
+        if url:
             try:
                 import json
                 import requests
@@ -237,7 +253,7 @@ class VoiceManager:
                         }
                     ]
                 }
-                resp = requests.post(self.onebot_http_url, json=payload, timeout=5.0)
+                resp = requests.post(url, json=payload, timeout=5.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("retcode") == 0 or data.get("status") == "ok":
@@ -276,8 +292,12 @@ class VoiceManager:
         group_name: str = "",
         sender_name: str = "",
         on_success: Callable[[str, str, str], None] | None = None,
-    ) -> None:
+    ) -> bool:
         """在后台线程异步请求本地 TTS 并发送语音消息。
+
+        返回 **是否真的排上了**（False = 关闭 / 熔断 / 冷却 / 连发保护）。
+        调用方据此决定要不要把「发过语音」写进上下文——以前无论如何都写，
+        网关离线时她会「记得」自己发过一条根本不存在的语音。
 
         参数:
             event: OlivOS 事件对象 (具有 send(session_type, target_id, payload) 方法)
@@ -295,7 +315,7 @@ class VoiceManager:
         can, reason = self.can_send_voice(session_key, str(target_id), is_active_request)
         if not can:
             logger.debug("跳过语音合成 [%s]: %s", session_key, reason)
-            return
+            return False
 
         norm_emotion = normalize_emotion(emotion)
 
@@ -351,6 +371,7 @@ class VoiceManager:
                 logger.warning("异步发送语音异常: %s", e)
 
         self._executor.submit(_worker)
+        return True
 
     def report_reply_telemetry(self) -> None:
         """在后台线程异步上报文本回复事件，点亮本地控制台的语音触发率指标。"""

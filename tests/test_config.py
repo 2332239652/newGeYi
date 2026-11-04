@@ -44,8 +44,10 @@ CONSUMED_KEYS = (
 )
 # 历史兜底值与默认值打架、已统一的那批（抽查，关键是别反弹）
 SPOT_CHECK_FALLBACKS = {
-    'active_base_cooldown': 180,
-    'active_daily_cap': 60,
+    # 2026-11-02 闭环预算上线时这两项一起改了：冷却 180→15（交给闭环按消息条数放行）、
+    # 每群日上限 60→150（大群 3% × 2600 条 ≈ 80，60 会顶住）
+    'active_base_cooldown': 15,
+    'active_daily_cap': 320,
     'active_no_response_window': 600,
     'active_quiet_hours': '',
     'group_quota_enabled': False,
@@ -58,6 +60,19 @@ def _write_config(data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+class _ConfigCase(unittest.TestCase):
+    """写完配置必须恢复默认。
+
+    为什么：整个测试进程共用一个 GEYI_DATA_DIR（第一个 import 的模块说了算），
+    这里把磁盘上的 config.json 改成 `memory_curator_enabled: false` 之后，
+    **后面模块**的 `Runtime()` 读到的就是这份被改过的配置——
+    2026-11-03 就是这样让 `test_runtime_guards` 在跑全套时莫名其妙失败、单跑却正常。
+    """
+
+    def tearDown(self):
+        _write_config(dict(C.DEFAULT_CONFIG))
+
+
 class VersionTest(unittest.TestCase):
     def test_app_json_matches_plugin_version(self):
         """菜单/状态读 PLUGIN_VERSION，OlivOS 插件列表读 app.json —— 必须一致。"""
@@ -65,7 +80,7 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(C.version_mismatch(), '')
 
 
-class DeepMergeTest(unittest.TestCase):
+class DeepMergeTest(_ConfigCase):
     def test_partial_failover_keeps_other_keys(self):
         """只写一个子项时，其余默认值必须留着（这是判死阈值曾经从 1 变 2 的原因）。"""
         _write_config({'failover': {'probe_interval_seconds': 600}})
@@ -84,7 +99,7 @@ class DeepMergeTest(unittest.TestCase):
         self.assertEqual(cfg['triggers'], [])
 
 
-class DefaultsTest(unittest.TestCase):
+class DefaultsTest(_ConfigCase):
     def test_consumed_keys_have_defaults(self):
         for key in CONSUMED_KEYS:
             self.assertIn(key, C.DEFAULT_CONFIG, f'{key} 被代码读取，却没进 DEFAULT_CONFIG')
@@ -103,7 +118,7 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(C.missing_config_keys(), [])
 
 
-class LegacyKeyTest(unittest.TestCase):
+class LegacyKeyTest(_ConfigCase):
     def test_auto_memory_enabled_migrates(self):
         """老配置只写了废弃的 auto_memory_enabled → 迁移成 memory_curator_enabled。"""
         _write_config({'auto_memory_enabled': True})

@@ -36,7 +36,61 @@ logger = logging.getLogger('newGeYi.gateway')
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # 认证类错误：key 无效/欠费不会自己好，重试与等待都没意义
 AUTH_STATUS = {401, 403}
+# 请求本身有问题的状态码（请求体坏了 / 图太大 / 参数不合法）。
+# 这类错误**换渠道也没用**，更不能记成「渠道不健康」——否则一个坏请求就能把
+# 所有渠道判死、切到兜底渠道并锁定，还要给骰主发一条「全挂」（2026-11-03 审查发现）。
+CLIENT_ERROR_STATUS = {400, 404, 405, 409, 413, 414, 415, 422, 431, 501}
 PROBE_PROMPT = 'hi'
+
+
+def is_provider_fault(error_code: str) -> bool:
+    """这个错误码算不算「渠道自己有问题」。
+
+    - 空回复（思考链吃光 max_tokens）：是**请求/模型输出**问题，不是渠道故障；
+    - 4xx 请求错误：这一次的请求有问题，换个渠道问同一件事还是同样的错；
+    - 超时 / 连接 / 429 / 5xx / 401 / 403：渠道问题。
+    `chat()` 只有在最后一轮失败**是渠道问题**时才升级到兜底渠道并锁定。
+    """
+    code = str(error_code or '')
+    if not code:
+        return True
+    if code == 'empty_content':
+        return False
+    if code in ('no_api_key', 'no_provider'):
+        return True
+    if code.startswith('http_'):
+        try:
+            status = int(code[5:])
+        except ValueError:
+            return True
+        return status not in CLIENT_ERROR_STATUS
+    return True
+
+
+def cached_tokens_from_usage(usage: dict) -> int:
+    """从各家 response.usage 里挖出「命中前缀缓存的输入 token 数」。
+
+    各家字段名互不兼容，而且不少中转站干脆把字段透传丢了：
+    - OpenAI / 智谱：usage.prompt_tokens_details.cached_tokens
+    - DeepSeek：usage.prompt_cache_hit_tokens
+    - Anthropic（含本地 gemini 反代）：usage.cache_read_input_tokens
+    拿不到就当 0。这个数字**只用来算缓存命中率**，不参与任何业务判断。
+    """
+    try:
+        if not isinstance(usage, dict):
+            return 0
+        details = usage.get('prompt_tokens_details')
+        for value in (
+            details.get('cached_tokens') if isinstance(details, dict) else None,
+            usage.get('cached_tokens'),
+            usage.get('prompt_cache_hit_tokens'),
+            usage.get('cache_read_input_tokens'),
+        ):
+            if value:
+                return int(value)
+    except (TypeError, ValueError):
+        return 0
+    return 0
 
 # 仅单渠道兼容模式使用：opencode 网关要求 x-opencode-session 路由头
 _OPCODE_SESSION_ID = uuid.uuid4().hex
@@ -55,6 +109,10 @@ _KEY_CURRENT = 'gw.current'
 _KEY_UNHEALTHY = 'gw.unhealthy'
 _KEY_HISTORY = 'gw.history'
 _KEY_ANCHOR = 'gw.anchor'
+# 「锁定到兜底渠道」：五个候选全挂之后按骰主的口径切官方 DeepSeek 并锁死，
+# 直到有人手动「切换渠道 X」。和 anchor 分开存，因为 anchor 的语义是
+# 「不许越过它往上爬」，而这里是「**只准用它**」，用它表达不了。
+_KEY_HOLD = 'gw.hold'
 
 
 def _env_key_for(name: str) -> str:
@@ -210,6 +268,7 @@ class LLMGateway:
         self._pairs: list[tuple[Provider, ProviderState]] = []
         self._current_name = ''
         self._anchor_name = ''
+        self._hold_name = ''
         self._history: list[dict] = []
         self._last_down_notify = 0.0
         self._notify_cb = None
@@ -290,6 +349,21 @@ class LLMGateway:
         with self._lock:
             pairs = list(self._pairs)
             current = self._current_name
+            hold = self._hold_name
+
+        # 锁定兜底渠道：只准用它，一个别的都不试。
+        # 骰主的口径是「五个全挂就切官方 DeepSeek 不再尝试，直到我手动切回其中一个」——
+        # 这个语义 anchor 表达不了（anchor 只是「不许越过它往上」，
+        # 而官方 DeepSeek 排在最后，锚点逻辑会判定"之下没有渠道"从而忽略限制）。
+        if hold:
+            held = [p for p in pairs if p[0].name == hold]
+            if held:
+                return held
+            logger.warning('锁定的兜底渠道 %s 已不在配置里，自动解除锁定', hold)
+            with self._lock:
+                if self._hold_name == hold:
+                    self._hold_name = ''
+                    self._persist_locked()
 
         if kind:
             scoped = [p for p in pairs if p[0].serves(kind)]
@@ -326,7 +400,36 @@ class LLMGateway:
                 provider.name,
             )
 
-        return sorted(pairs, key=rank)
+        ordered = sorted(pairs, key=rank)
+        preferred = self._preferred_for(kind)
+        if preferred:
+            for index, pair in enumerate(ordered):
+                if pair[0].name == preferred:
+                    if not pair[1].healthy:
+                        break       # 它也挂了就别硬塞到第一个去撞墙
+                    if index:
+                        ordered.insert(0, ordered.pop(index))
+                    break
+        return ordered
+
+    # 哪些 kind 允许在配置里指定专用渠道（<kind> → 配置键名）
+    _KIND_PROVIDER_KEYS = {
+        'memory_curate': 'curate_provider',
+        'gate': 'gate_provider',
+    }
+
+    def _preferred_for(self, kind: str) -> str:
+        """某些 kind 可以固定走专用渠道，聊天本身完全不受影响。
+
+        - `memory_curate`（记忆提炼）：后台机械活，不需要聊天主力那套理解力；
+        - `gate`（搭话判断）：只要回答 SPEAK/SKIP，专用小模型 + 独立计费。
+
+        指定的渠道挂了照常按优先级往下兜底，不会因为省钱把任务饿死。
+        """
+        key = self._KIND_PROVIDER_KEYS.get(kind)
+        if not key:
+            return ''
+        return str(self.config.get(key, '') or '').strip()
 
     def has_multiple_providers(self) -> bool:
         with self._lock:
@@ -369,11 +472,15 @@ class LLMGateway:
             pairs = list(self._pairs)
             current = self._current_name
             anchor = self._anchor_name
+            hold = self._hold_name
             history = list(self._history)
         if not pairs:
             return '尚未配置任何模型渠道（config.json 的 providers 为空且缺少 api_endpoint/api_key）'
         lines = ['--- 模型渠道 ---']
-        if anchor:
+        if hold:
+            lines.append(f'⛔ 已锁定兜底渠道: {hold}（五个候选全挂后自动切入）'
+                         f' → 不再尝试其它渠道；「切换渠道 <名称|自动>」可解除')
+        elif anchor:
             anchor_provider = next((p for p, _ in pairs if p.name == anchor), None)
             model = anchor_provider.model if anchor_provider is not None else '?'
             lines.append(f'手动锚点: {anchor}（{model}）'
@@ -386,6 +493,8 @@ class LLMGateway:
                 marks += ' ← 当前'
             if provider.name == anchor:
                 marks += ' ⇤ 锚点'
+            if provider.name == hold:
+                marks += ' ⛔ 锁定'
             health = '正常' if state.healthy else f'不可用({state.last_error or "未知"})'
             tag = '可选·手动' if provider.manual_only else f'优先级{provider.priority}'
             lines.append(
@@ -416,6 +525,9 @@ class LLMGateway:
 
             if key in ('自动', 'auto', 'AUTO', 'Auto', '自动选择', '取消锚点'):
                 self._anchor_name = ''
+                # 手动操作一律解除「锁定兜底渠道」：骰主回来了就听骰主的
+                was_held = self._hold_name
+                self._hold_name = ''
                 best = None
                 for provider, state in sorted(pairs, key=lambda x: (x[0].priority, x[0].name)):
                     if provider.manual_only or not state.healthy:
@@ -429,7 +541,8 @@ class LLMGateway:
                 self._current_name = best.name
                 self._append_history_locked(old, best.name, 'manual', '取消锚点')
                 self._persist_locked()
-                return (f'✅ 已取消手动锚点，当前渠道 {best.name}（{best.model}），'
+                note = '（已解除兜底锁定）' if was_held else ''
+                return (f'✅ 已取消手动锚点{note}，当前渠道 {best.name}（{best.model}），'
                         f'恢复成按优先级自动恢复')
 
             target = None
@@ -444,20 +557,23 @@ class LLMGateway:
                 return f'找不到渠道：{key}（用「渠道状态」看可用列表）'
             old = self._current_name
             same = (target.name == old)
+            was_held = bool(self._hold_name)
             self._current_name = target.name
             self._anchor_name = target.name
+            self._hold_name = ''        # 手动指定锚点 = 解除兜底锁定
             state = next(st for p, st in pairs if p.name == target.name)
             state.healthy = True
             state.fail_count = 0
             state.last_error = ''
             self._append_history_locked(old, target.name, 'manual', '锚点')
             self._persist_locked()
+            unlock = '\n（已解除「五连挂后锁定兜底渠道」的状态）' if was_held else ''
             if same:
                 return (f'✅ {target.name}（{target.model}）本来就是当前渠道，'
-                        f'已设为手动锚点，自动恢复只会回到这里')
+                        f'已设为手动锚点，自动恢复只会回到这里{unlock}')
             return (f'✅ 已切换到渠道 {target.name}（{target.model}）\n'
                     f'已设为手动锚点：故障时只在它以下的渠道里找备份，'
-                    f'恢复也只回到这里（「切换渠道 自动」可取消）')
+                    f'恢复也只回到这里（「切换渠道 自动」可取消）{unlock}')
 
     # ==================== 调用 ====================
     def chat(self, req: ModelRequest, kind: str = 'chat', session_key: str = '') -> ModelResult:
@@ -469,14 +585,70 @@ class LLMGateway:
         start = time.time()
         last_error = 'unknown'
         last_message = ''
-        for provider, state in candidates:
-            result = self._call_provider(provider, state, req, kind, session_key)
-            if result.ok:
-                return result
-            last_error = result.error_code or last_error
-            last_message = result.error_message or last_message
-        # 所有渠道都失败
-        self._notify_all_down(last_error)
+        # 总时长预算：5 个候选 × 2 轮 × (重试) × 单渠道超时，最坏能到 8 分钟，
+        # 而调度器的看门狗是 300 秒 —— 会先把这次任务当成"卡死"再踢掉。
+        budget = float(self._failover_cfg.get('total_timeout_seconds', 60) or 0)
+        deadline = (start + budget) if budget > 0 else 0.0
+        # 骰主口径（2026-11-01）：「第 5 个挂了就重回第一个开始连接」——
+        # 一轮走到底不算完，要整轮重来一次（failover_full_cycles，默认 2 轮）。
+        # 只有一个候选时不做第二轮：_call_provider 内部已经重试过了，纯浪费延迟。
+        cycles = max(1, int(self._failover_cfg.get('full_cycles', 2) or 1))
+        if len(candidates) < 2:
+            cycles = 1
+        empty_retry_used = False
+        for cycle in range(cycles):
+            for provider, state in candidates:
+                if deadline and time.time() > deadline:
+                    last_error = last_error if last_error != 'unknown' else 'deadline'
+                    logger.warning('模型调用总时长超过 %.0fs（%s），停止本次故障转移',
+                                   budget, last_error)
+                    break
+                # 第二轮跳过「key 无效」这类不会自己好的渠道：重试一次只是白等。
+                # 超时 / 5xx / 空回复仍然照骰主的意思再撞一次（可能是瞬时抖动）。
+                if cycle and state.last_error in ('http_401', 'http_403', 'no_api_key'):
+                    continue
+                result = self._call_provider(provider, state, req, kind, session_key)
+                if result.ok:
+                    if cycle:
+                        logger.info('第 %d 轮才连通：%s（前一轮全军覆没后才接上）',
+                                    cycle + 1, provider.name)
+                    return result
+                last_error = result.error_code or last_error
+                last_message = result.error_message or last_message
+                if not is_provider_fault(last_error):
+                    # 空回复（思考链吃光预算）**不是渠道故障**，换一个模型再试一次还有救；
+                    # 4xx 是这一次请求本身有问题，换渠道问同一件事还是同样的错，立刻收手。
+                    # 两种情况都**不判渠道死、不升级兜底、不给骰主发「全挂」**。
+                    if last_error == 'empty_content' and not empty_retry_used:
+                        empty_retry_used = True
+                        logger.warning('空回复（非渠道故障），换下一个渠道再试一次：%s',
+                                       provider.name)
+                        continue
+                    logger.warning('请求级错误 %s，停止故障转移（不判渠道失败）：%s',
+                                   last_error, provider.name)
+                    return ModelResult(
+                        ok=False, model=req.model,
+                        latency_ms=int((time.time() - start) * 1000),
+                        error_code=last_error, error_message=last_message,
+                    )
+            if cycle + 1 < cycles:
+                logger.warning('第 %d 轮 %d 个渠道全失败（%s），回到第一个渠道再来一轮',
+                               cycle + 1, len(candidates), last_error)
+            if deadline and time.time() > deadline:
+                break
+        if not is_provider_fault(last_error):
+            # 兜底：到这一步说明是请求/内容问题，不该触发「全挂」流程
+            return ModelResult(
+                ok=False, model=req.model,
+                latency_ms=int((time.time() - start) * 1000),
+                error_code=last_error, error_message=last_message,
+            )
+        # 两轮都没活口
+        if self._hold_name:
+            # 已经锁在兜底渠道上还失败：按冷却通知，不做二次降级
+            self._notify_all_down(last_error)
+        else:
+            self._escalate_to_last_resort(last_error)
         return ModelResult(
             ok=False,
             model=req.model,
@@ -484,6 +656,59 @@ class LLMGateway:
             error_code=last_error,
             error_message=last_message,
         )
+
+    def _escalate_to_last_resort(self, error_code: str) -> None:
+        """候选渠道全挂 → 通知骰主 + 切到兜底渠道并锁定（等人手动切回）。
+
+        骰主原话：「五个全测了一轮都挂了就给骰主发一条通知然后切换官方 Deepseek 为锚点
+        不再尝试，直到我手动切回那五个中的一个为锚点」。
+
+        实现要点：
+        - **锁定**（`gw.hold`）而不是普通锚点：官方 DeepSeek 排在最后，普通锚点的
+          「不许越过它往上」语义在这里会被 "之下没有渠道" 的兜底逻辑绕过；
+        - 锁定期间 `probe_once` 不再自动爬回，`_switch_locked` 也不再把渠道切走；
+        - 解除只有一条路：骰主「切换渠道 X」或「切换渠道 自动」。
+        """
+        name = str(self._failover_cfg.get('last_resort_provider', 'official-chat') or '').strip()
+        if not name:
+            self._notify_all_down(error_code)
+            return
+        with self._lock:
+            target = next((p for p, _ in self._pairs if p.name == name), None)
+            if target is None:
+                # 没配兜底渠道：退回老行为（只发通知）
+                self._notify_all_down(error_code)
+                return
+            if self._hold_name == name and self._current_name == name:
+                self._notify_all_down(error_code)
+                return
+            old = self._current_name
+            self._current_name = name
+            self._hold_name = name
+            self._anchor_name = ''          # 锁定时锚点无意义，清掉免得多一套限制打架
+            state = next(st for p, st in self._pairs if p.name == name)
+            state.healthy = True
+            state.fail_count = 0
+            state.last_error = ''
+            self._append_history_locked(old, name, 'all_down', error_code)
+            self._persist_locked()
+        logger.warning('候选渠道两轮全挂（%s），已切到兜底渠道 %s 并锁定；'
+                       '「切换渠道 X」可解除', error_code, name)
+        cfg = self._failover_cfg
+        if not cfg.get('notify_owner', True) or self._notify_cb is None:
+            return
+        tried = '、'.join(dict.fromkeys(p.name for p, _ in self._pairs)) or '（无）'
+        try:
+            self._notify_cb(
+                f'🚨 歌伊的模型渠道全挂了（最后一次错误：{error_code}）\n'
+                f'候选渠道：{tried}\n'
+                f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
+                f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。'
+            )
+            with self._lock:
+                self._last_down_notify = time.time()
+        except Exception:  # noqa: BLE001 - 通知失败不影响主流程
+            logger.exception('通知骰主失败')
 
     def _call_provider(self, provider: Provider, state: ProviderState,
                        req: ModelRequest, kind: str, session_key: str) -> ModelResult:
@@ -513,13 +738,14 @@ class LLMGateway:
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        ok, content, input_tokens, output_tokens, err_msg = self._parse_response(provider, data)
+                        ok, content, input_tokens, output_tokens, cached_tokens, err_msg = self._parse_response(provider, data)
                         if not ok:
                             last_error = 'empty_content'
                             result = ModelResult(
                                 ok=False, model=provider.model,
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
+                                cached_tokens=cached_tokens,
                                 latency_ms=int((time.time() - start) * 1000),
                                 error_code=last_error, error_message=err_msg or '模型没有输出内容',
                             )
@@ -532,6 +758,7 @@ class LLMGateway:
                             model=provider.model,
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
+                            cached_tokens=cached_tokens,
                             latency_ms=int((time.time() - start) * 1000),
                         )
                         self._record(session_key, kind, result)
@@ -693,7 +920,7 @@ class LLMGateway:
         body.update(provider.extra_body)
         return url, body
 
-    def _parse_response(self, provider: Provider, data: dict) -> tuple[bool, str, int, int, str]:
+    def _parse_response(self, provider: Provider, data: dict) -> tuple[bool, str, int, int, int, str]:
         if provider.protocol == 'anthropic':
             raw_content = data.get('content', [])
             text_parts = []
@@ -718,14 +945,15 @@ class LLMGateway:
             usage = data.get('usage') or {}
             input_tokens = int(usage.get('input_tokens') or 0)
             output_tokens = int(usage.get('output_tokens') or 0)
+            cached_tokens = cached_tokens_from_usage(usage)
 
             if not text:
                 msg = '思考链耗尽 max_tokens' if (thinking and data.get('stop_reason') == 'max_tokens') else '模型没有输出内容'
-                return False, '', input_tokens, output_tokens, msg
+                return False, '', input_tokens, output_tokens, cached_tokens, msg
             if _UPSTREAM_SAFETY_RE.search(text):
                 logger.warning('渠道 %s [%s] 触发上游安全策略拦截：%s', provider.name, provider.model, text[:120])
-                return False, '', input_tokens, output_tokens, 'upstream_safety_block'
-            return True, text, input_tokens, output_tokens, ''
+                return False, '', input_tokens, output_tokens, cached_tokens, 'upstream_safety_block'
+            return True, text, input_tokens, output_tokens, cached_tokens, ''
 
         choices = data.get('choices') or []
         message = (choices[0].get('message') if choices else None) or {}
@@ -733,12 +961,13 @@ class LLMGateway:
         usage = data.get('usage') or {}
         input_tokens = int(usage.get('prompt_tokens', 0))
         output_tokens = int(usage.get('completion_tokens', 0))
+        cached_tokens = cached_tokens_from_usage(usage)
         if not isinstance(content, str) or not content.strip():
-            return False, '', input_tokens, output_tokens, '模型没有输出内容'
+            return False, '', input_tokens, output_tokens, cached_tokens, '模型没有输出内容'
         if _UPSTREAM_SAFETY_RE.search(content):
             logger.warning('渠道 %s [%s] 触发上游安全策略拦截：%s', provider.name, provider.model, content[:120])
-            return False, '', input_tokens, output_tokens, 'upstream_safety_block'
-        return True, content.strip(), input_tokens, output_tokens, ''
+            return False, '', input_tokens, output_tokens, cached_tokens, 'upstream_safety_block'
+        return True, content.strip(), input_tokens, output_tokens, cached_tokens, ''
 
     def _get_session(self) -> requests.Session:
         s = getattr(self._local, 'session', None)
@@ -774,10 +1003,13 @@ class LLMGateway:
                 self._persist_locked()
 
     def _mark_failure(self, provider: Provider, state: ProviderState, error_code: str) -> None:
-        # empty_content 是模型输出问题（例如思考模式耗尽 max_tokens），不是渠道故障
-        if error_code == 'empty_content':
+        # 只有**渠道自己的问题**才算失败：空回复是模型输出问题（思考模式耗尽 max_tokens），
+        # 4xx 是这次请求本身有问题。以前这两类都被记成渠道故障 → 两轮之后切兜底 + 锁定 +
+        # 给骰主发「渠道全挂」，一个坏请求就能造成这个后果（2026-11-03 审查发现）。
+        if not is_provider_fault(error_code):
+            logger.warning('请求级错误（%s）不计入渠道健康：%s', error_code, provider.name)
             return
-        threshold = int(self._failover_cfg.get('fail_threshold', 2) or 1)
+        threshold = int(self._failover_cfg.get('fail_threshold', 1) or 1)
         immediate = error_code in ('http_401', 'http_403', 'no_api_key')
         with self._lock:
             state.fail_count += 1
@@ -798,6 +1030,9 @@ class LLMGateway:
         `manual_only` 的可选渠道不是自动切换的目标；锚点下方全挂时才越过锚点兜底。
         """
         with self._lock:
+            # 锁定兜底渠道期间不做任何自动切换：骰主要的就是「别再尝试」，等人手动切回
+            if self._hold_name:
+                return False
             pairs = list(self._pairs)
             ceiling = self._anchor_priority_locked()
 
@@ -908,6 +1143,9 @@ class LLMGateway:
         cfg = self._failover_cfg
         need = max(1, int(cfg.get('probe_success_needed', 1) or 1))
         with self._lock:
+            if self._hold_name:
+                # 锁定兜底渠道期间不探测、不爬回：这是骰主明说的「不再尝试」
+                return []
             pairs = list(self._pairs)
             current = self._current_name
             anchor = self._anchor_name
@@ -1017,6 +1255,7 @@ class LLMGateway:
         try:
             self.store.set_setting(_KEY_CURRENT, self._current_name)
             self.store.set_setting(_KEY_ANCHOR, self._anchor_name)
+            self.store.set_setting(_KEY_HOLD, self._hold_name)
             unhealthy = [p.name for p, st in self._pairs if not st.healthy]
             self.store.set_setting(_KEY_UNHEALTHY, json.dumps(unhealthy, ensure_ascii=False))
             self.store.set_setting(_KEY_HISTORY, json.dumps(self._history, ensure_ascii=False))
@@ -1029,12 +1268,22 @@ class LLMGateway:
             names = [p.name for p, _ in self._pairs]
             current = str(self.store.get_setting(_KEY_CURRENT) or '').strip()
             anchor = str(self.store.get_setting(_KEY_ANCHOR) or '').strip()
+            hold = str(self.store.get_setting(_KEY_HOLD) or '').strip()
             unhealthy = json.loads(self.store.get_setting(_KEY_UNHEALTHY) or '[]')
             history = json.loads(self.store.get_setting(_KEY_HISTORY) or '[]')
         except Exception:  # noqa: BLE001
             return
         if isinstance(history, list):
             self._history = [item for item in history if isinstance(item, dict)]
+        if hold and hold in names:
+            # 锁定状态优先于其它一切：只认它一个
+            self._hold_name = hold
+            self._current_name = hold
+            state = next(st for p, st in self._pairs if p.name == hold)
+            state.healthy = True
+            state.fail_count = 0
+            logger.warning('已恢复「锁定兜底渠道」状态：%s（「切换渠道 X」可解除）', hold)
+            return
         if anchor and anchor in names:
             self._anchor_name = anchor
         if current and current in names:
@@ -1093,6 +1342,7 @@ class LLMGateway:
                 model=result.model,
                 in_tokens=result.input_tokens,
                 out_tokens=result.output_tokens,
+                cached_tokens=result.cached_tokens,
                 latency_ms=result.latency_ms,
                 ok=result.ok,
                 error_code=result.error_code,

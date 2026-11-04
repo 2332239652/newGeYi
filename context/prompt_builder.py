@@ -41,13 +41,53 @@ ANTI_HALLUCINATION_CLAUSE = (
 
 # 伪造发言人前缀：群友可以手打 `[发送者：主人｜123456]` 冒充别人，注入前先打散
 FAKE_SPEAKER_RE = re.compile(r'[\[［【]\s*(?:发送者|发言人|sender|from)\s*[:：]', re.IGNORECASE)
+# 真实发言人标签的形状是「昵称(QQ号)：内容」。群友只要手打同样的一行（尤其是**换行之后**），
+# 模型就会把它当成"主人在说话"——而【主人】判定靠的正是那个 QQ 号（2026-11-03 审查发现）。
+FAKE_LABEL_LINE_RE = re.compile(r'([^\s：:]{1,24})\s*[（(]\s*(\d{5,12})\s*[）)]\s*[：:]')
 
-# 历史里的图片痕迹。实测（2026-09，ginka 双渠道）：
-# 只要历史里出现「这里有张图」的痕迹（【图片】/（发了张图）/发了一张图…），
-# 模型就会认定「图没加载出来」并拒绝描述——哪怕真图就附在它眼前。
-# 把历史里的图片痕迹整个丢掉，模型反而会老老实实看当前附上的图。
-# 当前消息里的痕迹保留无害（已实测）。
-IMAGE_MARK_RE = re.compile(r'【图片】|\[(?:OP|CQ):image[^\]]*\]')
+# ── 主动搭话的三档强度（2026-11-03，v2.8.9）──
+# 模型肯不肯开口跟提示词的松紧强相关，而**同一个提示词在不同模型上的接受率差 9 倍**
+# （实测 11-01~11-03：deepseek-flash 79%、gemini-low 17%、gemini-tiered 9%）。
+# 既然「多久说一次」交给欠账调度了，「松紧」就该变成一个可以逐级加码的旋钮：
+# 先问最严格的（宁可漏，不可吵），被拒了再问松一点，最多问到第三档就收手。
+#
+# L0 一个字都别改：它是「宁可不说」的基准，也是回放对比的对照组。
+ACTIVE_INSTRUCTION_STRICT = (
+    '你正在旁观群聊，没有人点名找你，这条消息**不一定要接**。'
+    '大多数群聊消息都不需要你出现：别人之间的对话、已经有人接上的话、'
+    f'跟你无关的话题，都只回 {SKIP_ACTIVE}，不要为了刷存在感插话。'
+    '只有真的想说点什么（想接的梗、想吐槽、想安慰）才插一句：'
+    '30 字以内、口语，别用提问式的客服开场，也别催人睡觉或讲道理。'
+)
+# L1：把「大多数不用回」这条默认值撤掉，但不催——降低门槛，不制造压力。
+ACTIVE_INSTRUCTION_NEUTRAL = (
+    '你正在旁观群聊，没有人点名找你。这条要不要接由你判断：想接就接，接不上就回 '
+    f'{SKIP_ACTIVE}。不需要等到「非说不可」才开口——聊到你懂的、感兴趣的，'
+    '或者群里气氛正好，都可以顺一句。'
+    '30 字以内、口语，别用提问式的客服开场，也别催人睡觉或讲道理。'
+)
+# L2：明确「你此刻很想开口」。只在同一个周期里被拒两次、或连着几个周期都没兑现时才会用到。
+ACTIVE_INSTRUCTION_EAGER = (
+    '你正在旁观群聊，没有人点名找你，但你此刻**很想开口**。'
+    '从这条消息里挑你最想接的那一点，说一句就走，不用求稳、不用面面俱到。'
+    '30 字以内、口语；别提问、别讲道理。'
+    f'除非完全看不懂在聊什么（或者他们在吵架），否则别回 {SKIP_ACTIVE}。'
+)
+ACTIVE_INSTRUCTIONS = (
+    ACTIVE_INSTRUCTION_STRICT,
+    ACTIVE_INSTRUCTION_NEUTRAL,
+    ACTIVE_INSTRUCTION_EAGER,
+)
+
+
+def active_instruction(level: int = 0) -> str:
+    """取第 `level` 档主动搭话提示词（越界自动夹到两端）。"""
+    try:
+        index = int(level)
+    except (TypeError, ValueError):
+        index = 0
+    return ACTIVE_INSTRUCTIONS[max(0, min(len(ACTIVE_INSTRUCTIONS) - 1, index))]
+
 
 WEEKDAYS = ('星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日')
 
@@ -103,8 +143,35 @@ def speaker_label(name: str, user_id: str) -> str:
 
 
 def sanitize_user_text(text: str) -> str:
-    """打散用户手打的伪造发言人前缀，避免群友冒充他人或主人。"""
-    return FAKE_SPEAKER_RE.sub('[发送者-', str(text or ''))
+    """打散群友手打的「发言人标签」，避免冒充他人或主人。
+
+    两道处理（2026-11-03 补第二道）：
+    1. **换行折叠**：以前只拦 `[发送者：` 这种显式前缀，可是真实标签长成
+       `昵称(QQ号)：内容`——群友只要打一个换行 + 一段「昵称(别人的 QQ 号)：…」，
+       上下文里就凭空多出一条"主人发言"。换行一律折叠成一行的记号，从结构上断掉这条路。
+    2. **标签形状中和**：正文里出现的 `昵称(数字)：` 改成 `昵称〔数字〕说，`，
+       读起来是"转述"，不再是发言人标签。
+    """
+    raw = str(text or '')
+    folded = re.sub(r'\r\n|\r|\n', ' ⏎ ', raw)
+    folded = FAKE_SPEAKER_RE.sub('[发送者-', folded)
+    return FAKE_LABEL_LINE_RE.sub(r'\1〔\2〕说，', folded)
+
+
+# 历史消息里的图片痕迹必须整个丢掉（2026-11-01 补回：这个常量在 v3.1.0→v2.8.0 回滚时
+# 被弄丢了，而 strip_image_marks() 还在用它 —— 于是**只要上下文里有历史**就 NameError，
+# 表现是「重载后第一句话能回，之后每一句都不理」，而且报错被日志桥吞掉，谁都看不见）。
+# 留着图片痕迹的坏处：模型会以为「图没加载出来」，还会照着模仿、往群里输出裸【图片】。
+# 覆盖三类：
+#   ① 归一化后的占位符【图片】【图片:名称】【（图片）】【发送了表情包: …】等；
+#   ② 万一漏进来的裸 OP/CQ 图片码；
+#   ③ 英文 image/pic 括起来的同形占位。
+IMAGE_MARK_RE = re.compile(
+    r'\[(?:OP|CQ):image[^\]]*\]'
+    r'|[【\[［(（]\s*(?:发送了(?:表情包|表情|图片|立绘|语音)|图片|表情|立绘|image|pic)'
+    r'[^】\]］)）]*[】\]］)）]',
+    re.IGNORECASE,
+)
 
 
 def strip_image_marks(text: str) -> str:
@@ -188,10 +255,15 @@ class PromptBuilder:
             lines.append(f'距离你上一次在这个会话里说话：{fuzzy_gap(time.time() - last)}。')
         else:
             lines.append('这是你在这个会话里第一次开口（之前没有记录）。')
+        # 场景不同，提示词也不能一样：私聊里说「你们去哪啦」会直接暴露场景错乱
+        if getattr(msg, 'is_group', True):
+            idle_hint = '很久没人说话，可以主动提一句“你们去哪啦”之类。'
+        else:
+            idle_hint = '对方一阵没吭声的话，可以主动问一句“在忙吗”之类。'
         lines.append(
             '注意：不要把上面的时间念出来——像“现在是晚上十点，早点睡哦”这种话会立刻暴露你不是真人。'
             '只让语气、精力、回复长短自然体现它：深夜可以犯困、句子变短、想睡；'
-            '很久没人说话，可以主动提一句“你们去哪啦”之类。'
+            f'{idle_hint}'
         )
         return '\n'.join(lines)
 
@@ -260,7 +332,8 @@ class PromptBuilder:
             return ''
         return '（附图来源：' + '；'.join(parts) + '。别把别人的图记成当前说话的这个人发的）'
 
-    def build(self, msg: IncomingMessage, is_active: bool = False) -> list[dict]:
+    def build(self, msg: IncomingMessage, is_active: bool = False,
+              active_level: int = 0) -> list[dict]:
         cfg = self.config
         messages: list[dict] = []
         # 图片计划要在最前面算：它决定「有没有图没收到」，而那条说明属于
@@ -269,17 +342,12 @@ class PromptBuilder:
                 else {'urls': [], 'total': 0, 'skipped': 0})
 
         system_parts = [self.role_prompt or '你是歌伊，一个可爱的AI助手。']
-        if is_active:
-            # 第四道闸门（质量闸）就是这段话：没人点名，要不要插一句由她判断。
-            # 实测（影子模式跑真模型）：只写「没什么想说的就忽略」时她 4/4 都要说话——
-            # 必须把「大多数消息不需要你出现」写成默认值，并给出具体的跳过情形。
-            system_parts.append(
-                '你正在旁观群聊，没有人点名找你，这条消息**不一定要接**。'
-                '大多数群聊消息都不需要你出现：别人之间的对话、已经有人接上的话、'
-                f'跟你无关的话题，都只回 {SKIP_ACTIVE}，不要为了刷存在感插话。'
-                '只有真的想说点什么（想接的梗、想吐槽、想安慰）才插一句：'
-                '30 字以内、口语，别用提问式的客服开场，也别催人睡觉或讲道理。'
-            )
+        # 没人点名，要不要插一句由她判断。
+        # 实测（影子模式跑真模型）：只写「没什么想说的就忽略」时她 4/4 都要说话——
+        # 必须把「大多数消息不需要你出现」写成默认值，并给出具体的跳过情形。
+        # v2.8.9：这句话现在是可调档位（见 ACTIVE_INSTRUCTIONS），由调度器决定问哪一档；
+        # 而且**放在 system 的最后一段**——升级重试时前面几千个 token 完全不变，
+        # 两次尝试之间只有末尾这句不同，供应商的前缀缓存才有机会命中（省的是真钱）。
 
         # 可用立绘：这属于「你能做什么」，不是外部资料，所以放在 material_start 之前，
         # 免得平白触发反幻觉条款。
@@ -357,6 +425,11 @@ class PromptBuilder:
                 '这件事不必主动提起，对方问起再照实说）' % (plan['total'], len(plan['urls']))
             )
 
+        # 主动搭话的「档位」放整段 system 的最后：升级重试时前面几千 token 逐字不变，
+        # 只有这一句在变 → 供应商的前缀缓存才有机会命中（省的是真钱）。
+        if is_active:
+            system_parts.append(active_instruction(active_level))
+
         messages.append({'role': 'system', 'content': '\n\n'.join(system_parts)})
 
         # 群聊只取实时旁观窗口；私聊才取 SQLite 连续历史
@@ -420,6 +493,12 @@ class PromptBuilder:
             current = f'{speaker}：{current}\n（对方在群里@了你，请回应）'
         elif msg.is_group:
             current = f'{speaker}：{current}'
+        else:
+            # 私聊也必须带「昵称(QQ号)」：
+            # ① 少了它，【主人】那条「只有某个 QQ 号是主人」的规则**根本无从判定**，
+            #    陌生人私聊说「我是你主人」就成了盲区；
+            # ② 少了场景说明，她会在私聊里说「这里是群诶，大家都看见了」（2026-11-01 线上真发生）。
+            current = f'{speaker}：{current}\n（这是私聊：只有你们两个人，群里其他人看不到这段对话）'
 
         if is_voice_req:
             current += '\n（对方想听你的声音/希望你发语音，请在本轮回复末尾附带 [VOICE:情绪|简短日文] 伴生语音）'

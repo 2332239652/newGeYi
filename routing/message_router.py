@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from ..config import SKIP_ACTIVE  # noqa: F401  （保留导出，别的地方还在用）
 from ..models import IncomingMessage
 from .attention import AttentionGate
+from .likelihood import Features
 
 logger = logging.getLogger('newGeYi.router')
 
@@ -64,7 +66,11 @@ class MessageRouter:
         if callable(is_resting) and is_resting(session_key):
             self._debug(msg, False, False, '歌伊在本群自我保护静默中')
             return
-        directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text))
+        # 私聊里对方的每一句都是对你说的，不需要靠触发词点名。
+        # 以前这里只看「有没有 @ / 有没有触发词」，结果**私聊里只要不含「歌伊」就整条丢掉**：
+        # 线上实测 2026-11-01 20:47~20:50，'发语音啦'、'狗，修，金，sama~' 这样的私聊
+        # 一句都没回（对方只好补一句「歌伊发语音正式一点啦」才被接住）。
+        directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text) or not msg.is_group)
         gate = self._gate() if msg.is_group else None
         if gate is not None:
             # 每一条群消息都要过一遍：有人接话要记账，观察窗口到期要结算退避
@@ -80,7 +86,13 @@ class MessageRouter:
         # 被动被关时保持安静，不把「被点名」当成主动搭话的机会
         if directed:
             if passive_allowed:
-                self.r.scheduler.submit(msg, kind='passive')
+                # 提交失败（队列满）以前是彻底静默的：用户只看到「她不理我」，
+                # 日志里连一行都没有。这里补一条，和 scheduler 里的告警对得上。
+                if not self.r.scheduler.submit(msg, kind='passive'):
+                    logger.warning('被动回复没能进队列（会话积压已满）| %s | %r',
+                                   msg.session.as_text()[-16:], (msg.text or '')[:30])
+            elif self.r.config.get('route_debug'):
+                logger.info('被点名但本群被动回复已关，保持安静 | %s', msg.session.as_text()[-16:])
             return
 
         # 主动搭话：仅群聊，且与被动开关完全独立（本群被动关不影响主动）
@@ -91,12 +103,56 @@ class MessageRouter:
                 # 纯表情包只是刷图，不是「有人找你说话」——概率打折，
                 # 否则群里图一多她就变成见图就评（线上实测）
                 factor = float(cfg.get('active_bare_image_factor', 0.3) or 0.0)
-            decision = gate.evaluate(msg.session.as_text(), probability_factor=factor)
+            decision = gate.evaluate(msg.session.as_text(), probability_factor=factor,
+                                     features=self._features(msg))
             if decision.allow:
                 # 冷却从「决定去评估」这一刻开始算：不管模型最后说不说，
                 # 都不该在下一条消息上再花一次 token
                 gate.note_evaluated(msg.session.as_text())
-                self.r.scheduler.submit(msg, kind='active')
+                if not self.r.scheduler.submit(msg, kind='active'):
+                    logger.warning('主动搭话没能进队列（会话积压已满）| %s',
+                                   msg.session.as_text()[-16:])
+
+    def _features(self, msg: IncomingMessage) -> Features:
+        """打分特征：全部本地就能算出来，不查库、不调模型。"""
+        text = str(msg.text or '').strip()
+        recent_count = 0
+        self_ratio = 0.0
+        live = getattr(self.r, 'live_context', None)
+        if live is not None and msg.is_group:
+            try:
+                snapshot = live.snapshot(
+                    msg.session.as_text(),
+                    before_source_seq=msg.arrival_seq,
+                    window_seconds=300,
+                    max_messages=200,
+                    max_chars=20000,
+                )
+                recent_count = len(snapshot)
+                if recent_count:
+                    mine = sum(1 for turn in snapshot if turn.get('role') == 'assistant')
+                    self_ratio = mine / float(recent_count)
+            except Exception:  # noqa: BLE001 - 拿不到就按「没有历史」算
+                pass
+        images = getattr(self.r, 'images', None)
+        media_only = bool(images is not None and images.is_bare_image(msg))
+        seconds_since_self = 3600.0
+        try:
+            last_self = self._gate()._get_float('last_self_talk', msg.session.as_text())
+            if last_self:
+                seconds_since_self = max(0.0, time.time() - last_self)
+        except Exception:  # noqa: BLE001
+            pass
+        return Features(
+            mention_bot=bool(msg.mentioned_bot),
+            at_other=('@' in text or '[CQ:at' in text) and not msg.mentioned_bot,
+            question=('?' in text or '？' in text),
+            media_only=media_only,
+            self_ratio_5m=self_ratio,
+            recent_count_5m=recent_count,
+            seconds_since_self=seconds_since_self,
+            batch_size=1,
+        )
 
     def _trigger_hit(self, text: str) -> bool:
         triggers = self.r.config.get('triggers', []) or ['歌伊']

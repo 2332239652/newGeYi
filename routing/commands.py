@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 import os
 import re
 import threading
@@ -14,6 +16,8 @@ from ..memory.exporter import export_memory
 from ..models import IncomingMessage
 from ..presentation.renderer import load_emote_table  # noqa: F401  （保留导出）
 
+logger = logging.getLogger('newGeYi.commands')
+
 
 def _mask_key(key: str) -> str:
     """回显时只显示掩码，明文不落聊天记录。"""
@@ -23,11 +27,45 @@ def _mask_key(key: str) -> str:
     return key[:4] + '****' + key[-4:]
 
 
+# 用量拆账用的中文标签（kind 是网关口径，别在别处再写一遍字面量）
+KIND_LABELS = {
+    'gate': '搭话判断',
+    'active': '主动回复',
+    'passive': '被动回复',
+    'memory_curate': '记忆提炼',
+    'chat': '聊天',
+}
+
+
 class CommandRouter:
     def __init__(self, runtime):
         self.r = runtime
 
     # ------------- 公共 -------------
+    def _save_and_reload(self, changes: dict | None = None) -> None:
+        """改配置 + 写盘 + 热更新（配置字典 identity 不变，所有组件立刻看到新值）。
+
+        - `changes` 是要改的键值；**先快照再改**，所以写盘失败能把内存一起回滚
+          （否则会出现「命令说没写盘、行为却已经变了」这种更难查的状态）。
+        - 写盘失败抛 `ConfigWriteBlocked`，由 `try_handle` 统一回一句「没有写盘」，
+          **绝不**用默认配置覆盖用户手改的文件。
+        """
+        cfg = self.r.config
+        snapshot = copy.deepcopy(cfg)
+        if changes:
+            cfg.update(changes)
+        try:
+            plugin_config.save_config(cfg)
+        except Exception:
+            cfg.clear()
+            cfg.update(snapshot)
+            raise
+        reload_fn = getattr(self.r, 'reload_config', None)
+        if callable(reload_fn):
+            error = reload_fn()
+            if error:
+                logger.warning('配置热更新有问题：%s', error)
+
     def _cmd_menu(self, msg: IncomingMessage) -> str:
         cfg = self.r.config
         wb_state = '开' if cfg.get('worldbook_enabled') else '关'
@@ -41,7 +79,7 @@ class CommandRouter:
             f'--- 歌伊菜单 v{plugin_config.PLUGIN_VERSION} ---',
             '',
             '[状态] 歌伊状态 | 今日用量',
-            '[对话] 记住 <内容> | 忘了我',
+            '[对话] 我的记忆 / 查看记忆 | 忘了我',
             '[世界书] 世界书状态',
             '',
             '[骰主/主人] 渠道状态 | 切换渠道 <名称/序号> | 切换渠道 自动',
@@ -118,6 +156,20 @@ class CommandRouter:
                 rest_line = '自我保护静默: 未触发'
         except Exception:  # noqa: BLE001
             rest_line = '自我保护静默: 读取失败'
+        # 调度队列：回答「她是不是卡在队列里了」——2026-11-01 那次故障就卡在这里，
+        # 而当时没有任何一行能看出这一点。
+        try:
+            scheduler = getattr(self.r, 'scheduler', None)
+            snap = scheduler.pending_snapshot() if scheduler is not None else {}
+            if snap.get('executor_down'):
+                queue_line = '队列: 线程池已关闭（异常，重载插件可恢复）'
+            elif snap.get('total'):
+                queue_line = '队列: 待处理 %d 条（%d 个会话在排队）' % (
+                    snap['total'], len(snap.get('sessions') or {}))
+            else:
+                queue_line = '队列: 空闲'
+        except Exception:  # noqa: BLE001
+            queue_line = '队列: 读取失败'
         return '\n'.join([
             f'--- 歌伊状态 v{plugin_config.PLUGIN_VERSION} ---',
             key_line,
@@ -129,6 +181,7 @@ class CommandRouter:
             memory_line,
             quota_line,
             rest_line,
+            queue_line,
             f'今日调用: {today["calls"]}/{budget} | 今日输出token: {today["output_tokens"]}',
             f'今日主动搭话: {today["active_calls"]} 次',
             f'触发词: {", ".join(cfg.get("triggers", [])) or "歌伊"}',
@@ -187,10 +240,7 @@ class CommandRouter:
         return attention.stats_text(msg.session.as_text())
 
     def _cmd_active_shadow(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['active_shadow'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'active_shadow': on})
         if getattr(self.r, 'attention', None):
             self.r.attention.config = self.r.config
         if on:
@@ -212,21 +262,80 @@ class CommandRouter:
         today = self.r.store.today_stats()
         budget = int(self.r.config.get('daily_call_budget', 999999))
         out_budget = int(self.r.config.get('daily_output_token_budget', 99999999))
-        return (
-            f'今日调用 {today["calls"]}/{budget} 次，输出 {today["output_tokens"]}/{out_budget} tokens\n'
-            f'其中主动搭话触发 {today["active_calls"]} 次'
-        )
+        input_tokens = int(today.get('input_tokens') or 0)
+        cached = int(today.get('cached_tokens') or 0)
+        rate = (cached * 100 // input_tokens) if input_tokens else 0
+        lines = [
+            f'今日调用 {today["calls"]}/{budget} 次，输出 {today["output_tokens"]}/{out_budget} tokens',
+            # 缓存命中率是省钱改造的尺子：渠道不透传就是 0%，别以为是插件没做
+            f'输入 {input_tokens} tokens，其中缓存命中 {cached}（{rate}%）',
+            f'其中主动搭话触发 {today["active_calls"]} 次',
+        ]
+        # 拆账：判断/主动/被动/提炼的单价差一个量级，混在一起看不出钱花在哪
+        try:
+            parts = []
+            for row in self.r.store.today_stats_by_kind()[:4]:
+                label = KIND_LABELS.get(row['kind'], row['kind'] or '未知')
+                parts.append(f'{label} {row["calls"]}次/{row["input_tokens"] // 1000}k')
+            if parts:
+                lines.append('按用途：' + ' · '.join(parts))
+        except Exception:  # noqa: BLE001 - 拆账失败不该让用量命令报错
+            pass
+        return '\n'.join(lines)
 
     def _cmd_remember(self, msg: IncomingMessage, arg: str) -> str:
-        fact = arg.strip()
-        if not fact:
-            return '格式: 记住 <内容>，例如「记住我喜欢喝牛奶」'
-        self.r.memory.add_fact(msg, fact)
-        return '✅ 记住啦~（「忘了我」可以清空）'
+        # 墓碑：显式「记住 xxx」已被废除，避免提示词注入与越狱投毒风险。
+        return '现在不用专门喊「记住」啦，平时正常和我聊天我就会自然记住你的习惯和爱好哦～（发送「我的记忆」可查看）'
+
+    def _cmd_view_my_memory(self, msg: IncomingMessage) -> str:
+        """查看歌伊对当前用户的记忆与印象。"""
+        uid = str(getattr(msg, 'sender_id', '') or '').strip()
+        if not uid:
+            return '唔……未能获取到你的账号信息哦。'
+        session_key = msg.session.as_text()
+
+        # 1. 查找群友高维印象
+        impression_text = ''
+        if self.r.config.get('memory_impression_enabled', True):
+            try:
+                imp = self.r.store.get_user_impression(uid)
+                if imp and imp.get('summary'):
+                    impression_text = str(imp['summary']).strip()
+            except Exception:
+                pass
+
+        # 2. 查找群友事实（包含当前会话事实与跨群全局偏好）
+        facts: list[str] = []
+        try:
+            include_global = self.r.config.get('memory_cross_group_enabled', True)
+            rows = self.r.store.list_user_facts(session_key, uid, limit=20, include_global=include_global)
+            seen = set()
+            for r in rows:
+                f = str(r.get('fact') or '').strip()
+                if f and f not in seen:
+                    seen.add(f)
+                    facts.append(f)
+        except Exception:
+            pass
+
+        if not impression_text and not facts:
+            return '唔……歌伊的小本本上关于你还是一片空白呢～\n平时多和我聊聊天，我就会自然记住你的习惯和爱好啦！（眨眼）'
+
+        lines = ['【歌伊的小本本 · 记忆档案】']
+        if impression_text:
+            lines.append(f'🌟 歌伊对你的印象：\n  {impression_text}')
+        if facts:
+            lines.append(f'📝 记住的事（共 {len(facts)} 条）：')
+            for f in facts:
+                lines.append(f'  · {f}')
+        lines.append('💡 提示：发送「忘了我」可以随时清空关于你的这些记录哦～')
+        return '\n'.join(lines)
 
     def _cmd_forget_me(self, msg: IncomingMessage) -> str:
+        # 连**全局范围**的事实一起清（跨群偏好存在 session_key='global' 里），
+        # 否则换个群她还记得你（2026-11-03 审查发现）。
         count = self.r.memory.clear_user(msg)
-        return f'✅ 已忘记关于你的 {count} 条记忆'
+        return f'✅ 已忘记关于你的 {count} 条记忆（含跨群偏好）'
 
     def _cmd_worldbook_status(self, msg: IncomingMessage) -> str:
         on = self.r.config.get('worldbook_enabled', False)
@@ -238,24 +347,15 @@ class CommandRouter:
     # 现在模型由渠道决定（掉线时在渠道间按稳定性切换），模型池与它对不上了。
 
     def _cmd_global_passive(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['passive_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'passive_enabled': on})
         return '✅ 已开启全局被动回复' if on else '🔕 已关闭全局被动回复'
 
     def _cmd_global_active(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['active_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'active_enabled': on})
         return '✅ 已开启全局主动搭话' if on else '🔕 已关闭全局主动搭话'
 
     def _cmd_private(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['private_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'private_enabled': on})
         return '✅ 已开启私聊' if on else '🔕 已关闭私聊'
 
     def _cmd_reset_context(self, msg: IncomingMessage) -> str:
@@ -263,55 +363,43 @@ class CommandRouter:
         return '✅ 已重置当前会话上下文'
 
     def _cmd_reload(self, msg: IncomingMessage) -> str:
-        self.r.config = plugin_config.load_config()
-        role = self.r.load_role_prompt()
-        self.r.prompt_builder.config = self.r.config
-        self.r.prompt_builder.set_role_prompt(role)
+        """重新读盘并热更新：配置 / 角色设定 / 世界书 / 语音 / 静默 / 记忆。
+
+        以前漏了记忆、静默、语音三个组件，而且解析失败时照样回「✅ 已重载」——
+        用户以为配好了，实际是最容易踩的坑（2026-11-03 审查发现）。
+        """
+        error = ''
+        reload_fn = getattr(self.r, 'reload_config', None)
+        if callable(reload_fn):
+            error = reload_fn() or ''
+        self.r.prompt_builder.set_role_prompt(self.r.load_role_prompt())
         self.r.worldbook.load()
-        self.r.renderer.config = self.r.config
         if self.r.gateway:
             self.r.gateway.reload(self.r.config)
-        if getattr(self.r, 'curator', None):
-            self.r.curator.config = self.r.config
-        if getattr(self.r, 'images', None):
-            self.r.images.config = self.r.config
-        if getattr(self.r, 'attention', None):
-            self.r.attention.config = self.r.config
-        if getattr(self.r, 'permissions', None):
-            self.r.permissions.config = self.r.config
-        if getattr(self.r, 'group_profile', None):
-            self.r.group_profile.config = self.r.config
-        return '✅ 已重载 配置/角色设定/世界书/权限/群额度'
+        if error:
+            return error + '\n（其它组件已按内存里现有的配置重新读过；磁盘文件没有被覆盖）'
+        return '✅ 已重载 配置/角色设定/世界书/权限/群额度/记忆/静默/语音'
 
     def _cmd_trigger_add(self, msg: IncomingMessage, arg: str) -> str:
         arg = arg.strip()
         if not arg:
             return '格式: 添加触发词 <词>'
-        cfg = self.r.config
-        triggers = list(cfg.get('triggers', []))
+        triggers = list(self.r.config.get('triggers', []))
         if arg not in triggers:
             triggers.append(arg)
-            cfg['triggers'] = triggers
-            plugin_config.save_config(cfg)
-            self.r.config = plugin_config.load_config()
-        return f'✅ 触发词: {", ".join(cfg.get("triggers", []))}'
+            self._save_and_reload({'triggers': triggers})
+        return f'✅ 触发词: {", ".join(self.r.config.get("triggers", []))}'
 
     def _cmd_trigger_del(self, msg: IncomingMessage, arg: str) -> str:
         arg = arg.strip()
         if not arg:
             return '格式: 删除触发词 <词>'
-        cfg = self.r.config
-        triggers = [t for t in cfg.get('triggers', []) if t != arg]
-        cfg['triggers'] = triggers
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        triggers = [t for t in self.r.config.get('triggers', []) if t != arg]
+        self._save_and_reload({'triggers': triggers})
         return f'✅ 触发词: {", ".join(triggers) or "（仅剩默认「歌伊」）"}'
 
     def _cmd_worldbook_toggle(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['worldbook_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'worldbook_enabled': on})
         return '✅ 世界书已开启（命中关键词才读取设定）' if on else '🔕 世界书已关闭'
 
     def _cmd_worldbook_reload(self, msg: IncomingMessage) -> str:
@@ -319,18 +407,12 @@ class CommandRouter:
         return f'✅ 世界书已重载，共 {len(self.r.worldbook.entries)} 条'
 
     def _cmd_emote_toggle(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['emote_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'emote_enabled': on})
         self.r.renderer.config = self.r.config
         return '✅ 立绘已开启' if on else '🔕 立绘已关闭'
 
     def _cmd_image_toggle(self, msg: IncomingMessage, on: bool) -> str:
-        cfg = self.r.config
-        cfg['image_enabled'] = on
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'image_enabled': on})
         images = getattr(self.r, 'images', None)
         if images is not None:
             images.config = self.r.config
@@ -482,16 +564,15 @@ class CommandRouter:
         return ""
 
     def _cmd_voice_toggle(self, msg: IncomingMessage, enable: bool) -> str:
-        cfg = self.r.config
-        cfg['voice_enabled'] = enable
-        plugin_config.save_config(cfg)
-        self.r.config = plugin_config.load_config()
+        self._save_and_reload({'voice_enabled': enable})
         if hasattr(self.r, 'voice_manager'):
             self.r.voice_manager.reload(self.r.config)
         return f"✅ 已{'开启' if enable else '关闭'}伴生语音输出"
 
     def _cmd_voice_reload(self, msg: IncomingMessage) -> str:
-        self.r.config = plugin_config.load_config()
+        reload_fn = getattr(self.r, 'reload_config', None)
+        if callable(reload_fn):
+            reload_fn()
         if hasattr(self.r, 'voice_manager'):
             self.r.voice_manager.reload(self.r.config)
         return "✅ 已重新加载语音配置与预设词库"
@@ -523,6 +604,18 @@ class CommandRouter:
         return any(text.startswith(p) for p in cls._OWNER_CMD_PREFIX)
 
     def try_handle(self, msg: IncomingMessage) -> bool:
+        """命令入口：任何异常都不能把用户的消息吞掉（既不回复也不报错）。"""
+        try:
+            return self._dispatch(msg)
+        except plugin_config.ConfigWriteBlocked as exc:
+            logger.warning('配置写盘被拒绝：%s', exc)
+            self.r.reply(msg, '⚠ 没有写盘：%s' % exc)
+            return True
+        except Exception:  # noqa: BLE001 - 命令出错退回聊天流程，别整条消息消失
+            logger.exception('命令处理失败：%r', (getattr(msg, 'text', '') or '')[:60])
+            return False
+
+    def _dispatch(self, msg: IncomingMessage) -> bool:
         text = msg.text.strip()
         if not text:
             return False
@@ -559,6 +652,9 @@ class CommandRouter:
             return True
         if text.startswith('记住 '):
             self.r.reply(msg, self._cmd_remember(msg, text[3:]))
+            return True
+        if text in ('我的记忆', '查看记忆', '歌伊看我'):
+            self.r.reply(msg, self._cmd_view_my_memory(msg))
             return True
         if text == '忘了我':
             self.r.reply(msg, self._cmd_forget_me(msg))
@@ -628,22 +724,29 @@ class CommandRouter:
             if not key:
                 self.r.reply(msg, '格式: 设置key <API Key>')
                 return True
-            cfg = self.r.config
-            cfg['api_key'] = key
-            # 同步更新当前正在使用的渠道中的 api_key
-            current_provider_name = getattr(self.r.gateway, 'current_provider_name', None) or getattr(self.r.gateway, '_current_name', None)
-            if 'providers' in cfg and isinstance(cfg['providers'], list):
-                for prov in cfg['providers']:
-                    if isinstance(prov, dict):
-                        if current_provider_name and prov.get('name') == current_provider_name:
-                            prov['api_key'] = key
-                        elif not prov.get('api_key'):
-                            prov['api_key'] = key
-            plugin_config.save_config(cfg)
-            self.r.config = plugin_config.load_config()
+            if msg.is_group:
+                # 群里发 key = 把钥匙贴在墙上（群历史里会留一份明文）
+                self.r.reply(msg, '这个请私聊里发：「设置key <API Key>」。群里发等于把钥匙贴在墙上。')
+                return True
+            # 只写**当前正在用的那一个渠道**。以前会把同一个 key 灌进所有「还没填 key」
+            # 的渠道，而那些渠道可能是别家厂商——key 一通、全线 401，等于把钥匙到处撒。
+            # 在副本上改，再一次性提交：写盘失败时内存也不会被带歪。
+            providers = copy.deepcopy(self.r.config.get('providers') or [])
+            name = str(getattr(self.r.gateway, '_current_name', '') or '')
+            hit = False
+            for prov in providers:
+                if isinstance(prov, dict) and name and prov.get('name') == name:
+                    prov['api_key'] = key
+                    hit = True
+            changes = {'api_key': key}
+            if hit:
+                changes['providers'] = providers
+            self._save_and_reload(changes)
             if self.r.gateway:
                 self.r.gateway.reload(self.r.config)
-            self.r.reply(msg, f'✅ 已设置 API Key（{_mask_key(key)}），已重载网关并立即生效\n数据保存在 data 目录 config.json')
+            where = f'渠道「{name}」' if hit else '单渠道模式（api_key）'
+            self.r.reply(msg, f'✅ 已设置 {where} 的 API Key（{_mask_key(key)}），已重载网关并立即生效\n'
+                              f'数据保存在 {plugin_config.get_config_path()}')
             return True
         if text == '全局被动开':
             self.r.reply(msg, self._cmd_global_passive(msg, True))

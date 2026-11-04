@@ -40,7 +40,11 @@ CURATOR_RULES = """下面是一个 QQ 群最近的一段聊天记录（每行开
 {{
   "group_summary": "这段群聊发生了什么（1-2 句，只写公共事件）",
   "user_facts": [
-    {{"user_id": "QQ号", "fact": "关于这个人的稳定事实", "category": "身份/偏好/习惯/经历", "importance": 0.6}}
+    {{"user_id": "QQ号", "fact": "关于这个人的稳定事实", "category": "身份/偏好/习惯/经历", "importance": 0.6, "scope": "global/group"}}
+  ],
+  "expired_fact_ids": [被新事实替代或已失效的已知事实ID数字列表],
+  "user_impressions": [
+    {{"user_id": "QQ号", "summary": "该群友的个性特质与互动印象（1句话，无明显特质则留空）"}}
   ],
   "self_memories": [
     {{"content": "歌伊自己的经历/承诺/情绪", "kind": "event/promise/feeling", "importance": 0.6}}
@@ -52,12 +56,16 @@ CURATOR_RULES = """下面是一个 QQ 群最近的一段聊天记录（每行开
 2. user_facts 只记「这个人本人的稳定事实」：身份、职业、偏好、习惯、长期经历。
    - 不记：一次性的互动、玩笑、角色扮演内容、情绪化的气话
    - 不记：{assistant}（AI）说的话——那是 AI 自己的事，不属于任何用户
+   - scope：通用个人特质/偏好填 "global"，本群特有梗/职务填 "group"
    - 没把握的宁可不记
-3. self_memories 只记「{assistant}自己」的经历、答应过的承诺、明显的情绪波动。
-4. group_summary 只写公共事件，不要写任何人的私人信息。
-5. 没有可记的内容就留空数组，不要硬凑。
-6. **已经在「已知事实」里的信息不要再记一遍**——哪怕换了说法。只有出现**新信息**
-   （新的身份、新的偏好、情况发生变化）才记；同一类信息只保留最新的一条。"""
+3. expired_fact_ids：如果已知事实里某条信息已被本批次的新事实推翻或替代（例如「准备考研」变成「考研已上岸」），请在 user_facts 写入新事实，并在 expired_fact_ids 列出被替代的已知事实 ID。没有失效的不要填。
+4. user_impressions：仅在群友展现出鲜明性格或与{assistant}有深度互动时更新，写 1 句高维印象。
+5. self_memories 只记「{assistant}自己」的经历、答应过的承诺、明显的情绪波动。不记：关于年龄、称呼的口舌争辩或群友的调侃打趣。
+   也不要用「软件/程序/数据」的视角写她：不要出现「接入模型」「部署在服务器」「功能上线」「测试数据」「代码 / bug / 接口」这类措辞，
+   更不要写成「我是数据」「我是 AI」「靠电活着」。主人给她改东西，就用她的说法记成「主人在她的圣堂里添了东西、给她调了法器」。
+6. group_summary 只写公共事件，不要写任何人的私人信息。
+7. 没有可记的内容就留空数组，不要硬凑。
+8. **已经在「已知事实」里的有效信息不要再重复记一遍**。"""
 
 # 动态部分：这两块每轮都变，必须排在静态规则之后
 CURATOR_TAIL = """{known}
@@ -74,11 +82,17 @@ def clamp01(value, default: float = 0.5) -> float:
         return default
 
 
-def extract_json(text: str) -> dict:
-    """从模型输出里抠出 JSON 对象（容忍代码围栏与前后废话）。"""
+def extract_json(text: str) -> dict | None:
+    """从模型输出里抠出 JSON 对象（容忍代码围栏与前后废话）。
+
+    **解析失败返回 None，合法空对象返回 `{}`**——两者必须能分开：
+    以前统一返回 `{}`，于是「模型老老实实答了个空 JSON（这批没什么可记的）」
+    和「模型压根没吐 JSON」走同一条失败路径，光标不推进 → 同一批无限重试
+    （2026-11-03 审查发现）。
+    """
     raw = str(text or '').strip()
     if not raw:
-        return {}
+        return None
     if '```' in raw:
         for part in raw.split('```'):
             part = part.strip()
@@ -90,12 +104,12 @@ def extract_json(text: str) -> dict:
     start = raw.find('{')
     end = raw.rfind('}')
     if start < 0 or end <= start:
-        return {}
+        return None
     try:
         data = json.loads(raw[start:end + 1])
     except (ValueError, TypeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class MemoryCurator:
@@ -171,10 +185,28 @@ class MemoryCurator:
     def _mark_run(self, session_key: str) -> None:
         self.store.set_setting(f'mem.last_run:{session_key}', str(time.time()))
 
+    def _drop_backlog(self, session_key: str) -> None:
+        """把不该进记忆的会话缓冲整段丢掉（游标推到末尾即可，行留给自己的过期清理）。"""
+        try:
+            rows = self.store.buffer_fetch(session_key, self.cursor(session_key), limit=500)
+            if rows:
+                self.set_cursor(session_key, rows[-1]['id'])
+                logger.info('私聊内容不进记忆，已丢弃 %s 的 %d 条缓冲',
+                            session_key[-14:], len(rows))
+        except Exception:  # noqa: BLE001 - 清理失败不该影响后台线程
+            logger.exception('丢弃私聊缓冲失败')
+
     # ==================== 触发条件 ====================
     def should_run(self, session_key: str) -> bool:
         cfg = self.config
         if not cfg.get('memory_curator_enabled', True):
+            return False
+        if not cfg.get('memory_enabled', True):
+            return False
+        if '|private|' in str(session_key) and not cfg.get('memory_private_enabled', False):
+            # 私聊默认不进记忆（隐私）。历史版本缓冲下来的私聊内容在这里一并清掉，
+            # 否则关掉之后这些内容还会被提炼进库、再喂给模型。
+            self._drop_backlog(session_key)
             return False
         cursor = self.cursor(session_key)
         pending = self.store.buffer_pending(session_key, cursor)
@@ -239,9 +271,10 @@ class MemoryCurator:
                 self.set_cursor(session_key, rows[-1]['id'])
                 return stats
 
+            known_text, allowed_fact_ids = self._known_facts_block(session_key, valid_ids)
             tail = CURATOR_TAIL.format(
                 records=records[:8000],
-                known=self._known_facts_block(session_key, valid_ids),
+                known=known_text,
             )
             data = self._request_and_parse(tail, session_key)
             if isinstance(data, str):
@@ -250,7 +283,8 @@ class MemoryCurator:
                 logger.warning('记忆提炼 %s 未完成（%s），%.0f 分钟后再试',
                                session_key, data, wait / 60.0)
                 return stats
-            stats.update(self._store_results(session_key, data, valid_ids, rows[-1]['id']))
+            stats.update(self._store_results(session_key, data, valid_ids,
+                                             rows[-1]['id'], allowed_fact_ids))
             self._note_success(session_key)
             self._last_stats = dict(stats)
             return stats
@@ -310,13 +344,19 @@ class MemoryCurator:
                 return code
             last_text = str(result.text or '')
             data = extract_json(last_text)
-            if data:
+            if data is not None:
                 return data
             logger.warning('第 %d 次提炼未返回合法 JSON：%s',
                            attempt, last_text[:200].replace('\n', ' '))
         return 'bad_json'
 
-    def _known_facts_block(self, session_key: str, valid_ids) -> str:
+    def _known_facts_block(self, session_key: str, valid_ids) -> tuple[str, set]:
+        """带上去重用的已知事实；返回 (文本, 本批**允许失效**的事实 ID 集合)。
+
+        为什么要把允许失效的 ID 带回来：`expired_fact_ids` 是模型给的裸数字，
+        以前直接 `expire_user_fact(id)` —— 模型幻觉出一个 ID 就能把**别人**的事实
+        标成失效（2026-11-03 审查发现）。现在只认「刚才真的给它看过的那几条」。
+        """
         """把本批次说话人的现有事实列给模型，让它自己判重。
 
         为什么不在本地做：线上实测的重复是**换说法**的——「跑团新人」「自称TRPG萌新，
@@ -326,24 +366,33 @@ class MemoryCurator:
         """
         per_user = int(self.config.get('memory_curate_known_facts', 5) or 0)
         if per_user <= 0:
-            return ''
+            return '', set()
         try:
             known = self.store.list_facts_of_users(session_key, valid_ids, per_user)
         except Exception:  # noqa: BLE001 - 拿不到就不带去重上下文，不影响提炼
-            return ''
+            return '', set()
         lines: list[str] = []
+        allowed: set = set()
         for user_id, facts in known.items():
-            for fact in facts:
-                lines.append('  %s：%s' % (user_id, fact))
+            for item in facts:
+                fid = item.get('id') if isinstance(item, dict) else 0
+                fact = item.get('fact') if isinstance(item, dict) else str(item)
+                scope = item.get('scope', 'group') if isinstance(item, dict) else 'group'
+                if fid:
+                    lines.append('  [ID=%d] %s（%s）：%s' % (fid, user_id, scope, fact))
+                    allowed.add(int(fid))
+                else:
+                    lines.append('  %s：%s' % (user_id, fact))
         if not lines:
-            return ''
+            return '', set()
         # 上限兜一下，别让去重上下文把提示词撑大
         body = '\n'.join(lines[:60])
-        return ('\n已知事实（这些**已经记过了**，不要重复记）：\n' + body + '\n')
+        return ('\n已知事实（这些**已经记过了**，若未失效不要重复记；若已失效请在 expired_fact_ids 列出其 ID）：\n'
+                + body + '\n'), allowed
 
     def _store_results(self, session_key: str, data: dict, valid_ids: set[str],
-                       last_id: int) -> dict:
-        stats = {'summary': 0, 'facts': 0, 'self': 0, 'skipped': 0}
+                       last_id: int, allowed_fact_ids: set | None = None) -> dict:
+        stats = {'summary': 0, 'facts': 0, 'self': 0, 'skipped': 0, 'expired': 0, 'impressions': 0}
 
         # ---- L1 群级摘要（只有公共事件）----
         summary = str(data.get('group_summary') or '').strip()
@@ -352,6 +401,32 @@ class MemoryCurator:
             stats['summary'] = 1
         elif summary:
             logger.warning('群摘要过长已丢弃（%d 字）', len(summary))
+
+        # ---- 过期/失效旧事实 ----
+        # 只认「本批真的给它看过」的 ID：模型幻觉一个数字，绝不能把别人的事实标成失效。
+        for fid in data.get('expired_fact_ids') or []:
+            try:
+                fid_int = int(fid)
+            except (ValueError, TypeError):
+                continue
+            if allowed_fact_ids is not None and fid_int not in allowed_fact_ids:
+                logger.info('忽略模型给的过期事实 ID=%s（不在本批已知事实里）', fid_int)
+                continue
+            try:
+                self.store.expire_user_fact(fid_int)
+                stats['expired'] += 1
+            except Exception:  # noqa: BLE001 - 单条失败不该中断整批
+                logger.exception('标记事实失效失败（ID=%s）', fid_int)
+
+        # ---- 群友高维印象更新 ----
+        for imp in data.get('user_impressions') or []:
+            if not isinstance(imp, dict):
+                continue
+            uid = str(imp.get('user_id') or '').strip()
+            imp_summary = str(imp.get('summary') or '').strip()
+            if uid in valid_ids and imp_summary and len(imp_summary) <= 200:
+                self.store.set_user_impression(uid, imp_summary)
+                stats['impressions'] += 1
 
         # ---- L2 用户事实（speaker 硬校验）----
         for item in (data.get('user_facts') or [])[:20]:
@@ -367,22 +442,25 @@ class MemoryCurator:
                 logger.debug('丢弃来源不明的用户事实：%s / %s', uid, fact[:40])
                 continue
             fact = fact[:200]
-            existing = self.store.find_user_fact(session_key, uid, fact)
+            scope = str(item.get('scope') or 'group').strip().lower()
+            target_session = 'global' if (scope == 'global' and self.config.get('memory_cross_group_enabled', True)) else session_key
+            fuzzy_thresh = float(self.config.get('memory_fuzzy_dedup_threshold', 0.60))
+
+            existing = self.store.find_similar_user_fact(target_session, uid, fact, threshold=fuzzy_thresh)
             if existing:
                 self.store.touch_user_fact(existing['id'])
                 stats['skipped'] += 1
                 continue
             self.store.add_user_fact(
-                session_key, uid, fact,
+                target_session, uid, fact,
                 category=str(item.get('category') or '').strip()[:12],
                 source='inferred',
                 importance=clamp01(item.get('importance'), 0.5),
             )
             stats['facts'] += 1
-            # 容量兜底：线上实测一个人能攒到 17 条、5 条在说同一件事。
-            # 字面归一化挡不住换说法的重复，所以超量就淘汰分数最低的。
+            # 容量兜底：字面归一化挡不住换说法的重复，超量就淘汰分数最低的
             stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
-                session_key, uid,
+                target_session, uid,
                 max_per_user=int(self.config.get('memory_max_facts_per_user', 12) or 0),
                 max_per_group=0,
             )
@@ -394,7 +472,10 @@ class MemoryCurator:
             content = str(item.get('content') or '').strip()[:200]
             if not content:
                 continue
-            if self.store.find_self_memory(session_key, content):
+            fuzzy_thresh = float(self.config.get('memory_fuzzy_dedup_threshold', 0.60))
+            existing_self = self.store.find_similar_self_memory(session_key, content, threshold=fuzzy_thresh)
+            if existing_self:
+                self.store.touch_self_memory(existing_self['id'])
                 stats['skipped'] += 1
                 continue
             self.store.add_self_memory(

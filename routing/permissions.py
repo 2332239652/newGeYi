@@ -26,8 +26,29 @@ class Permissions:
         self._extra_owners = owner_ids_env
 
     def _owner_set(self) -> set[str]:
-        ids = {str(x).strip() for x in self.config.get('owner_ids', []) if str(x).strip().isdigit()}
-        for item in self._extra_owners.replace('，', ',').split(','):
+        """解析主人名单。
+
+        **必须容忍脏配置**：`"owner_ids": null` 或直接写一个数字（`"owner_ids": 1234567890`）
+        时，以前 `for x in None` / `for x in 数字` 会 TypeError，
+        而这个函数**每条消息都会被调用**——于是每条消息都被入口的 except 吞掉、彻底不回话
+        （2026-11-03 审查发现）。这里一律按「能解析出数字就当主人，其余忽略」处理。
+        """
+        ids: set[str] = set()
+        raw = self.config.get('owner_ids') if isinstance(self.config, dict) else None
+        if raw is None:
+            raw = []
+        elif isinstance(raw, (str, int)):
+            raw = [raw]
+        try:
+            items = list(raw)
+        except TypeError:
+            items = []
+        for item in items:
+            text = str(item).strip() if item is not None else ''
+            if text.isdigit():
+                ids.add(text)
+        env = self._extra_owners if isinstance(self._extra_owners, str) else ''
+        for item in env.replace('，', ',').split(','):
             item = item.strip()
             if item.isdigit():
                 ids.add(item)

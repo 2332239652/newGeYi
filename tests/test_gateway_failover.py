@@ -1,0 +1,232 @@
+# -*- encoding: utf-8 -*-
+"""渠道故障转移的回归测试（离线、无网络、不碰线上状态）。
+
+锁住 2026-11-01 骰主定的口径：
+
+- 候选渠道一轮走到底（最后一个也挂了）→ **回到第一个再来一轮**（`failover.full_cycles`）；
+- 整轮都挂 → 通知骰主 + **切到兜底渠道并锁定**（`gw.hold`），不再尝试其它渠道；
+- 锁定期间：`_ordered_pairs` 只返回兜底那一个、`probe_once` 不探测、`_switch_locked` 不切换；
+- 解除只有一条路：`切换渠道 <名称>` / `切换渠道 自动`。
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+_SCRATCH = tempfile.mkdtemp(prefix='geyi_gateway_tests_')
+os.environ['GEYI_DATA_DIR'] = _SCRATCH
+
+from newGeYi.models import ModelRequest  # noqa: E402
+from newGeYi.providers.llm_gateway import LLMGateway  # noqa: E402
+
+PROVIDERS = [
+    {'name': 'p1', 'endpoint': 'http://x1/v1/chat/completions', 'api_key': 'k1',
+     'model': 'm1', 'priority': 1},
+    {'name': 'p2', 'endpoint': 'http://x2/v1/chat/completions', 'api_key': 'k2',
+     'model': 'm2', 'priority': 2},
+    {'name': 'p3', 'endpoint': 'http://x3/v1/chat/completions', 'api_key': 'k3',
+     'model': 'm3', 'priority': 3},
+    {'name': 'p4', 'endpoint': 'http://x4/v1/chat/completions', 'api_key': 'k4',
+     'model': 'm4', 'priority': 4},
+    {'name': 'p5', 'endpoint': 'http://x5/v1/chat/completions', 'api_key': 'k5',
+     'model': 'm5', 'priority': 5},
+    {'name': 'official-chat', 'endpoint': 'http://x6/v1/chat/completions', 'api_key': 'k6',
+     'model': 'deepseek-flash', 'priority': 6, 'manual_only': True},
+]
+
+
+class FakeStore:
+    def __init__(self):
+        self.settings = {}
+        self.api_calls = []
+
+    def get_setting(self, key):
+        return self.settings.get(key)
+
+    def set_setting(self, key, value):
+        self.settings[key] = value
+
+    def add_api_call(self, **kwargs):
+        self.api_calls.append(kwargs)
+
+
+class FakeResp:
+    def __init__(self, status):
+        self.status_code = status
+        self.text = 'upstream boom'
+
+    def json(self):
+        return {}
+
+
+class FakeSession:
+    def __init__(self, status):
+        self.status = status
+        self.posts = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        body = json or {}
+        self.posts.append((body.get('model'), url))
+        return FakeResp(self.status)
+
+
+def build(status=500, **failover):
+    store = FakeStore()
+    cfg = {
+        'providers': [dict(p) for p in PROVIDERS],
+        'max_retries': 0,          # 测试里不要 sleep 重试
+        'global_concurrency': 4,
+        'failover': {
+            'fail_threshold': 1,
+            'full_cycles': 2,
+            'last_resort_provider': 'official-chat',
+            'notify_owner': True,
+            'notify_cooldown_seconds': 0,
+            'probe_success_needed': 1,
+            'probe_timeout_seconds': 1,
+            'probe_repair_per_round': 0,
+        },
+    }
+    cfg['failover'].update(failover)
+    gw = LLMGateway(store, cfg)
+    session = FakeSession(status)
+    gw._get_session = lambda: session          # type: ignore[assignment]
+    notes = []
+    gw.set_notify(lambda text: notes.append(text))
+    return gw, store, session, notes
+
+
+def ask(gw):
+    return gw.chat(ModelRequest(messages=[{'role': 'user', 'content': 'hi'}], model='x'),
+                   kind='chat', session_key='t')
+
+
+class RequestErrorTest(unittest.TestCase):
+    """2026-11-03 审查：一个**坏请求**不能把渠道判死、更不能触发「全挂」锁定。
+
+    以前 400/413/422（请求体坏了、图太大、参数不合法）和「空回复」都会走
+    `_mark_failure` → 两轮之后切兜底 + 锁定 + 给骰主发「渠道全挂」。
+    """
+
+    def test_client_error_aborts_without_marking_providers(self):
+        gw, store, session, notes = build(status=400)
+        res = ask(gw)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_code, 'http_400')
+        # 只试了当前渠道一次：换渠道问同一件事还是同样的错
+        self.assertEqual([m for m, _ in session.posts], ['m1'])
+        self.assertEqual(gw._hold_name, '', '一个坏请求就把网关锁到兜底渠道了')
+        self.assertEqual(notes, [], '一个坏请求就给骰主发了「全挂」通知')
+
+    def test_client_error_does_not_touch_provider_health(self):
+        gw, store, session, notes = build(status=422)
+        ask(gw)
+        state = next(st for p, st in gw._pairs if p.name == 'p1')
+        self.assertTrue(state.healthy)
+        self.assertEqual(state.fail_count, 0)
+
+    def test_empty_content_does_not_lock_the_gateway(self):
+        # 200 但没有任何输出：模型/预算问题，不是渠道故障
+        gw, store, session, notes = build(status=200)
+        gw._parse_response = lambda provider, data: (False, '', 0, 0, 0, '思考链吃光预算')
+        res = ask(gw)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_code, 'empty_content')
+        self.assertEqual(gw._hold_name, '', '空回复把网关锁到兜底渠道了')
+        self.assertEqual(notes, [])
+
+
+class CycleAndEscalateTest(unittest.TestCase):
+    def test_two_cycles_then_lock_official(self):
+        gw, store, session, notes = build()
+        res = ask(gw)
+        self.assertFalse(res.ok)
+        models = [m for m, _ in session.posts]
+        # 5 个候选 × 2 轮，且兜底渠道（manual_only）不参与轮转
+        self.assertEqual(models, ['m1', 'm2', 'm3', 'm4', 'm5'] * 2)
+        # 整轮挂完之后：切到兜底 + 锁定 + 通知一次
+        self.assertEqual(gw._current_name, 'official-chat')
+        self.assertEqual(gw._hold_name, 'official-chat')
+        self.assertEqual(store.settings.get('gw.hold'), 'official-chat')
+        self.assertEqual(len(notes), 1)
+        self.assertIn('全挂', notes[0])
+        self.assertIn('official-chat', notes[0])
+
+    def test_locked_gateway_only_uses_official(self):
+        gw, store, session, notes = build()
+        ask(gw)
+        session.posts.clear()
+        ask(gw)
+        self.assertEqual([m for m, _ in session.posts], ['deepseek-flash'])
+        # 锁定期间不再重复发「五连挂」通知，走冷却通知（cooldown=0 所以**这一次**会多一条）
+        self.assertEqual(len(notes), 2, notes)
+
+    def test_hold_is_persisted_and_restored(self):
+        gw, store, session, notes = build()
+        ask(gw)
+        # 用同一个 store 重建网关：锁定状态要能恢复
+        gw2 = LLMGateway(store, gw.config)
+        self.assertEqual(gw2._hold_name, 'official-chat')
+        pairs = gw2._ordered_pairs('chat')
+        self.assertEqual([p.name for p, _ in pairs], ['official-chat'])
+
+    def test_probe_and_auto_switch_disabled_while_locked(self):
+        gw, store, session, notes = build()
+        ask(gw)
+        self.assertEqual(gw.probe_once(), [])
+        self.assertFalse(gw._switch_locked('auto', 'test'))
+
+    def test_manual_switch_unlocks(self):
+        gw, store, session, notes = build()
+        ask(gw)
+        msg = gw.switch_to('p2')
+        self.assertIn('解除', msg)
+        self.assertEqual(gw._hold_name, '')
+        pairs = gw._ordered_pairs('chat')
+        self.assertEqual(pairs[0][0].name, 'p2')
+        # 手动锚点的老语义不变：备份只在锚点及其以下找，p1 被排除；
+        # 兜底渠道（manual_only）仍不进自动轮转 → p2/p3/p4/p5 = 4 个
+        self.assertEqual([p.name for p, _ in pairs], ['p2', 'p3', 'p4', 'p5'])
+
+    def test_switch_auto_also_unlocks(self):
+        gw, store, session, notes = build()
+        ask(gw)
+        gw.switch_to('自动')
+        self.assertEqual(gw._hold_name, '')
+
+    def test_no_last_resort_configured_just_notifies(self):
+        gw, store, session, notes = build(last_resort_provider='')
+        ask(gw)
+        self.assertEqual(gw._hold_name, '')
+        self.assertTrue(notes)
+
+    def test_success_in_second_cycle_is_logged_and_returns(self):
+        """第一轮全挂、第二轮第一个就通了：应当直接返回，不再往下试。"""
+        gw, store, session, notes = build()
+        state = {'n': 0}
+
+        def post(url, headers=None, json=None, timeout=None):
+            state['n'] += 1
+            session.posts.append(((json or {}).get('model'), url))
+            # 前 5 次（第一轮）返回 500，第 6 次返回 200 + 正常内容
+            if state['n'] <= 5:
+                return FakeResp(500)
+            resp = FakeResp(200)
+            resp.json = lambda: {
+                'choices': [{'message': {'content': '收到'}}],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1},
+            }
+            return resp
+
+        session.post = post  # type: ignore[assignment]
+        res = ask(gw)
+        self.assertTrue(res.ok, res.error_code)
+        self.assertEqual(res.text, '收到')
+        self.assertEqual(gw._hold_name, '')      # 没降级
+        self.assertFalse(notes)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

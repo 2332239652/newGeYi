@@ -55,6 +55,8 @@ class ModelResult:
     model: str = ''
     input_tokens: int = 0
     output_tokens: int = 0
+    # 命中前缀缓存的输入 token（渠道不报就是 0）。只做观测，不参与任何逻辑。
+    cached_tokens: int = 0
     latency_ms: int = 0
     error_code: str = ''
     error_message: str = ''

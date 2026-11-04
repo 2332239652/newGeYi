@@ -117,13 +117,25 @@ FENCE_RE = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 # 而标记本身漏进群里会让角色瞬间出戏（调研里反复出现的翻车点）。
 SILENT_MARKS = (SKIP_ACTIVE, '[NO_REPLY]', '【不回复】')
 
+# 模型经常把标记写得**没有括号**：线上实测 11 次整条发出 `歌伊忽略`（10-30~10-31，
+# 横跨 4 个群），另外 `[歌伊忽略]`、`（歌伊忽略）` 这类写法也出现过。
+# 只要整条消息去掉括号/空白/标点之后等于这些内核，就同样按「不回复」丢弃。
+SILENT_CORES = ('歌伊忽略', '不回复', 'NOREPLY')
+
+# 判定「整条只是标记」时忽略的字符：括号、引号、空白、标点、markdown 修饰符
+_MARK_JUNK_RE = re.compile(
+    r'[\s【】\[\]（）()<>《》「」『』"\'`*#·\-—_。,，、!！?？…~～:：;；]')
+
 
 def is_silent_reply(text: str) -> bool:
     """模型输出是否表示「这次不回复」。"""
     cleaned = str(text or '').strip()
     if not cleaned:
         return False
-    return any(mark and mark in cleaned for mark in SILENT_MARKS)
+    if any(mark and mark in cleaned for mark in SILENT_MARKS):
+        return True
+    core = _MARK_JUNK_RE.sub('', cleaned).upper()
+    return bool(core) and core in {item.upper() for item in SILENT_CORES}
 
 
 # ===== 回复审计：防泄露的最后一道闸门 =====
@@ -142,13 +154,18 @@ AUDIT_RULES = (
     (re.compile(r'(?<![A-Za-z0-9])[A-Za-z]:[\\/]'), '本机路径'),
     # Unix 家目录/系统目录。前面不能紧跟字母数字或点，否则网址里的 x.com/home/ 会被误判。
     (re.compile(r'(?<![A-Za-z0-9.\-])/(?:home|Users|root|etc|var|opt|srv)/'), '本机路径'),
-    # 凭据字样后面跟着赋值号，例如 token= / api_key:
-    (re.compile(r'(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret'
-                r'|password|passwd|credential)\b\s*[:=]'), '凭据'),
-    # 典型密钥字面量
-    (re.compile(r'\bsk-[A-Za-z0-9_\-]{16,}'), '密钥'),
+    # 凭据字样后面跟着赋值号，例如 token= / api_key: / 密钥＝
+    # ⚠️ 这里**不能用 `\b`**：Python 的 `\w` 包含汉字，而「的api_key=」里
+    # 「的」和「a」之间没有词边界 → 整条规则失效，只有空格分隔才拦得住。
+    # 2026-11-03 审查实测：「我的api_key=…」「密钥是sk-…」全都放行。
+    (re.compile(r'(?i)(?<![A-Za-z0-9])(?:api[_-]?key|access[_-]?token|auth[_-]?token'
+                r'|secret|password|passwd|credential'
+                r'|密码|密钥|口令|令牌|私钥)\s*[:=：＝]'), '凭据'),
+    # 典型密钥字面量（同样不能用 \b，理由同上）
+    (re.compile(r'(?i)(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{12,}'), '密钥'),
     # 32 位以上的十六进制串（要求至少含一个字母，免得把一长串纯数字误判成密钥）
-    (re.compile(r'\b(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{32,}\b'), '疑似密钥'),
+    (re.compile(r'(?<![0-9a-fA-F])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])'),
+     '疑似密钥'),
     # 上游服务商安全拦截/策略拒绝报错泄露
     (re.compile(r'(?i)(?:The prompt could not be submitted|Generative AI Prohibited Use policy|'
                 r'violate[s]? Google\'s|ai\.google\.dev/gemini-api|'
@@ -173,6 +190,49 @@ def audit_reply(text: str) -> str:
         found = pattern.search(text)
         if found:
             return f'{label}｜命中片段 {found.group(0)[:40]!r}'
+    return ''
+
+
+# ===== 「把写稿备忘当台词发出去」检测（2026-11-01 线上实测）=====
+# 小群 200000005，一条 B 站愚人节剧情视频触发的**主动搭话**，模型把写给自己的提纲整段发了出去：
+#
+#     （或者顺着刚才聊的边狱话题发出来的），作为歌伊，可以结合愚人节剧情被创飞的梗、
+#     或者画风突变女仆卡戎/马娘那些离谱镜像世界来吐槽或搭话。
+#     - 风格：口语、30~70字以内，自然，不换行，可带一个动作或[EMOTE]。
+#     - 注意情绪立绘：惊讶/死鱼眼/晕乎乎等。选“惊讶”或“死鱼眼”都很贴切。
+#     - 构思：这个愚人节剧情简直精神污染啊，看完感觉整个人都要被卡戎的车来回碾两遍了
+#
+# 现有的三道清洗都拦不住它：不是 `【…】` 方括号（`_strip_thinking_process` ②），
+# 不是 `<think>`，也不是「条列提纲 + 短标题」那种（`_strip_outline_draft` 要求有
+# 纯标题行或 ≥2 个列表项且能切出台词）。而它有个非常稳定的特征：
+#   **行首是「标签：」**（风格 / 构思 / 注意情绪立绘 / 字数 / 方向 …），
+# 正常台词不会以这些词加冒号开头。
+#
+# 判据放在 render() 最前面、对**原始输出**判——放到清洗之后就认不出来了（会被改成别的形状）。
+# 命中就**整条不发**：这种输出往往通篇都是提纲，抠掉标签只会剩半句不像人话的东西，
+# 而且会把「模型犯过错」这件事掩盖掉（与 AUDIT_RULES 的口径一致）。
+PLAN_LABEL_RE = re.compile(
+    r'(?m)^[ \t]*(?:[-*•·][ \t]*)?[*_]{0,2}'
+    r'(?:风格|构思|方向|思路|语气|字数|长度|要点|备注|人设'
+    r'|情绪立绘|注意情绪立绘|立绘|表情|表情包|可用立绘'
+    r'|回复策略|拟定回复|拟定|草稿|写作要点|输出要求)'
+    r'[*_]{0,2}[ \t]*[:：]'
+)
+# 「作为歌伊，可以/应该…」是写给自己的指令口吻。她平时自称「人家/我」，
+# 不会用第三人称给自己派活——单独成句时也是同一类泄露。
+PLAN_VOICE_RE = re.compile(r'作为歌伊[，,][ \t]*(?:可以|应当|应该|要|需要|不妨|不如|最好|能)')
+
+
+def looks_like_plan(text: str) -> str:
+    """这条输出是「写稿备忘/提纲」还是台词？命中返回原因，没命中返回空串。"""
+    if not text:
+        return ''
+    hit = PLAN_LABEL_RE.search(text)
+    if hit:
+        return f'提纲标签 {hit.group(0).strip()[:24]!r}'
+    hit = PLAN_VOICE_RE.search(text)
+    if hit:
+        return f'写稿口吻 {hit.group(0)[:24]!r}'
     return ''
 
 
@@ -605,6 +665,14 @@ class Renderer:
         # 静默标记：主动/被动一视同仁，绝不让它漏进群里
         if is_silent_reply(text):
             return None
+        # 写稿备忘/提纲（模型把「给自己的备忘」当台词说了）：整条不发。
+        # 必须放在所有清洗**之前**，对原始输出判——清洗之后它就不是这个形状了。
+        plan_leak = looks_like_plan(text)
+        if plan_leak:
+            logger.warning('回复像是「写稿备忘」而不是台词，整条不发（%s）：%r',
+                           plan_leak, text.strip()[:160])
+            fallback_text = str(self.config.get('reply_audit_fallback', '') or '').strip()
+            return RenderedReply(text=fallback_text) if fallback_text else None
         # 去掉代码围栏
         text = FENCE_RE.sub('', text).strip()
         # 思考过程/思维链/草稿：剥除混入的思考过程，防止模型思维链漏出到群里
@@ -668,9 +736,15 @@ class Renderer:
             idx = text.index(first) + len(first)
             after = re.sub(r'\[CQ:at,qq=[^,\]]+\]', '', text[idx:])
             text = text[:idx] + after
-        # 再剥离模型自带的其余所有码（OP 与 CQ 都剥，防止模型注入图片/路径）
-        text = OP_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
-        text = CQ_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
+        # 再剥离模型自带的其余所有码（OP 与 CQ 都剥，防止模型注入图片/路径）。
+        # 必须**交替剥到稳定**：模型写 `[O[CQ:x]P:at,id=all]` 时，先剥 OP 再剥 CQ，
+        # 内层被拿掉后会重新拼出一个合法 OP 码，一遍过就漏了（2026-11-03 审查发现）。
+        for _ in range(3):
+            before = text
+            text = OP_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
+            text = CQ_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
+            if text == before:
+                break
         # 剥除称呼时误带的纯数字 QQ 账号（例如 "伊尔达(2397087988)" -> "伊尔达"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张

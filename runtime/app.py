@@ -14,8 +14,10 @@ from collections import deque
 import logging
 import os
 import random
+import re
 import threading
 import time
+import traceback
 
 from .. import config as plugin_config
 from ..context.cross_plugin_observer import install_cross_plugin_observer
@@ -64,7 +66,21 @@ class _ProcLogHandler(logging.Handler):
     插件里到处是 `logger.warning('记忆提炼未完成…')` / `logger.exception(...)`，
     但 OlivOS 只记录 proc.log 的输出，**这些告警在日志文件里一条都看不到**——
     线上排查「记忆提炼一半失败」时，翻遍两天日志找不到任何线索，只能靠数据库反推。
+
+    ⚠️ 2026-11-01 修正：`Proc.log` 的档位在本机 OlivOS（0.11.81）上**只有 2 会落到文件**
+    （2 → `[INFO]`）；0/1/3 这些档位实测一条都不会写进日志。原来这里把 WARNING 映射成 1，
+    于是「额度用完 / 模型报错 / 会话任务失败 / 配置缺键」这些**最该看见的告警全被静默吞掉**——
+    翻遍 2026-09 至今的全部日志，newGeYi 的 WARN/ERROR 行数为 0，就是这么来的。
+    现在一律用档位 2，把级别和异常栈写进正文：宁可多一行前缀，也不能再让报错无声消失。
     """
+
+    LEVEL_TAGS = {
+        logging.DEBUG: '[DEBUG] ',
+        logging.INFO: '',
+        logging.WARNING: '[WARN] ',
+        logging.ERROR: '[ERROR] ',
+        logging.CRITICAL: '[CRIT] ',
+    }
 
     def __init__(self, runtime):
         super().__init__(level=logging.INFO)
@@ -73,8 +89,14 @@ class _ProcLogHandler(logging.Handler):
     def emit(self, record):
         try:
             name = record.name.split('.')[-1]
-            level = 1 if record.levelno >= logging.WARNING else 2
-            self.runtime.log(level, '[%s] %s' % (name, record.getMessage()))
+            # INFO 保持原格式（`[newGeYi] [router] …`，老日志里的 grep 还认它）；
+            # WARNING 及以上加标记，一眼能看出「这行是告警」。
+            tag = self.LEVEL_TAGS.get(record.levelno, '[WARN] ')
+            text = '[%s] %s%s' % (name, tag, record.getMessage())
+            if record.exc_info:
+                # logger.exception 的价值全在栈里；以前只转发 getMessage()，栈直接丢了
+                text += '\n' + ''.join(traceback.format_exception(*record.exc_info)).rstrip()
+            self.runtime.log(2, text)
         except Exception:  # noqa: BLE001 - 日志转发失败绝不能反过来影响业务
             pass
 
@@ -125,6 +147,41 @@ class Runtime:
         # 已登录机器人账号名单（骰娘/程心等）的短期缓存，用于识别机器人消息
         self._bot_ids_cache: set[str] | None = None
         self._bot_ids_checked_at = 0.0
+
+    # ==================== 配置热更新 ====================
+    # 约定：**self.config 这个字典对象的 identity 永不改变**。
+    # 以前每个开关命令都 `self.r.config = load_config()`，换的只是这一个属性，
+    # 而 attention / permissions / curator 等组件怀里抱的还是启动时那份字典
+    # —— 于是命令回「✅」、行为却不变（第二次开关尤其明显）。见交接文档 §28。
+    _CFG_HOLDERS = ('prompt_builder', 'gateway', 'renderer', 'curator', 'images',
+                    'attention', 'permissions', 'group_profile', 'rest', 'memory')
+
+    def apply_config(self) -> dict:
+        """把当前 self.config 推给所有缓存了配置的组件。"""
+        for name in self._CFG_HOLDERS:
+            comp = getattr(self, name, None)
+            if comp is not None and hasattr(comp, 'config'):
+                comp.config = self.config
+        voice = getattr(self, 'voice_manager', None)
+        if voice is not None:
+            try:
+                voice.reload(self.config)
+            except Exception:  # noqa: BLE001 - 语音配置坏了不该挡住其它热更新
+                logger.exception('重载语音配置失败')
+        return self.config
+
+    def reload_config(self) -> str:
+        """重新读盘并**原地**更新配置，返回人话错误说明（空串 = 成功）。"""
+        fresh = plugin_config.load_config()
+        error = plugin_config.config_load_error()
+        self.config.clear()
+        self.config.update(fresh)
+        self.apply_config()
+        if error:
+            return ('⚠ 配置文件解析失败：%s\n'
+                    '本次按默认值运行，磁盘上的文件**没有被覆盖**（已另存 .broken 备份）。'
+                    '改好 JSON 再发「重载设定」。' % error)
+        return ''
 
     # ==================== 初始化 ====================
     def init(self, Proc) -> None:
@@ -245,14 +302,22 @@ class Runtime:
         root.setLevel(logging.INFO)
         root.addHandler(_ProcLogHandler(self))
 
+    # OlivOS 的 Proc.log 档位 → 正文前缀。档位本身不再往上传（只有 2 会落盘）。
+    _LOG_PREFIX = {0: '[DEBUG] ', 1: '[WARN] ', 2: '', 3: '[ERROR] '}
+
     def log(self, level: int, text: str) -> None:
+        """写一行 OlivOS 日志。档位一律用 2——本机 OlivOS 只把 2 落进日志文件。"""
+        try:
+            prefix = self._LOG_PREFIX.get(int(level), '')
+        except (TypeError, ValueError):
+            prefix = ''
         try:
             if self.proc is not None and hasattr(self.proc, 'log'):
-                self.proc.log(level, f'[newGeYi] {text}', [])
+                self.proc.log(2, f'[newGeYi] {prefix}{text}', [])
                 return
         except Exception:  # noqa: BLE001
             pass
-        logger.info(text)
+        logger.info('%s%s', prefix, text)
 
     def _notify_owner(self, text: str) -> bool:
         """私聊通知骰主（渠道全挂、自我保护静默等运维事件）。返回是否真的发出去了。
@@ -406,10 +471,27 @@ class Runtime:
                     msg.session.as_text(), event, msg.session.target_id)
             # 记下这张图（只记来源，回复时真要用了才下载）
             self.images.remember(msg)
-            self.curator.buffer_user(msg)
+            # 只有「会进记忆」的会话才写缓冲：私聊默认不进（隐私），
+            # 记忆/提炼关掉时也不写（否则缓冲只增不减，而且会被提炼成记忆）。
+            if self._memory_tracking_on(msg):
+                self.curator.buffer_user(msg)
             self.router.route(msg)
         except Exception:  # noqa: BLE001 - 事件入口永不抛出
             logger.exception('handle_message failed')
+
+    def _memory_tracking_on(self, msg: IncomingMessage) -> bool:
+        """这条消息该不该进记忆缓冲。"""
+        cfg = self.config
+        if not cfg.get('memory_enabled', True):
+            return False
+        if not cfg.get('memory_curator_enabled', True):
+            return False
+        if not msg.is_group and not cfg.get('memory_private_enabled', False):
+            return False
+        return True
+
+    # 收消息里的 @：OP 与 CQ 两种形态，取方括号里的 id
+    AT_ID_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)')
 
     def _mentioned(self, event, raw: str) -> bool:
         try:
@@ -423,13 +505,14 @@ class Runtime:
                 self_id = ''
         if not self_id or self_id in ('-1', 'None'):
             return False
-        # 收消息默认是 OP 码；兼容 CQ 形态（万一 message_mode 被改成 old_string）
-        return (
-            f'[OP:at,id={self_id}' in raw
-            or '[OP:at,id=all]' in raw
-            or f'[CQ:at,qq={self_id}' in raw
-            or '[CQ:at,qq=all]' in raw
-        )
+        # 用**精确 id 比较**：以前是 `f'[OP:at,id={self_id}' in raw` 的前缀匹配，
+        # 于是机器人 123456789 会被 `[OP:at,id=1234567890]`（@别人）命中。
+        ids = {match.group(1).strip() for match in self.AT_ID_RE.finditer(raw or '')}
+        if self_id in ids:
+            return True
+        # @全体成员 默认**不算**点名她（那是在叫所有人，不是跟她说话）；
+        # 想让她被 @全体 也叫醒就打开 mention_on_at_all。
+        return 'all' in ids and bool(self.config.get('mention_on_at_all', False))
 
     # ==================== 机器人识别 ====================
     def _bot_account_ids(self) -> set[str]:
@@ -477,6 +560,114 @@ class Runtime:
             return False
 
     # ==================== 生成任务 ====================
+    def _ask(self, msg: IncomingMessage, kind: str, level: int, cfg: dict):
+        """拼上下文 + 调一次模型。返回 (result, text)；失败返回 (None, '')。
+
+        `level` 只对主动搭话有意义（0 严格 / 1 中性 / 2 软化），被动回复恒为 0。
+        """
+        try:
+            messages = self.prompt_builder.build(
+                msg, is_active=(kind == 'active'), active_level=level)
+        except Exception:  # noqa: BLE001 - 拼上下文失败只该丢这一条，不该让会话队列陪葬
+            logger.exception('拼 prompt 失败（kind=%s, level=%s）| %s',
+                             kind, level, msg.session.as_text()[-16:])
+            return None, ''
+        # 兜底值要和 config.DEFAULT_CONFIG 保持一致：写小了会在配置缺键时
+        # 悄悄退回小额度，而空回复的锅会记到模型头上（实测踩过）。
+        req = ModelRequest(
+            messages=messages,
+            model=cfg.get('fast_model', 'gemini-3.8-flash-medium'),
+            temperature=float(cfg.get('fast_temperature', 0.7)),
+            max_tokens=int(cfg.get('fast_max_tokens', 8192)),
+        )
+        # 网关本身吞掉了网络异常，但「拼请求体」等步骤在 try 外面，以前一抛就直接
+        # 冒到 _drain 的 except 里，整条栈又进不了日志 —— 线上就是「没有 api_calls、
+        # 没有回复、也没有任何报错」。这里兜住并留痕。
+        try:
+            result = self.gateway.chat(req, kind=kind, session_key=msg.session.as_text())
+        except Exception:  # noqa: BLE001
+            logger.exception('网关调用抛异常（kind=%s, level=%s）| %s',
+                             kind, level, msg.session.as_text()[-16:])
+            return None, ''
+        return result, (result.text or '')
+
+    def _active_cycle(self, msg: IncomingMessage, kind: str, cfg: dict):
+        """主动搭话的一个周期：逐级加强，最多试 `active_burst_max_attempts` 次。
+
+        为什么要在**同一个周期里**连试几档，而不是被拒了等下一轮：
+        模型拒的是「这条消息」，等五分钟换条新消息再问，等于重新掷骰——钱花了，
+        但拿不到「换一种说法她肯不肯」这个信息。同一段上下文里升级，才有信息量。
+        这也是省钱的关键：v2.8.7 是 11 次调用换 1 句，这里是 2~3 次。
+
+        返回 (result, text, level)；整轮被拒返回 (None, '', -1)。
+        """
+        session = msg.session.as_text()
+        plan = self.attention.pending_plan(session)
+        levels = list(plan.levels) or [0]
+        logger.info('主动周期 %s | %s | 欠账 %.2f 干旱 %d 兑现率 %.2f',
+                    plan.text(), session[-16:], plan.deficit, plan.drought,
+                    self.attention.conversion(session))
+        started = time.time()
+        budget = float(cfg.get('active_burst_max_seconds', 12) or 0)
+        for index, level in enumerate(levels):
+            # 时间预算：这个群是**每会话串行**的，一条被动回复会排在整轮升级后面。
+            # 试到一半超时就直接收手，宁可这一轮不说，也不能让 @她 的人等十几秒。
+            if budget > 0 and index > 0 and time.time() - started > budget:
+                logger.info('主动周期超时（%.1fs > %.0fs），放弃剩余档位 | %s',
+                            time.time() - started, budget, session[-16:])
+                break
+            # 每次调用前都过一遍本群额度：连试三次等于三次真实调用，不能只查一次
+            allowed, why = self.group_profile.allow(session)
+            if not allowed:
+                logger.warning('本群额度已满，本轮升级中断：%s %s', session[-12:], why)
+                break
+            result, text = self._ask(msg, kind, level, cfg)
+            if result is None or not result.ok:
+                if result is not None:
+                    logger.warning('LLM error %s for %s（kind=%s, L%s）',
+                                   result.error_code, session[-16:], kind, level)
+                # 网络/额度错误不是「她不想说」，不记档位、也不再往上加码
+                self.attention.end_cycle(session, False)
+                return None, '', -1
+            if not text.strip():
+                logger.warning(
+                    '模型返回空内容（思考链吃光 max_tokens=%s？）session=%s kind=%s L%s',
+                    cfg.get('fast_max_tokens', 8192), session[-16:], kind, level)
+                self.attention.note_attempt(session, level, False, result.model)
+                continue
+            if is_silent_reply(text):
+                # 这个档位被拒：记档位（算它的真实接受率），再往上加一档
+                self.attention.note_attempt(session, level, False, result.model)
+                self.attention.record_model(
+                    session, 'observe', detail=text.strip(),
+                    latency_ms=result.latency_ms, level=level)
+                logger.info('主动搭话 L%s 被拒 | %s', level, session[-16:])
+                continue
+            self.attention.note_attempt(session, level, True, result.model)
+            # 周期兑现了就在这里结账：即使后面被渲染层拦下（计划泄露/审计命中），
+            # 「模型这次肯开口」这个事实也该算进兑现率，否则会被误判成挑食。
+            self.attention.end_cycle(session, True)
+            return result, text, level
+        self.attention.end_cycle(session, False)
+        logger.info('主动周期整轮被拒，本轮不开口 | %s', session[-16:])
+        return None, '', -1
+
+    def _remember_user_turn(self, msg: IncomingMessage) -> None:
+        """把用户这句话先记进 turns，**只对私聊**。
+
+        为什么只对私聊：群聊上下文来自 live_context（消息一到就写），这里再写会重复；
+        而私聊的上下文**只**来自 turns。以前所有早退分支（模型报错 / 空内容 /
+        静默 / 渲染被拦 / 本轮在静默期）一句都不写，于是她「完全不记得对方说过什么」，
+        下一句还会答非所问。先记账再生成，任何分支都不会丢。
+        """
+        if msg.is_group:
+            return
+        try:
+            self.store.add_turn(msg.session.as_text(), 'user', msg.text,
+                                msg.sender_id, msg.sender_name)
+        except Exception:  # noqa: BLE001 - 记账失败不该挡住回复
+            logger.exception('记录私聊用户轮失败')
+
     def process_job(self, msg: IncomingMessage, kind: str) -> None:
         cfg = self.config
         # 命令重载后组件重新读取最新配置
@@ -484,46 +675,60 @@ class Runtime:
         self.gateway.config = cfg
         self.renderer.config = cfg
         is_active = kind == 'active'
+        session_key = msg.session.as_text()
+        # 私聊先记账：后面有六条早退分支，以前每一条都会把她这句话弄丢
+        remember_user = not msg.is_group
+        if remember_user:
+            self._remember_user_turn(msg)
+        # 静默期内不回复：以前只有 router 拦住了**新到**的消息，
+        # 队列里已经排着的任务照样落地（静默刚生效时最明显）。
+        is_resting = getattr(self, 'is_resting', None)
+        if callable(is_resting) and is_resting(session_key):
+            logger.info('本会话处于自我保护静默，丢弃排队任务（kind=%s）| %s',
+                        kind, session_key[-16:])
+            return
         # 按群额度：本群今天调够次数了就直接放弃，连 prompt 都不用拼。
         # 这是防「被拉进小群疯狂消耗」的总闸，放在最前面（比任何 token 都便宜）。
-        allowed, why = self.group_profile.allow(msg.session.as_text())
+        allowed, why = self.group_profile.allow(session_key)
         if not allowed:
-            logger.warning('本群额度已满，跳过本轮：%s %s', msg.session.as_text()[-12:], why)
+            logger.warning('本群额度已满，跳过本轮：%s %s', session_key[-12:], why)
             return
-        messages = self.prompt_builder.build(msg, is_active=is_active)
-        model = cfg.get('fast_model', 'gemini-3.8-flash-medium')
-        temperature = float(cfg.get('fast_temperature', 0.7))
-        # 兜底值要和 config.DEFAULT_CONFIG 保持一致：写小了会在配置缺键时
-        # 悄悄退回小额度，而空回复的锅会记到模型头上（实测踩过）。
-        max_tokens = int(cfg.get('fast_max_tokens', 8192))
-        req = ModelRequest(messages=messages, model=model, temperature=temperature, max_tokens=max_tokens)
-        result = self.gateway.chat(req, kind=kind, session_key=msg.session.as_text())
-        if not result.ok:
-            logger.warning('LLM error %s for %s', result.error_code, msg.session.as_text())
-            return
-        text = result.text
-        # 空内容要显式记一笔。以前这里走的是「render 返回 None → 静默 return」，
-        # 没日志没回复，排查时看起来就像「她根本没反应」。
-        # 实测（2026-09 ginka + dsv4.1-flash）：思考模式关不掉，思维链会吃光
-        # max_tokens，**11 次调用有 6 次返回空 content**——额度给小了尤其严重。
-        if not (text or '').strip():
-            logger.warning(
-                '模型返回空内容（思考链吃光 max_tokens=%s？）session=%s kind=%s',
-                max_tokens, msg.session.as_text()[-16:], kind,
-            )
-            return
+        # 主动搭话的去留已经在路由层由打分闸门决定了（见 routing/attention.py），
+        # 这里只按升级计划逐级尝试；被动回复照旧一次。
+        spoken_level = 0
+        if is_active:
+            result, text, spoken_level = self._active_cycle(msg, kind, cfg)
+            if result is None:
+                return
+        else:
+            result, text = self._ask(msg, kind, 0, cfg)
+            if result is None:
+                return
+            if not result.ok:
+                logger.warning('LLM error %s for %s（kind=%s）',
+                               result.error_code, msg.session.as_text()[-16:], kind)
+                return
+            if not (text or '').strip():
+                # 空内容要显式记一笔。以前这里走的是「render 返回 None → 静默 return」，
+                # 没日志没回复，排查时看起来就像「她根本没反应」。
+                # 实测（2026-09 ginka + dsv4.1-flash）：思考模式关不掉，思维链会吃光
+                # max_tokens，**11 次调用有 6 次返回空 content**——额度给小了尤其严重。
+                logger.warning(
+                    '模型返回空内容（思考链吃光 max_tokens=%s？）session=%s kind=%s',
+                    cfg.get('fast_max_tokens', 8192), msg.session.as_text()[-16:], kind,
+                )
+                return
         # 静默标记：主动/被动一视同仁，整轮丢弃，绝不发进群
         if is_silent_reply(text):
-            if is_active:
-                # 第四道闸门（质量闸）就是这次模型判断：她想了想觉得没什么好说的。
-                # 记下来，观察期结束要能算出「看过没说」占多大比例。
-                self.attention.record_model(
-                    msg.session.as_text(), 'observe',
-                    detail=text.strip(), latency_ms=result.latency_ms,
-                )
+            if not is_active:
+                # 被动还选择不说话是反常的：有人叫她，她却回了静默标记。
+                logger.warning('被动回复被模型判定为静默（有人叫她却不答）| %s | %r',
+                               msg.session.as_text()[-16:], text.strip()[:60])
             return
         rendered = self.renderer.render(text, msg)
         if rendered is None:
+            logger.warning('渲染层判定整条不发（审计命中或正文被清空）| %s | %r',
+                           msg.session.as_text()[-16:], (text or '')[:80])
             return
         # 自我保护：模型判断这个群已经待不下去（谩骂/过当调戏/纠缠等）→ 静默 + 通知骰主。
         # 放在发送之前：即使下面发送失败，静默也必须生效。
@@ -532,16 +737,20 @@ class Runtime:
             if not (rendered.text or '').strip():
                 # 她选择直接退场、不留话；但这条用户消息仍然入账，
                 # 否则静默结束后她看上下文会觉得「话说到一半断了」。
-                self.store.add_turn(msg.session.as_text(), 'user', msg.text,
-                                    msg.sender_id, msg.sender_name)
+                if not remember_user:
+                    self.store.add_turn(msg.session.as_text(), 'user', msg.text,
+                                        msg.sender_id, msg.sender_name)
                 return
         if is_active:
             row_id = self.attention.record_model(
                 msg.session.as_text(), 'speak',
                 detail=op_codes_to_plain(rendered.text), latency_ms=result.latency_ms,
+                level=spoken_level,
             )
             if self.config.get('active_shadow', True):
                 # 影子模式：决策记下了，但消息不发——先观察一两天把阈值调对
+                logger.info('影子模式：本次主动搭话只记账不发（L%s）| %s',
+                            spoken_level, msg.session.as_text()[-16:])
                 return
 
         # 伴生原声语音派发与双轨输出
@@ -549,7 +758,6 @@ class Runtime:
         if rendered.voice_payload:
             v_emotion, v_japanese = rendered.voice_payload
             is_active_req = self.voice_manager.is_user_requesting_voice(msg.text)
-            voice_annotation = f" [VOICE:{v_emotion}|{v_japanese}]"
             group_id = str(msg.session.target_id) if msg.is_group else ""
             group_name = ""
             if msg.is_group and hasattr(self, 'group_profile'):
@@ -560,7 +768,7 @@ class Runtime:
                 except Exception:
                     pass
 
-            self.voice_manager.dispatch_voice(
+            queued = self.voice_manager.dispatch_voice(
                 event=msg.event,
                 session_type='group' if msg.is_group else 'private',
                 target_id=msg.session.target_id,
@@ -572,6 +780,13 @@ class Runtime:
                 group_name=group_name,
                 sender_name=msg.sender_name,
             )
+            # 只有**真的排上了**才写进历史。以前不管发没发出去都写 [VOICE:…]，
+            # 于是网关离线或冷却拦下时，她之后会「记得」自己发过一条根本不存在的语音。
+            if queued:
+                voice_annotation = f" [VOICE:{v_emotion}|{v_japanese}]"
+            else:
+                logger.info('语音未发出（冷却/熔断/关闭），本次不写进历史：%s',
+                            msg.session.as_text()[-16:])
         else:
             self.voice_manager.mark_turn_without_voice(msg.session.as_text())
 
@@ -579,7 +794,10 @@ class Runtime:
         content_to_record = plain_reply + voice_annotation
 
         # 状态提交：用户轮 + 回复轮（回复以纯文本入库，避免 OP 码污染上下文；附带语音事实）
-        self.store.add_turn(msg.session.as_text(), 'user', msg.text, msg.sender_id, msg.sender_name)
+        # 私聊的用户轮已经在 process_job 开头记过了（保证早退分支也不丢）。
+        if not remember_user:
+            self.store.add_turn(msg.session.as_text(), 'user', msg.text,
+                                msg.sender_id, msg.sender_name)
         self.store.add_turn(
             msg.session.as_text(), 'assistant', content_to_record,
             model=result.model, in_tokens=result.input_tokens, out_tokens=result.output_tokens,

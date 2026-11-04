@@ -7,16 +7,70 @@ import os
 import re
 import sqlite3
 import threading
+import math
 import time
 from typing import Any, Optional
 
 # 事实判重用的归一化键：只留实义字符（中文、字母、数字），标点空白一律丢掉。
 # 这样「我喜欢喝牛奶。」和「我喜欢喝牛奶」会被认成同一条。
 _KEEP_RE = re.compile(r'[^\w\u4e00-\u9fff]+')
+_TOKEN_RE = re.compile(r'[\u4e00-\u9fa5]{2,4}|[a-zA-Z0-9_]{2,}')
+_STOP_WORDS = {
+    '这个', '那个', '什么', '怎么', '可以', '没有', '不是', '就是',
+    '我们', '你们', '他们', '感觉', '觉得', '因为', '所以', '虽然',
+    '但是', '如果', '一下', '今天', '明天', '昨天', '现在', '刚刚'
+}
+
+
+_CHINESE_STOP_CHARS = set('的一是不了在人有我他这个上们来到时大地为子中你说生国年着就那和要她它么得之过想买点去用会看能好把给让做多等别再现因真听太问些很')
 
 
 def normalize_fact(text: str) -> str:
     return _KEEP_RE.sub('', str(text or '')).lower()
+
+
+def extract_keywords(text: str) -> set[str]:
+    """提取用于比对的短语与关键词。"""
+    raw = str(text or '').strip()
+    if not raw:
+        return set()
+    tokens = {t.lower() for t in _TOKEN_RE.findall(raw) if t.lower() not in _STOP_WORDS}
+    chars = [c for c in raw if '\u4e00' <= c <= '\u9fa5']
+    for i in range(len(chars) - 1):
+        bg = chars[i] + chars[i + 1]
+        if bg not in _STOP_WORDS:
+            tokens.add(bg)
+    return tokens
+
+
+def text_similarity(text1: str, text2: str) -> float:
+    """计算两段记忆文本之间的语义重叠相似度 (0.0 ~ 1.0)。纯本地运算，0 延迟。
+    结合核心实义汉字与词汇 Overlap/Jaccard 系数。
+    """
+    t1 = str(text1 or '').strip().lower()
+    t2 = str(text2 or '').strip().lower()
+    if not t1 or not t2:
+        return 0.0
+    if t1 == t2:
+        return 1.0
+    if (t1 in t2 or t2 in t1) and min(len(t1), len(t2)) / max(len(t1), len(t2)) > 0.6:
+        return 0.9
+
+    c1 = {c for c in t1 if '\u4e00' <= c <= '\u9fa5' and c not in _CHINESE_STOP_CHARS}
+    c2 = {c for c in t2 if '\u4e00' <= c <= '\u9fa5' and c not in _CHINESE_STOP_CHARS}
+    e1 = set(re.findall(r'[a-zA-Z0-9_]{2,}', t1))
+    e2 = set(re.findall(r'[a-zA-Z0-9_]{2,}', t2))
+    all1 = c1 | e1
+    all2 = c2 | e2
+    if not all1 or not all2:
+        return 0.0
+
+    inter = len(all1 & all2)
+    if inter == 0:
+        return 0.0
+    overlap = inter / min(len(all1), len(all2))
+    jaccard = inter / len(all1 | all2)
+    return 0.5 * overlap + 0.5 * jaccard
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns(
@@ -65,6 +119,7 @@ CREATE TABLE IF NOT EXISTS api_calls(
     model TEXT DEFAULT '',
     in_tokens INTEGER DEFAULT 0,
     out_tokens INTEGER DEFAULT 0,
+    cached_tokens INTEGER DEFAULT 0,
     latency_ms INTEGER DEFAULT 0,
     ok INTEGER DEFAULT 1,
     error_code TEXT DEFAULT ''
@@ -133,6 +188,13 @@ CREATE TABLE IF NOT EXISTS self_memories(
 );
 CREATE INDEX IF NOT EXISTS idx_self_sk ON self_memories(session_key, valid_to);
 
+-- L2 扩展：群友印象与羁绊卡片（跨会话高维画像）
+CREATE TABLE IF NOT EXISTS user_impressions(
+    user_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 -- 主动搭话决策日志。三道本地闸门 + 模型决策都记一条，用来观察「她多久想说一次、
 -- 被哪道闸门挡住、影子模式下本来会说什么」。这是调阈值的唯一依据。
 CREATE TABLE IF NOT EXISTS active_decisions(
@@ -170,11 +232,34 @@ class SQLiteStore:
             self._local.conn = conn
         return conn
 
+    def close(self) -> None:
+        """关掉本线程的连接（测试/退出用）。
+
+        连接是 thread-local 的，所以只能关当前线程这一条；没关掉的连接在解释器退出时
+        会刷一串 ResourceWarning（2026-11-03 审查提到）。运行时不需要主动调用
+        ——进程重启时由操作系统回收，SQLite 是实时落盘的。
+        """
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._local.conn = None
+
     def _init(self) -> None:
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        self._migrate(conn)
         if self.get_setting('schema_version') is None:
             self.set_setting('schema_version', '1')
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """老库补列：只做加法，绝不删列——升级不能把数据搞丢。"""
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(api_calls)')}
+        if 'cached_tokens' not in cols:
+            conn.execute('ALTER TABLE api_calls ADD COLUMN cached_tokens INTEGER DEFAULT 0')
 
     # ---------------- settings ----------------
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -290,20 +375,22 @@ class SQLiteStore:
         latency_ms: int,
         ok: bool,
         error_code: str = '',
+        cached_tokens: int = 0,
     ) -> None:
         self._conn().execute(
-            'INSERT INTO api_calls(day, ts, session_key, kind, model, in_tokens, out_tokens, latency_ms, ok, error_code) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO api_calls(day, ts, session_key, kind, model, in_tokens, out_tokens, cached_tokens, latency_ms, ok, error_code) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
             (time.strftime('%Y-%m-%d'), int(time.time()), session_key, kind, model,
-             in_tokens, out_tokens, latency_ms, 1 if ok else 0, error_code),
+             in_tokens, out_tokens, int(cached_tokens or 0), latency_ms, 1 if ok else 0, error_code),
         )
 
     def today_stats(self) -> dict:
-        """今日统计：总调用数、输出 token、主动搭话触发次数。"""
+        """今日统计：总调用数、输入/输出 token、其中命中缓存的输入 token。"""
         day = time.strftime('%Y-%m-%d')
         row = self._conn().execute(
             'SELECT COUNT(*), COALESCE(SUM(out_tokens), 0), '
-            "COALESCE(SUM(CASE WHEN kind = 'active' THEN 1 ELSE 0 END), 0) "
+            "COALESCE(SUM(CASE WHEN kind = 'active' THEN 1 ELSE 0 END), 0), "
+            'COALESCE(SUM(in_tokens), 0), COALESCE(SUM(cached_tokens), 0) '
             'FROM api_calls WHERE day=?',
             (day,),
         ).fetchone()
@@ -311,7 +398,26 @@ class SQLiteStore:
             'calls': int(row[0]),
             'output_tokens': int(row[1]),
             'active_calls': int(row[2]),
+            'input_tokens': int(row[3]),
+            'cached_tokens': int(row[4]),
         }
+
+    def today_stats_by_kind(self) -> list[dict]:
+        """今天按用途拆账：kind / 次数 / 输入 token（大的排前面）。
+
+        拆账的意义在于回答「钱到底花在哪」——搭话判断、主动回复、被动回复、
+        记忆提炼的单价和频次差着一个量级，混成一个总数什么也看不出来。
+        """
+        day = time.strftime('%Y-%m-%d')
+        rows = self._conn().execute(
+            'SELECT kind, COUNT(*), COALESCE(SUM(in_tokens), 0) '
+            'FROM api_calls WHERE day=? GROUP BY kind ORDER BY 3 DESC',
+            (day,),
+        ).fetchall()
+        return [
+            {'kind': str(r[0] or ''), 'calls': int(r[1]), 'input_tokens': int(r[2])}
+            for r in rows
+        ]
 
     # ==================== 记忆 L0：原始缓冲 ====================
     def buffer_append(self, session_key: str, role: str, content: str,
@@ -425,14 +531,34 @@ class SQLiteStore:
             return None
         return {'id': row[0], 'fact': row[1], 'importance': row[2], 'source': row[3]}
 
+    def find_similar_user_fact(self, session_key: str, user_id: str, fact: str,
+                               threshold: float = 0.60) -> Optional[dict]:
+        """模糊判重：若该用户已有相似度 >= threshold 的事实，返回已有条目，避免存入同义废话。"""
+        exact = self.find_user_fact(session_key, user_id, fact)
+        if exact:
+            return exact
+        rows = self.list_user_facts(session_key, user_id, limit=30, include_expired=False)
+        for r in rows:
+            sim = text_similarity(fact, r.get('fact') or '')
+            if sim >= threshold:
+                return r
+        return None
+
     def list_user_facts(self, session_key: str, user_id: Optional[str] = None,
-                        limit: int = 20, include_expired: bool = False) -> list[dict]:
-        sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
-               'last_hit_at, hit_count FROM user_facts WHERE session_key=?')
-        args: list = [session_key]
-        if user_id is not None:
-            sql += ' AND user_id=?'
-            args.append(str(user_id))
+                        limit: int = 20, include_expired: bool = False,
+                        include_global: bool = False) -> list[dict]:
+        if include_global and user_id is not None and session_key != 'global':
+            sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                   'last_hit_at, hit_count, session_key FROM user_facts '
+                   'WHERE (session_key=? OR session_key=\'global\') AND user_id=?')
+            args: list = [session_key, str(user_id)]
+        else:
+            sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                   'last_hit_at, hit_count, session_key FROM user_facts WHERE session_key=?')
+            args: list = [session_key]
+            if user_id is not None:
+                sql += ' AND user_id=?'
+                args.append(str(user_id))
         if not include_expired:
             sql += ' AND valid_to=0'
         sql += ' ORDER BY importance DESC, id DESC LIMIT ?'
@@ -440,7 +566,29 @@ class SQLiteStore:
         rows = self._conn().execute(sql, tuple(args)).fetchall()
         return [{'id': r[0], 'user_id': r[1], 'fact': r[2], 'category': r[3], 'source': r[4],
                  'importance': r[5], 'valid_from': r[6], 'valid_to': r[7],
-                 'last_hit_at': r[8], 'hit_count': r[9]} for r in rows]
+                 'last_hit_at': r[8], 'hit_count': r[9], 'session_key': r[10]} for r in rows]
+
+    def get_user_impression(self, user_id: str) -> Optional[dict]:
+        """获取群友高维印象卡片（跨群共享）。"""
+        row = self._conn().execute(
+            'SELECT user_id, summary, updated_at FROM user_impressions WHERE user_id=?',
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            return None
+        return {'user_id': row[0], 'summary': row[1], 'updated_at': row[2]}
+
+    def set_user_impression(self, user_id: str, summary: str) -> None:
+        """更新群友高维印象卡片。"""
+        text = str(summary or '').strip()
+        if not text:
+            return
+        now = int(time.time())
+        self._conn().execute(
+            'INSERT INTO user_impressions(user_id, summary, updated_at) VALUES(?,?,?) '
+            'ON CONFLICT(user_id) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at',
+            (str(user_id), text, now),
+        )
 
     def touch_user_fact(self, fact_id: int) -> None:
         """命中一次：刷新时间戳与次数。衰减用 last_hit_at 而非 created_at——越用越牢。"""
@@ -465,19 +613,32 @@ class SQLiteStore:
         row = self._conn().execute(sql, tuple(args)).fetchone()
         return int(row[0])
 
-    def purge_user_facts(self, session_key: str, user_id: str) -> int:
-        """清空某个用户在新记忆表里的事实（返回清掉的有效条数）。
+    def purge_user_facts(self, session_key: str, user_id: str,
+                         include_global: bool = True) -> int:
+        """清空某个用户的事实（返回清掉的有效条数）。
 
         注意方法名：旧的 memories 表已经有 clear_user_facts(user_key)，
         这里不能再叫同名，否则会把旧方法覆盖掉（实测踩过）。
+
+        `include_global=True` 会连**全局范围**（session_key='global'）的事实一起清掉：
+        「忘了我」以前只删当前群的，而跨群偏好存在 global 里，于是她换个群还记得你
+        （2026-11-03 审查发现）。
         """
         conn = self._conn()
+        sessions = [session_key]
+        if include_global and session_key != 'global':
+            sessions.append('global')
+        placeholders = ','.join('?' for _ in sessions)
         row = conn.execute(
-            'SELECT COUNT(*) FROM user_facts WHERE session_key=? AND user_id=? AND valid_to=0',
-            (session_key, str(user_id)),
+            'SELECT COUNT(*) FROM user_facts WHERE session_key IN (%s) AND user_id=? '
+            'AND valid_to=0' % placeholders,
+            tuple(sessions) + (str(user_id),),
         ).fetchone()
-        conn.execute('DELETE FROM user_facts WHERE session_key=? AND user_id=?',
-                     (session_key, str(user_id)))
+        conn.execute(
+            'DELETE FROM user_facts WHERE session_key IN (%s) AND user_id=?' % placeholders,
+            tuple(sessions) + (str(user_id),),
+        )
+        conn.execute('DELETE FROM user_impressions WHERE user_id=?', (str(user_id),))
         return int(row[0])
 
     def migrate_legacy_memories(self) -> int:
@@ -520,6 +681,85 @@ class SQLiteStore:
             (session_key, normalize_fact(content)),
         ).fetchone()
         return {'id': row[0], 'content': row[1]} if row else None
+
+    def find_similar_self_memory(self, session_key: str, content: str,
+                                 threshold: float = 0.60) -> Optional[dict]:
+        """模糊判重：若当前会话已有相似度 >= threshold 的歌伊自身记忆，返回已有条目。"""
+        exact = self.find_self_memory(session_key, content)
+        if exact:
+            return exact
+        rows = self.list_self_memories(session_key, limit=50, include_expired=False)
+        for r in rows:
+            sim = text_similarity(content, r.get('content') or '')
+            if sim >= threshold:
+                return r
+        return None
+
+    def expire_self_memory(self, memory_id: int, when: Optional[int] = None) -> None:
+        """失效但不删除自身记忆。"""
+        self._conn().execute(
+            'UPDATE self_memories SET valid_to=? WHERE id=? AND valid_to=0',
+            (int(when or time.time()), int(memory_id)),
+        )
+
+    def deduplicate_active_memories(self, threshold: float = 0.55) -> dict:
+        """存量去重：扫描库中全部有效事实与自身记忆，将语义相似度 >= threshold 的冗余旧条目软失效。"""
+        now = int(time.time())
+        stats = {'user_facts_expired': 0, 'self_memories_expired': 0}
+
+        # 1. 自身记忆去重：按 session_key 分组
+        cur = self._conn().execute(
+            'SELECT id, session_key, content, importance, hit_count, created_at '
+            'FROM self_memories WHERE valid_to=0 ORDER BY id DESC'
+        )
+        self_rows = cur.fetchall()
+        groups: dict[str, list] = {}
+        for r in self_rows:
+            groups.setdefault(r[1], []).append({
+                'id': r[0], 'session_key': r[1], 'content': r[2],
+                'importance': r[3], 'hit_count': r[4], 'created_at': r[5]
+            })
+        for sk, items in groups.items():
+            kept: list = []
+            for item in items:
+                duplicate_of = None
+                for k in kept:
+                    if text_similarity(item['content'], k['content']) >= threshold:
+                        duplicate_of = k
+                        break
+                if duplicate_of:
+                    self.expire_self_memory(item['id'], when=now)
+                    stats['self_memories_expired'] += 1
+                else:
+                    kept.append(item)
+
+        # 2. 用户事实去重：按 (session_key, user_id) 分组
+        cur_u = self._conn().execute(
+            'SELECT id, session_key, user_id, fact, importance, hit_count, created_at '
+            'FROM user_facts WHERE valid_to=0 ORDER BY id DESC'
+        )
+        u_rows = cur_u.fetchall()
+        u_groups: dict[tuple[str, str], list] = {}
+        for r in u_rows:
+            u_groups.setdefault((r[1], r[2]), []).append({
+                'id': r[0], 'session_key': r[1], 'user_id': r[2], 'fact': r[3],
+                'importance': r[4], 'hit_count': r[5], 'created_at': r[6]
+            })
+        for (sk, uid), items in u_groups.items():
+            kept_u: list = []
+            for item in items:
+                dup = None
+                for k in kept_u:
+                    if text_similarity(item['fact'], k['fact']) >= threshold:
+                        dup = k
+                        break
+                if dup:
+                    self.expire_user_fact(item['id'], when=now)
+                    stats['user_facts_expired'] += 1
+                else:
+                    kept_u.append(item)
+
+        return stats
 
     def list_self_memories(self, session_key: str, limit: int = 10,
                            include_expired: bool = False) -> list[dict]:
@@ -617,7 +857,7 @@ class SQLiteStore:
         而提炼按**消息量**算（每 `memory_curate_messages` 条一次）。
         小群一天几十次提炼，配额瞬间见底。
 
-        线上实测（群 957309761，19 人，配额 40）：
+        线上实测（群 200000005，19 人，配额 40）：
 
             09-17   提炼 39 + 被动 6 + 主动 21 = 66   ★ 超配额
             09-18   提炼 33 + 被动 0 + 主动 10 = 43   ★ 超配额
@@ -687,21 +927,24 @@ class SQLiteStore:
         return len(doomed)
 
     def list_facts_of_users(self, session_key: str, user_ids, limit_per_user: int = 8) -> dict:
-        """按一批 QQ 号取现有事实（提炼时喂给模型判重用）。返回 {user_id: [fact, ...]}。"""
+        """按一批 QQ 号取现有事实（含 global 全局事实，提炼时喂给模型判重/失效用）。
+        返回 {user_id: [{'id': int, 'fact': str, 'scope': str}]}。
+        """
         ids = [str(u) for u in (user_ids or []) if str(u).strip()]
         if not ids:
             return {}
         marks = ','.join('?' for _ in ids)
         rows = self._conn().execute(
-            'SELECT user_id, fact FROM user_facts WHERE session_key=? AND valid_to=0 '
+            'SELECT id, user_id, fact, session_key FROM user_facts '
+            'WHERE (session_key=? OR session_key=\'global\') AND valid_to=0 '
             'AND user_id IN (%s) ORDER BY importance DESC, id DESC' % marks,
             tuple([session_key] + ids),
         ).fetchall()
         out: dict = {}
-        for user_id, fact in rows:
+        for fid, user_id, fact, sk in rows:
             bucket = out.setdefault(str(user_id), [])
             if len(bucket) < int(limit_per_user):
-                bucket.append(str(fact))
+                bucket.append({'id': int(fid), 'fact': str(fact), 'scope': 'global' if sk == 'global' else 'group'})
         return out
 
     # ==================== 导出（排查/备份用） ====================

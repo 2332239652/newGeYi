@@ -6,6 +6,11 @@
 - 全局线程池限制总并发，网络调用在队列外执行（不占用会话锁）
 - 队列超过 max_pending_per_session 时丢弃新任务（防堆积）
 - 「话没说完」时先按住几秒再回（见 _hold_seconds 的说明）
+
+⚠️ 2026-11-01：这个模块以前有三条**完全静默**的路径——队列满丢消息、worker 标记卡住、
+_drain 找不到会话状态。线上表现就是「@她完全不理，日志一片干净、api_calls 一条都没有」，
+事后只能靠数据库和 py-spy 反推。现在每一条都留日志，并且加了看门狗：
+worker 标记挂着但 5 分钟没有任何进展，就重新起一个 drain——宁可多跑一次，也不能整场沉默。
 """
 
 from __future__ import annotations
@@ -34,6 +39,14 @@ DEFAULT_INCOMPLETE_TAILS = (
 # 按住期间的轮询间隔：够短才反应得过来，够长才不空转
 _HOLD_TICK = 0.4
 
+# 看门狗：worker_active 为真、但这么久都没有任何任务起步 → 判定上一个 drain 已经死了。
+# 阈值要明显大于「单条任务最坏耗时」（按住 8s + 下载图 10s + 网关 45s×2 次重试 + 语音派发），
+# 否则会把正在跑的长任务误判成卡死，白白并发两条回路。
+STALE_DRAIN_SECONDS = 300.0
+
+# 队列满的告警节流：同一个会话 60 秒内只喊一次，别把日志刷爆
+_FULL_WARN_INTERVAL = 60.0
+
 
 def looks_incomplete(text: str, tails=DEFAULT_INCOMPLETE_TAILS) -> bool:
     """消息是不是「话还没说完」。
@@ -51,42 +64,94 @@ def looks_incomplete(text: str, tails=DEFAULT_INCOMPLETE_TAILS) -> bool:
 
 
 class _SessionState:
-    __slots__ = ('pending', 'worker_active', 'last_active')
+    __slots__ = ('pending', 'worker_active', 'last_active', 'last_progress_at', 'warned_full_at')
 
     def __init__(self):
         self.pending: collections.deque = collections.deque()
         self.worker_active = False
         self.last_active = time.time()
+        # 上一次「真的有任务起步」的时间：看门狗靠它判断 drain 是不是死了
+        self.last_progress_at = time.time()
+        # 「队列满」告警的节流时间
+        self.warned_full_at = 0.0
 
 
 class SessionScheduler:
     def __init__(self, runtime, max_workers: int = 6):
         self.runtime = runtime
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix='geyi'
-        )
+        self.max_workers = int(max_workers)
+        self._executor = self._new_executor()
         self._states: dict[str, _SessionState] = {}
         self._lock = threading.Lock()
 
+    def _new_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix='geyi')
+
+    # ---------- 提交 ----------
     def submit(self, msg: IncomingMessage, kind: str) -> bool:
         key = msg.session.as_text()
         job = (msg, kind)
+        now = time.time()
+        need_kick = False
         with self._lock:
             state = self._states.get(key)
             if state is None:
                 state = _SessionState()
                 self._states[key] = state
-            state.last_active = time.time()
+            state.last_active = now
+            # 看门狗：标记还挂着，却久到不像有任何任务在跑 → 上一个 _drain 已经死了。
+            # 不重置的话这个会话会永远沉默：后面的消息只会往 pending 里堆，堆满 6 条
+            # 之后连 submit 都直接 return False，一句日志都没有（2026-11-01 的线上故障）。
+            if state.worker_active and now - state.last_progress_at > STALE_DRAIN_SECONDS:
+                logger.warning(
+                    '会话队列疑似卡死：worker 标记挂了 %.0f 秒没有进展，重建 drain（积压 %d 条）| %s',
+                    now - state.last_progress_at, len(state.pending), key[-24:],
+                )
+                state.worker_active = False
             max_pending = int(self.runtime.config.get('max_pending_per_session', 6))
             if len(state.pending) >= max_pending:
+                if now - state.warned_full_at > _FULL_WARN_INTERVAL:
+                    state.warned_full_at = now
+                    logger.warning(
+                        '会话队列已满（%d/%d），本条被丢弃 | %s | %r',
+                        len(state.pending), max_pending, key[-24:], (msg.text or '')[:30],
+                    )
                 return False
             state.pending.append(job)
-            if state.worker_active:
-                return True
-            state.worker_active = True
-            self._prune_locked()
-        self._executor.submit(self._drain, key)
+            if not state.worker_active:
+                state.worker_active = True
+                state.last_progress_at = now
+                self._prune_locked()
+                need_kick = True
+        if need_kick:
+            self._kick(key)
         return True
+
+    def _kick(self, key: str) -> None:
+        """起一个 drain 线程任务；线程池已经关了（插件重载后事件还发到旧 runtime）就重建。"""
+        try:
+            self._executor.submit(self._drain, key)
+            return
+        except RuntimeError as exc:  # 执行器已 shutdown
+            logger.warning('调度线程池已关闭（%s），重建后重试 | %s', exc, key[-24:])
+        except Exception:  # noqa: BLE001 - 提交失败不能把整条消息处理链路带崩
+            logger.exception('提交调度任务失败 | %s', key[-24:])
+            self._release(key)
+            return
+        try:
+            with self._lock:
+                self._executor = self._new_executor()
+            self._executor.submit(self._drain, key)
+        except Exception:  # noqa: BLE001
+            logger.exception('重建线程池后仍然提交失败，本会话任务挂起 | %s', key[-24:])
+            self._release(key)
+
+    def _release(self, key: str) -> None:
+        """把 worker 标记放掉，让下一条消息能重新起 drain（总比永远沉默好）。"""
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None:
+                state.worker_active = False
 
     # ---------- 话没说完时先按住 ----------
     def _hold_seconds(self, msg: IncomingMessage, kind: str) -> float:
@@ -102,7 +167,14 @@ class SessionScheduler:
             return 0.0
         if hold <= 0:
             return 0.0
-        tails = self.runtime.config.get('incomplete_tails') or DEFAULT_INCOMPLETE_TAILS
+        # 配置里写 [] 必须是「关掉」，不能掉回默认词表——以前 `[] or DEFAULT` 让这个
+        # 开关形同虚设：明明关了，每条以「然后/就是/话说」结尾的消息还是被按住 8 秒，
+        # 忙群里再被后一条顶掉，回复就直接消失了。
+        tails = self.runtime.config.get('incomplete_tails')
+        if tails is None:
+            tails = DEFAULT_INCOMPLETE_TAILS
+        if not isinstance(tails, (list, tuple, set)):
+            tails = DEFAULT_INCOMPLETE_TAILS
         if not looks_incomplete(getattr(msg, 'text', ''), tails):
             return 0.0
         return hold
@@ -113,6 +185,7 @@ class SessionScheduler:
         返回 True = 本条被后一条取代，调用方应该丢弃它。
         为什么可以丢：后一条的上下文是从数据库现取的，**已经包含前一条**，
         回一次就够；两条都回反而像抢话、像逐条应答的机器人。
+        （丢弃会留一行 INFO，以前是纯静默的，排查时看起来就像「她没收到这条」。）
         """
         hold = self._hold_seconds(msg, kind)
         if hold <= 0:
@@ -127,7 +200,11 @@ class SessionScheduler:
                 if len(pending) > 1:
                     # 后面确实又来了一条。只有也是被动回复时才取代本条；
                     # 如果排的是主动搭话，那跟本条无关，别把人家的话吞了。
-                    return pending[1][1] == 'passive'
+                    if pending[1][1] == 'passive':
+                        logger.info('「话没说完」：本条被后一条取代，不再单独回 | %r',
+                                    (getattr(msg, 'text', '') or '')[:30])
+                        return True
+                    return False
         return False
 
     def _prune_locked(self) -> None:
@@ -141,6 +218,8 @@ class SessionScheduler:
     def _drain(self, key: str) -> None:
         state = self._states.get(key)
         if state is None:
+            # 以前这里静默 return，等于把这个会话的下一条消息永远埋了
+            logger.warning('drain 找不到会话状态（已被清理？），本轮丢弃 | %s', key[-24:])
             return
         try:
             while True:
@@ -149,6 +228,9 @@ class SessionScheduler:
                         state.worker_active = False
                         return
                     msg, kind = state.pending[0]
+                    # 每起步一条任务就算一次「有进展」，看门狗据此判断死活
+                    state.last_progress_at = time.time()
+                    state.worker_active = True
                 # 未完待续：按住几秒。被后一条取代就直接丢，不重复回话。
                 if self._wait_or_superseded(state, msg, kind):
                     with self._lock:
@@ -169,16 +251,45 @@ class SessionScheduler:
                         return
                     msg, kind = state.pending.popleft()
                 try:
+                    # 开工/收工各留一行：没有这两行的话，「她没回」到底是没进队列、
+                    # 还是卡在生成里，日志上完全分不出来（2026-11-01 排障时最缺的就是这个）。
+                    logger.info('任务开始 kind=%s | %s | %r',
+                                kind, key[-16:], (msg.text or '')[:30])
                     self.runtime.process_job(msg, kind)
+                    # 「开始了」但没有 api_calls、也没有「LLM error」→ 说明是 process_job
+                    # 内部的静默早退，现在那些分支都各自留了 warning，可以对上号。
+                    logger.info('任务返回 kind=%s | %s', kind, key[-16:])
                 except Exception:  # noqa: BLE001 - 单个任务失败不影响会话继续
-                    logger.exception('session %s job failed', key)
+                    # 现在会连栈一起进日志文件了（见 _ProcLogHandler），以前整条栈是丢的
+                    logger.exception('会话任务失败（kind=%s）| %s', kind, key[-24:])
         finally:
+            # 注意：finally 里**不能 return**，否则会把正在冒泡的异常吞掉（原来是这个写法）
             with self._lock:
-                if state.pending:
-                    # 若因异常退出但仍有积压任务，重新提交 worker，杜绝死锁卡死
-                    self._executor.submit(self._drain, key)
-                else:
+                remaining = len(state.pending)
+                if not remaining:
                     state.worker_active = False
+            if remaining:
+                # 还有积压：必须重新起一个 drain，否则这个会话就哑了
+                logger.warning('drain 退出时仍有 %d 条积压，重新排队 | %s',
+                               remaining, key[-24:])
+                self._kick(key)
+
+    # ---------- 诊断 ----------
+    def pending_snapshot(self) -> dict:
+        """给「歌伊状态」用：现在有多少条任务在排队、worker 标记是否还挂着。"""
+        with self._lock:
+            busy = {key: len(st.pending) for key, st in self._states.items() if st.pending}
+            workers = sum(1 for st in self._states.values() if st.worker_active)
+            executor_down = bool(getattr(self._executor, '_shutdown', False))
+            return {
+                'sessions': busy,
+                'total': sum(busy.values()),
+                'workers_active': workers,
+                'executor_down': executor_down,
+            }
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False)
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:  # noqa: BLE001 - 关闭失败不该影响插件卸载
+            pass

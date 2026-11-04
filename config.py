@@ -6,10 +6,13 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import logging
 import os
 import shutil
 import time
 from pathlib import Path
+
+logger = logging.getLogger('newGeYi.config')
 
 PLUGIN_NAME = 'newGeYi'
 NAMESPACE = 'newGeYi'
@@ -21,7 +24,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.6.5'
+PLUGIN_VERSION = '2.8.10'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -107,7 +110,7 @@ DEFAULT_CONFIG = {
     #      "model": "deepseek-flash", "api_key": "sk-...",
     #      "extra_body": {"thinking": {"type": "disabled"}}},
     #     {"name": "relay", "kinds": ["memory_curate"], "priority": 1,
-    #      "endpoint": "https://api.example.com/v1/chat/completions",
+    #      "endpoint": "https://api.ginka.cloud/v1/chat/completions",
     #      "model": "deepseek-v4.1-flash", "api_key": "sk-...",
     #      "extra_body": {"reasoning_effort": "low"}}
     #   ]
@@ -127,11 +130,27 @@ DEFAULT_CONFIG = {
         'notify_owner': True,            # 所有渠道都挂时私聊通知骰主
         'notify_cooldown_seconds': 600,  # 同类通知节流间隔，防刷屏
         'switch_history_limit': 50,      # 保留多少条切换历史
+        # 「轮次循环」：一轮走到底（最后一个渠道也挂了）就回到第一个再来一轮。
+        # 骰主 2026-11-01 的口径：「第五个挂了就重回第一个开始连接」。
+        # 2 轮 = 最坏情况每个渠道试两次；只有一个渠道时自动降为 1 轮（内部已重试过）。
+        'full_cycles': 2,
+        # 一次 chat() 的总时长预算（秒）：超过就不再换渠道兜圈。
+        # 以前没有这条：5 候选 × 2 轮 × 单渠道超时，最坏能到 8 分钟，
+        # 而调度器的看门狗是 300 秒——任务会先被当成「卡死」踢掉。
+        'total_timeout_seconds': 60,
+        # 轮满了还全挂 → 切到这个渠道并**锁定**（不再尝试其它渠道），
+        # 直到骰主「切换渠道 <名称>」手动切回。空字符串 = 不降级，只发通知。
+        'last_resort_provider': 'official-chat',
     },
     # 单渠道兼容模式用的模型名：只在 providers 为空时才会被用到。
     'fast_model': 'gemini-3.8-flash-medium',
     # 记忆提炼专用的模型名。留空则沿用 fast_model。
     'curate_model': '',
+    # 记忆提炼固定走哪个渠道（providers[].name）。留空 = 跟聊天用同一条。
+    # 提炼是后台机械活（抽事实、写摘要），不需要聊天主力那套理解力，却占了近一成
+    # 输入 token；指到最便宜的渠道能直接省下来，聊天本身不受影响。
+    # 那条渠道挂了照常按优先级往下兜底，不会因为省钱把提炼饿死。
+    'curate_provider': '',
     'fast_temperature': 0.7,
     # 输出上限。大幅放开 token 上限，给长文本和细腻 RP 留足空间。
     'fast_max_tokens': 8192,
@@ -141,6 +160,9 @@ DEFAULT_CONFIG = {
     # 留空 = 这些通知全部发不出去，只在日志里留一条 warning（2026-10 踩过：
     # 歌伊触发退场、骰主却一条私信都没收到）。也可以改用环境变量 GEYI_OWNER_IDS。
     'owner_ids': [],
+    # @全体成员 算不算「在叫她」：默认**不算**（那是在叫所有人，不是跟她说话）。
+    # 2026-11-03 之前它被当成 @她，于是群里发个公告她就抢着接话。
+    'mention_on_at_all': False,
     'ignore_sender_ids': [],
     'private_enabled': False,
     'passive_enabled': True,
@@ -153,6 +175,10 @@ DEFAULT_CONFIG = {
     # load_config 会把只写了旧键的老配置迁移成 memory_curator_enabled（见 _migrate_legacy_keys）。
     # ===== 自动记忆：批量提炼 =====
     'memory_curator_enabled': True,
+    # 私聊内容要不要进长期记忆：默认**不进**（隐私优先）。
+    # 以前 buffer_user 不分群聊私聊，私聊内容会被提炼进库、再作为"记忆"喂给模型，
+    # 而且关掉私聊之后旧缓冲还在（2026-11-03 审查发现）。
+    'memory_private_enabled': False,
     'memory_curate_messages': 40,
     'memory_curate_idle_seconds': 900,
     'memory_curate_max_messages': 40,
@@ -161,11 +187,19 @@ DEFAULT_CONFIG = {
     'memory_curate_tick_seconds': 60,
     # 提炼单次输出上限（硬顶，防止一次吐 3 万字把预算烧光）
     'memory_curate_max_tokens_cap': 8000,
-    # ===== 记忆注入条数（这些键以前只在代码里 .get() 兜底，没进默认值，
-    # 导致 missing_config_keys() 永远发现不了、用户也不知道能配）=====
-    'memory_inject_facts': 6,       # 每轮注入几条群友事实（L2）
-    'memory_inject_self': 3,        # 每轮注入几条她的自我记忆（L3）
-    'memory_inject_summaries': 2,   # 每轮注入几条群摘要（L1）
+    # ===== 记忆注入条数与容量扩展（v2.8 新渠道升级）=====
+    'memory_inject_facts': 12,      # 每轮注入几条群友事实（L2，由 6 扩至 12）
+    'memory_inject_self': 6,        # 每轮注入几条她的自我记忆（L3，由 3 扩至 6）
+    'memory_inject_summaries': 3,   # 每轮注入几条群摘要（L1，由 2 扩至 3）
+    'memory_max_chars': 3200,       # 记忆注入总字符上限（由硬编码 900 放宽至 3200）
+    'memory_relevance_enabled': True,   # 是否启用话题关键词重叠相关度召回
+    'memory_relevance_weight': 0.25,    # 话题相关度在打分中的权重（0~1）
+    'memory_temporal_anchor': True,     # 是否在记忆前标注相对时间（如 [3天前]、[昨天]）
+    'memory_cross_group_enabled': True, # 是否允许跨会话检索同一用户的全局偏好事实
+    'memory_impression_enabled': True,  # 是否启用群友印象总结卡片（高好感/常聊群友高维总结）
+    'memory_diversity_enabled': True,   # 是否启用检索召回 MMR 语义多样性去重过滤（防同类记忆霸屏）
+    'memory_diversity_threshold': 0.30, # 检索去重相似度阈值（超过此值视为同类话题，只保留最高分那条）
+    'memory_fuzzy_dedup_threshold': 0.60, # 写入端模糊判重阈值（超过此值视为重复事实，转为刷新已有条目）
     'time_awareness_enabled': True,
     # 记忆提炼里代表「她自己」的署名（也是「AI 说了什么」的行首标签）
     'assistant_name': '歌伊',
@@ -174,16 +208,27 @@ DEFAULT_CONFIG = {
     # ===== 图片理解（多模态大幅放宽）=====
     'image_enabled': True,
     'image_max_per_turn': 5,           # 每次最多附几张
-    # 单张上限 4 MB。注意：**首张即使超过总量预算也会保留**（见 images.plan_for）——
+    # 单张上限 4 MB。**超过会先降采样**（Pillow 压到 1568px 的 JPEG），压不下来才丢弃；
+    # 注意：首张即使超过总量预算也会保留（见 images.plan_for）——
     # 宁可多花点 token，也别让用户发一张大图就彻底看不到。
     'image_max_bytes': 4 * 1024 * 1024,
     # 单轮总量 7 MB：3 张 2 MB 的截图勉强收得下，再多就只留前几张。
     'image_total_max_bytes': 7 * 1024 * 1024,
     'image_download_timeout': 15,
+    # 下载硬上限与重定向上限：以前没有体积上限、也不拦内网地址，
+    # 一个异常/恶意链接就能吃满内存，或者借她的进程去访问本机服务（2026-11-03 审查发现）。
+    'image_download_max_bytes': 12 * 1024 * 1024,
+    'image_download_max_redirects': 3,
     'image_window_seconds': 0,
     'image_fresh_seconds': 120,
     'active_bare_image_factor': 0.3,
-    'image_cache_seconds': 300,
+    # 缓存 TTL 1800s：**必须 ≥ 消息窗口（group_live_window_seconds）**，
+    # 否则"看看刚才那张图"回溯到 10 分钟前时缓存已经过期，而 QQ 图链早死了。
+    'image_cache_seconds': 1800,
+    # 内存里 data URL 的总字节上限（一张 ≤4MB，不设顶会把内存吃掉）
+    'image_cache_max_bytes': 64 * 1024 * 1024,
+    # 「取不到」的负缓存：QQ 图链过期是常态，10 分钟内同一个 ref 不再重试
+    'image_fail_cache_seconds': 600,
     'emote_enabled': True,
     'collapse_short_multiline': False,  # 默认关闭（由 config.json 开起）；单元测试依赖默认换行行为
     'strip_repeated_ellipsis': True,
@@ -195,11 +240,17 @@ DEFAULT_CONFIG = {
     'voice_enabled': True,
     'voice_gateway_url': 'http://127.0.0.1:9885/v1/voice/synthesize',
     'voice_health_url': 'http://127.0.0.1:9885/health',
+    # 本机 TTS 网关的共享口令：**默认留空**，别在源码里写死。
+    # 2026-11-03：以前这里写死了一个共享口令，而且 code 里还硬编码了
+    # 本机 OneBot HTTP 的 access_token —— 打包成 OPK 就等于把凭据一起发出去。
     'voice_auth_token': '',
     'voice_timeout': 10.0,
     'voice_group_cooldown': 45,       # 单群语音常规冷却秒数（防刷屏）
     'voice_poke_rate': 0.25,          # 戳一戳触发语音的概率（与表情包联动）
     'voice_speed': 1.0,
+    # 语音气泡直发用的本地 OneBot HTTP 地址（含 access_token 就写在这里，别写进代码）
+    'voice_onebot_http_url': '',
+    'voice_onebot_access_token': '',
     # ===== 自我保护静默 =====
     # 模型遇到谩骂/过当调戏/针对角色人格的侮辱/被连续纠缠时，可以输出 [REST:原因]
     # 让**当前会话**安静一段时间，并私聊通知骰主。到期自动恢复。
@@ -222,20 +273,65 @@ DEFAULT_CONFIG = {
     'global_concurrency': 4,
     # ── 主动搭话（大幅放宽频率与取消安静时段）────────────────────────────
     'active_shadow': True,                     # 影子模式默认开（防止新安装未调优时乱说话；实机由 config.json 覆盖为 False）
-    'active_base_cooldown': 180,               # 基础冷却 3 分钟
-    'active_daily_cap': 60,                    # 每群每天主动发言上限大幅放宽
+    'active_base_cooldown': 15,                # 基础最小间隔（闭环前是 180s，那是"绝对节奏"的病根）
+    'active_daily_cap': 320,                   # 每群每天上限（3/百条 × 9100 条/天 ≈ 273，150 会顶住）
     'active_quiet_hours': '',                  # 全天候陪伴，取消安静时段
     'active_min_self_gap': 45,
     'active_self_window': 1800,
+    'active_self_factor_cap': 2.0,             # 她发言频率系数上限（以前最高 4 倍 = 12 分钟不能说）
     'active_tier_probability': {'2': 0.60, '3': 0.30},
     'active_tier2_seconds': 180,
     'active_escalation_max': 8,
     'active_escalation_cap': 0.98,
     'active_no_response_window': 600,
+    # ── 主动搭话欠账调度（v2.8.9）：目标句/百条，靠「欠账 + 逐级升级」落地 ──
+    # 机制：每条群消息欠账 += λ，开口一次 -= 1；λ = 目标/100 ÷ 兑现率 conv。
+    #      一个周期最多试 3 档提示词（L0 严格 / L1 中性 / L2 软化），被拒就升一级。
+    # 为什么不再用 v2.8.7 的 `required = (100/target) × accept`：accept 是**模型服从度**，
+    # 同一段代码实测 9%~79%，于是「3 句/百条」变成「13.7 次调用/百条、0.75 句/百条」。
+    # 现在的 conv 是「一个周期兑现率」（0.6~0.95），补偿量温和、收敛快。
+    # 详见 routing/attention.py「欠账调度 + 暴击升级」与交接文档 §27。
+    'active_rate_target_per_100': 3.0,         # 目标落地句数（0 = 不限，只走间隔护栏）
+    'active_rate_min_gap': 15,                 # 同一群两个周期的最小间隔（秒）
+    'active_rate_max_attempts_10min': 40,      # 成本护栏（防跑飞用，**不负责节奏**）：正常群碰不到它
+    'active_deficit_cap': 1.0,                 # 欠账不排队：攒够就花，攒不出去的直接作废
+    'active_burst_max_attempts': 3,            # 一个周期最多调几次模型（1~3 = 只到 L0/L1/L2）
+    'active_escalate_enabled': True,           # 关掉就退回「一次调用定生死」（L0 only）
+    'active_prd_crit_rate': 0.25,              # 暴击名义概率：平均每 4 个失败周期被强推一次
+    'active_prd_strong_at': 4,                 # 干旱到这个周期数，暴击直接起手 L2
+    'active_burst_max_seconds': 12,            # 一轮升级的时长预算（超时收手：别让 @她 的人干等）
+    'active_level_min_samples': 60,            # 某档攒够多少次才敢判它没用（样本少了必误杀）
+    'active_level_min_accept': 0.05,           # 连「上界」都低于它 → 砍掉该档（约 20 次调用换 1 句）
+    'active_level_init_accept': 0.50,          # 档位接受率先验（没样本时）
+    'active_level_alpha': 0.25,                # 档位接受率 EWMA 系数（仅展示，判定用上界）
+    'active_conv_init': 0.15,                  # 周期兑现率初值：**宁可低估**（低估=多试几次，收敛快）
+    'active_conv_min': 0.08,                   # 下限：兑现率再差也要能补偿回来，成本靠 10 分钟上限挡
+    'active_conv_max': 1.0,
+    'active_conv_prior': 1.0,                  # 先验权重（个「假周期」）：只要兜住冷启动，给大了会一直把兑现率拖低
+    'active_conv_window': 40,                  # 计数窗口：满 40 个周期就减半遗忘
+    # 外环：每 N 条消息结算一次「实际产出/目标」，修正所有与模型无关的损耗
+    # （最小间隔、10 分钟上限、打分地板、日上限）。没有它，回放里 9% 的模型只能落地
+    # 1.38 句/百条而不是 3.0——差额全被护栏吃掉了。
+    'active_update_messages': 100,             # 结算窗口（条消息）
+    'active_rate_gain_min': 0.25,              # 修正系数下限
+    'active_rate_gain_max': 4.0,               # 上限
+    'active_gain_expo': 0.6,                   # 修正强度（1.0 = 一步到位，容易震荡）
+    'active_gain_step': 1.6,                   # 窗口内一句都没说成时的加速倍率
+    'active_gain_deadband': 0.08,               # 死区：偏 8% 以内不修（太宽会停在区间边缘）
     # 注意：曾经有个 `active_stop_strikes`（=10），但没有任何代码读它——
     # 真正的退避档位在 attention._apply_backoff 里（连冷 3/4/5/6 次 → 30min/1h/2h/4h）。
     # 键已删除：一个"看起来能调、实际没接上"的开关比没有更糟。
     'active_log_interval': 300,
+    # ── 主动搭话打分闸门（v2.8）：8 维逻辑回归，纯算术，不发模型请求 ──
+    # v2.8.7 起打分只当「噪声地板」：不再是配额（配额交给闭环），
+    # `gate_quantile_keep=1.0` 表示不按分位砍（砍了闭环会为凑产量把尝试数翻倍，钱白花）。
+    'gate_scorer_enabled': True,
+    'gate_min_score': 0.05,                    # 绝对地板：低于它就当噪声，零成本挡掉
+    'gate_quantile_keep': 1.0,                 # 0~1 保留比例；<1 时按每群滑窗分位再砍一刀
+    'gate_score_window': 80,                   # 每群分数滑窗长度
+    'gate_replies_per_hour': 6,                # 老口径，仅用于 gate_summary 参考显示
+    'gate_batches_per_hour': 60,
+    'gate_weights': {},
     'daily_call_budget': 999999,               # 日调用预算完全放开
     'daily_output_token_budget': 99999999,     # 日输出 token 完全放开
     # ===== 按群人数算额度 =====
@@ -489,9 +585,55 @@ def _migrate_legacy_keys(loaded: dict, merged: dict) -> dict:
     return merged
 
 
+class ConfigWriteBlocked(RuntimeError):
+    """配置文件不可写（磁盘上那份解析不了 / 之前解析失败过）。
+
+    为什么要有这个：`load_config` 以前遇到 JSON 语法错误会**静默返回默认值**，
+    用户发「重载设定」还会看到「✅ 已重载」，接着任何开关命令都把默认配置写回磁盘——
+    渠道和 API Key 一次全丢。现在宁可报错，也绝不覆盖一份看不懂的文件。
+    """
+
+
+# {error: 最近一次 load_config 的解析错误（空串 = 正常）, quarantined: 已存过副本的文件路径}
+_CONFIG_STATE: dict = {'error': '', 'quarantined': set()}
+
+
+def config_load_error() -> str:
+    """上一次 load_config 是否解析失败（空串表示正常）。命令层据此不要说「✅」。"""
+    return str(_CONFIG_STATE.get('error') or '')
+
+
+def _quarantine_config(path: Path, reason: str) -> None:
+    """把解析失败的文件复制成 `.broken-<时间戳>`，原文件一个字节都不动。
+
+    同一个文件每个进程只存一份：配置坏着的时候每次「重载设定」都会重新解析一遍，
+    不然一天下来能攒出几十份同样内容的副本。
+    """
+    try:
+        key = str(path.resolve())
+    except OSError:
+        key = str(path)
+    done = _CONFIG_STATE.setdefault('quarantined', set())
+    if key in done:
+        logger.error('配置文件解析失败（%s），本次按默认值运行，**不会覆盖磁盘上的配置**', reason)
+        return
+    try:
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        backup = path.with_name('%s.broken-%s' % (path.name, stamp))
+        shutil.copy2(str(path), str(backup))
+        done.add(key)
+        logger.error('配置文件解析失败（%s），原文件已复制到 %s，本次按默认值运行，'
+                     '**不会覆盖磁盘上的配置**。改好 JSON 再「重载设定」。',
+                     reason, backup.name)
+    except OSError:
+        logger.error('配置文件解析失败（%s），且复制备份也失败了；本次按默认值运行，'
+                     '不会覆盖磁盘上的配置', reason)
+
+
 def load_config() -> dict:
     path = get_config_path()
     value = copy.deepcopy(DEFAULT_CONFIG)
+    _CONFIG_STATE['error'] = ''
     if not path.exists():
         # 兼容旧版：配置曾经写在插件目录里（BASE_DIR/config.json）。
         # 数据目录里找不到配置时把它迁移过来——否则会出现
@@ -505,19 +647,52 @@ def load_config() -> dict:
                     value = _migrate_legacy_keys(loaded, _deep_merge(value, loaded))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 pass
-        save_config(value)
+        save_config(value, force=True)
         return value
     try:
-        loaded = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(loaded, dict):
-            value = _migrate_legacy_keys(loaded, _deep_merge(value, loaded))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        raw = path.read_text(encoding='utf-8')
+    except (OSError, UnicodeError) as exc:
+        _CONFIG_STATE['error'] = '%s: %s' % (path.name, exc)
+        logger.error('配置文件读不出来（%s），本次按默认值运行', _CONFIG_STATE['error'])
         return value
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        reason = '%s 第 %d 行第 %d 列：%s' % (path.name, exc.lineno, exc.colno, exc.msg)
+        _CONFIG_STATE['error'] = reason
+        _quarantine_config(path, reason)
+        return value
+    if not isinstance(loaded, dict):
+        _CONFIG_STATE['error'] = '%s: 顶层不是 JSON 对象' % path.name
+        logger.error('%s，本次按默认值运行', _CONFIG_STATE['error'])
+        return value
+    value = _migrate_legacy_keys(loaded, _deep_merge(value, loaded))
     return value
 
 
-def save_config(value: dict) -> None:
+def save_config(value: dict, force: bool = False) -> None:
+    """原子写入配置。
+
+    - 磁盘上那份**解析不了**时拒绝覆盖（抛 `ConfigWriteBlocked`），除非 `force=True`；
+    - 写入前留一份滚动备份 `config.json.bak-auto`（只留最近一份，避免越堆越多带走密钥）。
+    """
     path = get_config_path()
+    if _CONFIG_STATE.get('error') and not force:
+        raise ConfigWriteBlocked(
+            '配置文件上次解析失败（%s），为避免覆盖你的手改内容，这次没有写盘。'
+            '改好 JSON 再发「重载设定」。' % _CONFIG_STATE['error'])
+    if path.exists():
+        try:
+            json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            if not force:
+                raise ConfigWriteBlocked(
+                    '磁盘上的 config.json 现在解析不了（%s），拒绝覆盖。'
+                    '改好 JSON 再试。' % exc.__class__.__name__)
+        try:
+            shutil.copy2(str(path), str(path.with_name(path.name + '.bak-auto')))
+        except OSError:
+            logger.warning('配置滚动备份失败（不影响本次写入）')
     temp = path.with_suffix('.tmp')
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
     os.replace(temp, path)
