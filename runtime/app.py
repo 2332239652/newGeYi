@@ -31,6 +31,8 @@ from ..memory.worldbook import WorldbookService
 from ..models import IncomingMessage, ModelRequest, SessionKey
 from ..presentation.renderer import Renderer, is_silent_reply, op_codes_to_plain
 from ..providers.llm_gateway import LLMGateway
+from ..relationship.service import RelationshipService
+from ..relationship.stages import audit_overstep
 from ..routing.attention import AttentionGate
 from ..routing.commands import CommandRouter
 from ..routing.message_router import MessageRouter
@@ -38,7 +40,9 @@ from ..routing.permissions import Permissions
 from ..storage.database import SQLiteStore
 from ..voice.manager import VoiceManager
 from .rest import RestGuard
+from .private_gate import PrivateGate
 from .scheduler import SessionScheduler
+from .sleep import SleepWindow
 
 logger = logging.getLogger('newGeYi')
 
@@ -125,11 +129,21 @@ class Runtime:
         self.voice_manager = VoiceManager(self.config)
         # 自我保护静默：模型可以用 [REST:原因] 让某个群安静一段时间
         self.rest = RestGuard(self.store, self.config)
+        # 私聊闸门：触发词 / 防连发 / 每日限额（并发保护，见 runtime/private_gate.py）
+        self.private_gate = PrivateGate(self.store, self.config)
+        # 作息：睡前提醒 + 睡着时缄默（见 runtime/sleep.py）
+        self.sleep = SleepWindow(self.store, self.config)
         self.prompt_builder = PromptBuilder(
             self.config, self.store, self.memory, self.worldbook,
             self.live_context, self.images, self.renderer,
         )
         self.prompt_builder.voice_manager = self.voice_manager
+        self.prompt_builder.sleep_window = self.sleep
+        # 私聊 galgame：好感度 / 关系阶段（总开关 galgame_enabled，默认关）
+        self.relationship = RelationshipService(
+            self.config, self.store, self.gateway, self.worldbook, self.permissions)
+        self.prompt_builder.relationship = self.relationship
+        self.curator.relationship = self.relationship
         self.prompt_builder.set_role_prompt(self.load_role_prompt())
         self.commands = CommandRouter(self)
         self.router = MessageRouter(self)
@@ -154,7 +168,7 @@ class Runtime:
     # 而 attention / permissions / curator 等组件怀里抱的还是启动时那份字典
     # —— 于是命令回「✅」、行为却不变（第二次开关尤其明显）。见交接文档 §28。
     _CFG_HOLDERS = ('prompt_builder', 'gateway', 'renderer', 'curator', 'images',
-                    'attention', 'permissions', 'group_profile', 'rest', 'memory')
+                    'attention', 'permissions', 'group_profile', 'rest', 'memory', 'relationship')
 
     def apply_config(self) -> dict:
         """把当前 self.config 推给所有缓存了配置的组件。"""
@@ -274,6 +288,10 @@ class Runtime:
         except Exception:  # noqa: BLE001
             pass
         try:
+            self.relationship.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.gateway.stop_probe()
         except Exception:  # noqa: BLE001
             pass
@@ -362,6 +380,28 @@ class Runtime:
                 logger.exception('私聊通知骰主 %s 失败', owner_id)
         return sent
 
+    # ==================== 作息（休眠）====================
+    def send_sleep_notice(self, msg: IncomingMessage) -> None:
+        """睡着时被叫醒的那一句。
+
+        **不调模型**：一句话的成本没必要花，而且半夜的模型输出不可控。
+        走 `_track_self_sent` 补上账本（她说过什么 / turns / 旁观窗口），
+        否则醒来会一脸茫然地"不记得自己回过"。
+        """
+        try:
+            text = self.sleep.notice_text()
+        except Exception:  # noqa: BLE001 - 配置脏了也要能回一句
+            logger.exception('读取休眠提示文案失败')
+            text = '（迷迷糊糊翻了个身）唔……已经睡下了……明天再说嘛……'
+        # 这句不走 process_job，所以私聊的用户轮要在这里补记：
+        # 否则历史里会出现一条「她回了句睡下了」但前面没有对应提问的孤儿助手轮。
+        self._remember_user_turn(msg)
+        self.reply(msg, text)
+        try:
+            self._track_self_sent(msg.session, text, msg.is_group)
+        except Exception:  # noqa: BLE001 - 记账失败不影响已经发出去的那句话
+            logger.debug('休眠提示写入账本失败', exc_info=True)
+
     # ==================== 自我保护静默 ====================
     def is_resting(self, session_key: str) -> bool:
         """这个会话是不是正处于歌伊的自我保护静默期。"""
@@ -382,25 +422,39 @@ class Runtime:
         return f'群 {session_key.split(":")[-1]}'
 
     def _enter_rest(self, msg: IncomingMessage, reason: str) -> None:
-        """进入静默并通知骰主。任何异常都不能影响她已经决定的那句话。"""
+        """进入静默并通知骰主。任何异常都不能影响她已经决定的那句话。
+
+        私聊 → **无限期**（2026-11-04 起，`rest_private_forever`）：一对一的
+        骚扰是"同一个人一直追着说"，等她 10 分钟后自动回来，同一套话术会立刻
+        再来一遍；所以私聊的退场只能由骰主发「解除静默」放出来。群里是公共
+        场合，照旧 N 分钟后自动恢复。
+        """
         try:
+            session_key = msg.session.as_text()
+            forever = bool(self.rest.private_forever) and not msg.is_group
             until = self.rest.start(
-                msg.session.as_text(), reason=reason, by=msg.sender_name,
+                session_key, reason=reason, by=msg.sender_name, forever=forever,
             )
-            where = '私聊' if not msg.is_group else self._group_label(msg.session.as_text())
+            where = '私聊' if not msg.is_group else self._group_label(session_key)
             logger.warning(
-                '自我保护静默 %.0f 分钟 | 会话=%s | 触发者=%s(%s) | 原因=%s | 原话=%r',
-                self.rest.minutes, msg.session.as_text()[-14:], msg.sender_name,
+                '自我保护静默 %s | 会话=%s | 触发者=%s(%s) | 原因=%s | 原话=%r',
+                '无限期（私聊）' if forever else '%.0f 分钟' % self.rest.minutes,
+                session_key[-14:], msg.sender_name,
                 msg.sender_id, reason or '未说明', (msg.text or '')[:80],
             )
             if self.rest.enabled:
+                if forever:
+                    tail = '无限期静默（私聊），需在该会话发「解除静默」才会恢复'
+                else:
+                    tail = (f'{time.strftime("%H:%M", time.localtime(until))} 自动恢复｜'
+                            f'可在该会话发「解除静默」提前结束')
                 ok = self._notify_owner(
-                    f'🛑 歌伊自我保护：{where} 已静默 {int(self.rest.minutes)} 分钟\n'
+                    f'🛑 歌伊自我保护：{where} 已静默'
+                    f'{"（无限期）" if forever else " %d 分钟" % int(self.rest.minutes)}\n'
                     f'原因：{reason or "未说明"}\n'
                     f'触发者：{msg.sender_name}（{msg.sender_id}）\n'
                     f'原话：{(msg.text or "")[:120]}\n'
-                    f'{time.strftime("%H:%M", time.localtime(until))} 自动恢复｜'
-                    f'可在该会话发「解除静默」提前结束'
+                    f'{tail}'
                 )
                 if not ok:
                     logger.warning('静默已生效，但没通知到骰主（原因见上一条日志）')
@@ -408,8 +462,16 @@ class Runtime:
             logger.exception('进入自我保护静默失败')
 
     def load_role_prompt(self) -> str:
+        """角色设定：**先读状态目录里的网页覆盖**，没有再读包内出厂文件。
+
+        为什么覆盖放 state 而不是写回 `data/role_prompt.txt`：插件包在升级/重载时会被
+        整体替换，包内文件也可能只读；而 state 目录是线上数据的家，重载后应该继续生效。
+        （网页编辑器写的就是 `role_prompt.webui.txt`，见 panel.py。）
+        """
         try:
-            return plugin_config.get_resource_path('role_prompt.txt').read_text(encoding='utf-8').strip()
+            override = plugin_config.get_state_dir() / 'role_prompt.webui.txt'
+            path = override if override.is_file() else plugin_config.get_resource_path('role_prompt.txt')
+            return path.read_text(encoding='utf-8').strip()
         except (OSError, UnicodeError):
             return '你是歌伊，一个可爱的AI助手。'
 
@@ -446,7 +508,16 @@ class Runtime:
             sender_id = str(getattr(event.data, 'user_id', '') or '-')
             sender_name = str(sender.get('name', '') or '用户')
             session = self._session_key(event, is_group)
-            plain = op_codes_to_plain(raw)
+            # @码 → @名字：少数协议端不带 name=，这时至少把「@她自己」说成 @你，
+            # 别让模型看到一串数字（2026-11-04：她学会了写【@2309394954】）。
+            try:
+                self_id = str((getattr(event, 'base_info', None) or {}).get('self_id', '') or '')
+            except Exception:  # noqa: BLE001 - base_info 结构变了就当没有
+                self_id = ''
+            at_names = {sender_id: sender_name}
+            if self_id:
+                at_names.setdefault(self_id, '你')
+            plain = op_codes_to_plain(raw, names=at_names)
             msg = IncomingMessage(
                 session=session,
                 message_id=str(getattr(event.data, 'message_id', '') or ''),
@@ -480,13 +551,11 @@ class Runtime:
             logger.exception('handle_message failed')
 
     def _memory_tracking_on(self, msg: IncomingMessage) -> bool:
-        """这条消息该不该进记忆缓冲。"""
+        """这条消息该不该进记忆缓冲。私聊与群聊均独立缓冲和提炼。"""
         cfg = self.config
         if not cfg.get('memory_enabled', True):
             return False
         if not cfg.get('memory_curator_enabled', True):
-            return False
-        if not msg.is_group and not cfg.get('memory_private_enabled', False):
             return False
         return True
 
@@ -668,6 +737,42 @@ class Runtime:
         except Exception:  # noqa: BLE001 - 记账失败不该挡住回复
             logger.exception('记录私聊用户轮失败')
 
+    def _retry_if_overstep(self, msg: IncomingMessage, kind: str, cfg: dict, rendered, result):
+        """回复比当前关系阶段亲密得多 → 带"重写要求"再问一次。
+
+        返回 (result, text, rendered) 表示换用重写后的版本；None 表示保持原回复
+        （没越界 / 重写也失败 / 重写后仍越界——这种情况只记日志，不拦截，
+        拦了就是"她不回话"，比多说一句亲昵的话更糟）。
+        """
+        try:
+            if not self.relationship.active_for(msg):
+                return None
+            stage = self.relationship.stage_for(msg)
+            if stage is None:
+                return None
+            hit = audit_overstep(op_codes_to_plain(rendered.text), stage)
+            if not hit:
+                return None
+            session = msg.session.as_text()
+            logger.warning('私聊回复越界（阶段 %s，命中「%s」），要求重写 | %s', stage, hit, session[-16:])
+            self.prompt_builder.overstep_hint[session] = hit
+            try:
+                result2, text2 = self._ask(msg, kind, 0, cfg)
+            finally:
+                self.prompt_builder.overstep_hint.pop(session, None)
+            if result2 is None or not result2.ok or not (text2 or '').strip() or is_silent_reply(text2):
+                return None
+            rendered2 = self.renderer.render(text2, msg)
+            if rendered2 is None or not rendered2.text:
+                return None
+            if audit_overstep(op_codes_to_plain(rendered2.text), stage):
+                logger.warning('重写后仍然越界，保留原回复 | %s', session[-16:])
+                return None
+            return result2, text2, rendered2
+        except Exception:  # noqa: BLE001
+            logger.exception('越界重写失败，保留原回复')
+            return None
+
     def process_job(self, msg: IncomingMessage, kind: str) -> None:
         cfg = self.config
         # 命令重载后组件重新读取最新配置
@@ -730,6 +835,11 @@ class Runtime:
             logger.warning('渲染层判定整条不发（审计命中或正文被清空）| %s | %r',
                            msg.session.as_text()[-16:], (text or '')[:80])
             return
+        # 私聊关系越界审计：阶段不够却说了过分亲密的话 → 让她按阶段重写一次（最多一次）
+        if not msg.is_group and not is_active and rendered.text:
+            retried = self._retry_if_overstep(msg, kind, cfg, rendered, result)
+            if retried is not None:
+                result, text, rendered = retried
         # 自我保护：模型判断这个群已经待不下去（谩骂/过当调戏/纠缠等）→ 静默 + 通知骰主。
         # 放在发送之前：即使下面发送失败，静默也必须生效。
         if rendered.rest_reason:
@@ -744,7 +854,9 @@ class Runtime:
         if is_active:
             row_id = self.attention.record_model(
                 msg.session.as_text(), 'speak',
-                detail=op_codes_to_plain(rendered.text), latency_ms=result.latency_ms,
+                detail=op_codes_to_plain(rendered.text,
+                                         names={msg.sender_id: msg.sender_name}),
+                latency_ms=result.latency_ms,
                 level=spoken_level,
             )
             if self.config.get('active_shadow', True):
@@ -790,7 +902,7 @@ class Runtime:
         else:
             self.voice_manager.mark_turn_without_voice(msg.session.as_text())
 
-        plain_reply = op_codes_to_plain(rendered.text)
+        plain_reply = op_codes_to_plain(rendered.text, names={msg.sender_id: msg.sender_name})
         content_to_record = plain_reply + voice_annotation
 
         # 状态提交：用户轮 + 回复轮（回复以纯文本入库，避免 OP 码污染上下文；附带语音事实）
@@ -803,6 +915,12 @@ class Runtime:
             model=result.model, in_tokens=result.input_tokens, out_tokens=result.output_tokens,
         )
         self.reply(msg, rendered.text)
+        # 私聊 galgame：回复发出后异步评审（不增加回复延迟，结果影响下一轮）
+        if not msg.is_group:
+            try:
+                self.relationship.after_reply(msg, plain_reply)
+            except Exception:  # noqa: BLE001 - 评审再出事也不能影响聊天
+                logger.exception('触发关系评审失败')
         # 遥测上报：记录一条已发出的文本回复（无论是否配音），点亮控制台触发率
         if hasattr(self, 'voice_manager'):
             try:
@@ -834,7 +952,11 @@ class Runtime:
         self.prompt_builder.mark_talked(msg.session.as_text())
         # 歌伊自己的话也进缓冲：提炼器必须能区分「谁说的」，
         # 否则会把 AI 说的话记成某个用户的事实（调研里的最高危污染）。
-        self.curator.buffer_assistant(msg.session.as_text(), op_codes_to_plain(rendered.text))
+        # ⚠️ 必须和用户消息用**同一个门**：私聊开关关掉 / 记忆关掉时，这里要是照写，
+        # 那个会话就只剩「她自己的话」的缓冲，而 should_run 又永远不会去提炼它
+        # → 越攒越多且没人清（2026-11-04 复查发现）。
+        if self._memory_tracking_on(msg):
+            self.curator.buffer_assistant(msg.session.as_text(), op_codes_to_plain(rendered.text))
         if msg.is_group:
             self.live_context.append_assistant(
                 msg.session.as_text(), msg.arrival_seq, content_to_record

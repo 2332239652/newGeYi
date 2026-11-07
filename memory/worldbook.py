@@ -13,6 +13,14 @@
 - enabled：false 的条目直接忽略。
 - max_chars：可选，本条目的字数上限；不填用调用方的默认值。
 - always：true 表示**常驻**——不看关键词，每次都注入（见下）。
+- min_stage / max_stage：关系阶段门槛（0~5，见 relationship/stages.py）。私聊 galgame 系统里，
+  深层设定（身世、心事）写 min_stage，低阶段**根本不进 prompt**——她说不出来，也套不出来；
+  max_stage 用来写"对不熟的人只含糊地说"的版本。缺省 = 不设限。
+  没有关系系统（群聊 / 功能关闭）时按阶段 0 处理：min_stage>0 的条目不会出现。
+- scope：private / group / both（默认）。私人设定只在私聊注入。
+- topic：true 表示这是一条"主动谈资"（今天发生的小事），不参与检索，
+  由 RelationshipService 每天抽一条放进私聊 prompt。
+- id：可选，条目的稳定标识（谈资去重用）；不填则用内容哈希。
 
 关于 always（2026-09 新增）：
 纯关键词检索有个绕不过去的短板——**没命中时模型不是"不知道细节"，
@@ -29,6 +37,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -88,14 +97,29 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-class _Entry:
-    __slots__ = ('keywords', 'content', 'max_chars', 'always', 'term_freq', 'length')
+def _stage_or_none(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(5, parsed))
 
-    def __init__(self, keywords, content, max_chars, always):
+
+class _Entry:
+    __slots__ = ('keywords', 'content', 'max_chars', 'always', 'term_freq', 'length',
+                 'id', 'min_stage', 'max_stage', 'scope', 'topic')
+
+    def __init__(self, keywords, content, max_chars, always,
+                 entry_id='', min_stage=None, max_stage=None, scope='both', topic=False):
         self.keywords = keywords
         self.content = content
         self.max_chars = max_chars
         self.always = always
+        self.id = entry_id or hashlib.md5(content.encode('utf-8')).hexdigest()[:10]
+        self.min_stage = min_stage
+        self.max_stage = max_stage
+        self.scope = scope if scope in ('private', 'group') else 'both'
+        self.topic = bool(topic)
         # 文档 = 关键词 + 正文。关键词也算进词频，但命中另有显式加成。
         tokens = tokenize(' '.join(keywords) + ' ' + content)
         freq: dict[str, int] = {}
@@ -116,6 +140,18 @@ class WorldbookService:
         self._default_idf = 1.0
         self.load()
 
+    @staticmethod
+    def _visible(entry: '_Entry', stage: int | None, scope: str) -> bool:
+        """这个条目在给定阶段/场景下能不能出现（逻辑见模块说明）。"""
+        eff = 0 if stage is None else int(stage)
+        if entry.scope != 'both' and scope in ('private', 'group') and entry.scope != scope:
+            return False
+        if entry.min_stage is not None and eff < entry.min_stage:
+            return False
+        if entry.max_stage is not None and eff > entry.max_stage:
+            return False
+        return True
+
     def load(self) -> None:
         entries: list[_Entry] = []
         raw_entries: list[dict] = []
@@ -134,19 +170,30 @@ class WorldbookService:
                         content = str(item.get('content', '')).strip()
                         always = bool(item.get('always'))
                         # 常驻条目允许没有 keywords
-                        if (keywords or always) and content:
+                        if (keywords or always or item.get('topic')) and content:
                             clean_keywords = [
                                 str(k).strip().lower() for k in keywords if str(k).strip()
                             ]
-                            entries.append(_Entry(
+                            entry = _Entry(
                                 clean_keywords, content,
                                 _positive_int(item.get('max_chars')), always,
-                            ))
+                                entry_id=str(item.get('id') or '').strip(),
+                                min_stage=_stage_or_none(item.get('min_stage')),
+                                max_stage=_stage_or_none(item.get('max_stage')),
+                                scope=str(item.get('scope') or 'both').strip().lower(),
+                                topic=bool(item.get('topic')),
+                            )
+                            entries.append(entry)
                             raw_entries.append({
+                                'id': entry.id,
                                 'keywords': clean_keywords,
                                 'content': content,
                                 'max_chars': _positive_int(item.get('max_chars')),
                                 'always': always,
+                                'min_stage': entry.min_stage,
+                                'max_stage': entry.max_stage,
+                                'scope': entry.scope,
+                                'topic': entry.topic,
                             })
         except (OSError, UnicodeError, json.JSONDecodeError):
             entries, raw_entries = [], []
@@ -207,13 +254,16 @@ class WorldbookService:
         hit_mass = sum(self._idf.get(token, self._default_idf) for token in matched)
         return len(matched), hit_mass / total
 
-    def always_entries(self, max_chars_per_entry: int = DEFAULT_MAX_CHARS_PER_ENTRY) -> list[str]:
+    def always_entries(self, max_chars_per_entry: int = DEFAULT_MAX_CHARS_PER_ENTRY,
+                       stage: int | None = None, scope: str = 'both') -> list[str]:
         """常驻条目的正文（不看关键词，每次注入）。"""
         with self._lock:
             docs = list(self._docs)
         out = []
         for entry in docs:
-            if not entry.always:
+            if not entry.always or entry.topic:
+                continue
+            if not self._visible(entry, stage, scope):
                 continue
             limit = entry.max_chars or max_chars_per_entry
             content = entry.content
@@ -222,9 +272,17 @@ class WorldbookService:
             out.append(content)
         return out
 
+    def topics(self, stage: int | None = None, scope: str = 'private') -> list[dict]:
+        """主动谈资池：返回当前阶段/场景可用的 [{id, content}]。"""
+        with self._lock:
+            docs = list(self._docs)
+        return [{'id': e.id, 'content': e.content} for e in docs
+                if e.topic and self._visible(e, stage, scope)]
+
     def lookup(self, text: str, recent: list[str] | None = None,
                max_entries: int = 3,
-               max_chars_per_entry: int = DEFAULT_MAX_CHARS_PER_ENTRY) -> list[str]:
+               max_chars_per_entry: int = DEFAULT_MAX_CHARS_PER_ENTRY,
+               stage: int | None = None, scope: str = 'both') -> list[str]:
         """返回和消息相关的世界书内容；都不相关时返回空列表（零成本）。
 
         recent 是最近几条消息（可选）：群聊里「那她后来呢？」这种追问本身不含关键词，
@@ -249,8 +307,10 @@ class WorldbookService:
         lowered = current.lower()
         scored: list[tuple[float, int, _Entry]] = []
         for index, entry in enumerate(docs):
-            if entry.always:
-                continue          # 常驻条目走 always_entries，不参与检索
+            if entry.always or entry.topic:
+                continue          # 常驻条目走 always_entries，谈资走 topics，都不参与检索
+            if not self._visible(entry, stage, scope):
+                continue          # 阶段/场景不符：根本不进候选（深层设定的保密靠这里）
             hit = any(kw in lowered for kw in entry.keywords if kw)
             score = self._bm25(query_tokens, entry)
             if hit:

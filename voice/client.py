@@ -58,6 +58,55 @@ def _interleave_pcm16(channels: list[list[int]]) -> bytes:
     return struct.pack(f'<{len(merged)}h', *merged)
 
 
+def _read_wav(data: bytes) -> tuple:
+    """解析 RIFF/WAVE（PCM）→ (声道数, 采样宽度, 采样率, PCM 帧字节)。
+
+    为什么不用标准库 `wave`：OlivOS 是打包运行的，它的运行时 **没有** `wave`
+    模块（2026-11-04 实测：16 小时内 41 条 `No module named 'wave'`，也就是说
+    每一条语音都走了"原文件直接发"的降级分支 —— 没重采样、没裁头静音，
+    QQ 端就是"前面空 0.6 秒"甚至不发声）。这里只解 fmt/data 两个块，
+    没有任何依赖，也和 3.13 之后删 `audioop` 的路线无关。
+    """
+    import struct
+
+    if len(data) < 12 or data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+        raise ValueError('不是 RIFF/WAVE 数据')
+    pos = 12
+    fmt = None
+    frames = b''
+    while pos + 8 <= len(data):
+        chunk_id = data[pos:pos + 4]
+        size = struct.unpack('<I', data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if chunk_id == b'fmt ' and len(body) >= 16:
+            audio_format, nchannels, rate, _brate, _align, bits = struct.unpack(
+                '<HHIIHH', body[:16])
+            if audio_format not in (1, 0xFFFE):     # 1=PCM, 0xFFFE=WAVE_FORMAT_EXTENSIBLE
+                raise ValueError('不是 PCM 音频（format=%d）' % audio_format)
+            fmt = (int(nchannels), max(1, int(bits) // 8), int(rate))
+        elif chunk_id == b'data':
+            frames = body
+        pos += 8 + size + (size & 1)                # 块长度按 2 字节对齐
+    if fmt is None or not frames:
+        raise ValueError('缺少 fmt / data 块')
+    nchannels, sampwidth, framerate = fmt
+    if nchannels <= 0 or framerate <= 0:
+        raise ValueError('WAV 头非法（channels=%d, rate=%d）' % (nchannels, framerate))
+    return nchannels, sampwidth, framerate, frames
+
+
+def _write_wav(nchannels: int, sampwidth: int, framerate: int, frames: bytes) -> bytes:
+    """把 PCM 帧封成最小可用的 WAV（44 字节头，不依赖标准库 `wave`）。"""
+    import struct
+
+    block = max(1, int(nchannels) * int(sampwidth))
+    header = (b'RIFF' + struct.pack('<I', 36 + len(frames)) + b'WAVE'
+              + b'fmt ' + struct.pack('<IHHIIHH', 16, 1, int(nchannels), int(framerate),
+                                      int(framerate) * block, block, int(sampwidth) * 8)
+              + b'data' + struct.pack('<I', len(frames)))
+    return header + frames
+
+
 def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
     """对原始音频做两件事：
 
@@ -71,15 +120,9 @@ def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
     """
     global _AUDIOOP_MISSING_WARNED
     try:
-        import io
         import struct
-        import wave
 
-        with wave.open(io.BytesIO(wav_bytes), 'rb') as w_in:
-            nchannels = w_in.getnchannels()
-            sampwidth = w_in.getsampwidth()
-            framerate = w_in.getframerate()
-            frames = w_in.readframes(w_in.getnframes())
+        nchannels, sampwidth, framerate, frames = _read_wav(wav_bytes)
 
         try:
             import audioop  # noqa: PLC0415 - 可选加速路径
@@ -120,13 +163,7 @@ def _optimize_wav_audio(wav_bytes: bytes) -> bytes:
                 samples = samples[start_idx:]
                 frames = struct.pack(f'<{len(samples)}h', *samples)
 
-        out_io = io.BytesIO()
-        with wave.open(out_io, 'wb') as w_out:
-            w_out.setnchannels(nchannels)
-            w_out.setsampwidth(sampwidth)
-            w_out.setframerate(framerate)
-            w_out.writeframes(frames)
-        return out_io.getvalue()
+        return _write_wav(nchannels, sampwidth, framerate, frames)
     except Exception as e:  # noqa: BLE001 - 优化失败也要把原音频发出去
         # 从 debug 提到 warning：这条一旦出现，语音很可能"能发但没声"
         logger.warning('WAV 音频流优化失败，回退原始音频（可能无声或延迟）: %s', e)

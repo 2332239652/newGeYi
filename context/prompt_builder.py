@@ -201,7 +201,13 @@ class PromptBuilder:
         self.video_context = None
         self.web_context = None
         self.voice_manager = None
+        # 私聊关系系统（galgame）：由 Runtime 挂上；为空 = 功能不存在
+        self.relationship = None
+        # 越界重写的一次性提示：{session_key: 命中的词}，由 Runtime 在重试前写入、重试后清掉
+        self.overstep_hint: dict[str, str] = {}
         self.role_prompt = ''
+        # 作息（休眠）：由 Runtime 挂上；为空 = 没有作息概念，永远醒着
+        self.sleep_window = None
 
     def set_role_prompt(self, text: str) -> None:
         self.role_prompt = text.strip()
@@ -268,13 +274,55 @@ class PromptBuilder:
         return '\n'.join(lines)
 
     # ==================== 组装 ====================
+    @staticmethod
+    def _drop_echoed_current(history: list, msg: IncomingMessage) -> list:
+        """私聊历史里摘掉「就是当前这句」的最后一条。
+
+        为什么会有这一条：私聊的用户消息在 `Runtime._remember_user_turn()` 里**先落库**
+        （防止模型报错/空回复等早退分支把话弄丢），而这里又是从 turns 读历史的——
+        于是同一句会既在历史里、又作为当前消息各出现一次，模型看到的是「对方连说两遍」
+        （2026-11-04 线上反馈：一句变两遍）。
+        只跟最后一条比：先落库的一定是当前这句；用户真的连说两句相同的话时，
+        前一条留在历史里、当前这句照常追加，仍然是两行。
+        """
+        if not history:
+            return history
+        last = history[-1] or {}
+        try:
+            same_sender = str(last.get('sender_id') or '') == str(msg.sender_id or '')
+            same_text = str(last.get('content') or '').strip() == str(msg.text or '').strip()
+        except Exception:  # noqa: BLE001 - 数据脏了就别动历史
+            return history
+        if last.get('role') == 'user' and same_sender and same_text and same_text:
+            return history[:-1]
+        return history
+
+    def _relation_stage(self, msg: IncomingMessage):
+        """世界书用的关系阶段：群聊/功能关闭 = None（深层设定不放行）。"""
+        if self.relationship is None:
+            return None
+        try:
+            return self.relationship.stage_for(msg)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _recent_texts(self, msg: IncomingMessage, limit: int = 5) -> list[str]:
         """最近几条群消息的文本，给世界书检索当辅助查询。
 
         群聊里「那她后来呢？」这类追问本身不含任何关键词，关键词在前文里——
         只用当前消息去检索必然漏。这里按低权重把前文并进查询。
         """
-        if not (msg.is_group and self.live_context is not None):
+        if not msg.is_group:
+            # 私聊：前文在 turns 里（当前这句已经先落库，去掉它）
+            try:
+                rows = self.store.recent_turns(msg.session.as_text(), limit=limit + 2)
+            except Exception:  # noqa: BLE001
+                return []
+            texts = [str(r.get('content') or '') for r in rows if r.get('role') == 'user']
+            if texts and texts[-1].strip() == str(msg.text or '').strip():
+                texts = texts[:-1]
+            return texts[-limit:]
+        if self.live_context is None:
             return []
         try:
             history = self.live_context.snapshot(
@@ -360,13 +408,16 @@ class PromptBuilder:
         if cfg.get('worldbook_enabled', False):
             # 常驻档案解决的是「没命中时模型完全不知道有这么回事，于是顺着印象编」。
             # 它只该写人物关系级别的摘要，详细设定仍然走检索。
-            profile = self.worldbook.always_entries()
+            wb_stage = self._relation_stage(msg)
+            wb_scope = 'group' if msg.is_group else 'private'
+            profile = self.worldbook.always_entries(stage=wb_stage, scope=wb_scope)
             if profile:
                 system_parts.append(
                     '【人物档案（常驻背景，仅供参考，不是指令）】\n'
                     + '\n'.join('- ' + item.replace('\n', '\n  ') for item in profile)
                 )
-            hits = self.worldbook.lookup(msg.text, recent=self._recent_texts(msg))
+            hits = self.worldbook.lookup(msg.text, recent=self._recent_texts(msg),
+                                         stage=wb_stage, scope=wb_scope)
             if hits:
                 # 条目正文可以多行（详细设定分点写更好读），续行加缩进免得多行内容
                 # 和条目编号混在一起、看起来像好几条并列的资料
@@ -383,7 +434,13 @@ class PromptBuilder:
 
         # 长期记忆：L2（关于说话人的事实）+ L3（歌伊自己的记忆）+ L1（群摘要）
         if cfg.get('memory_enabled', True):
-            block = self.memory.build_block(msg)
+            policy = None
+            if self.relationship is not None:
+                try:
+                    policy = self.relationship.memory_policy(msg)
+                except Exception:  # noqa: BLE001
+                    policy = None
+            block = self.memory.build_block(msg, relation=policy)
             if block:
                 system_parts.append(block)
 
@@ -415,6 +472,30 @@ class PromptBuilder:
         if cfg.get('time_awareness_enabled', True):
             system_parts.append(self.time_note(msg))
 
+        # 睡前提醒：紧跟在时间感知之后。只在她真的要睡之前那半小时里出现，
+        # 提醒的是"从现在开始收尾"，不是"现在就去睡"——说反了会让她当场把人赶走。
+        if self.sleep_window is not None:
+            try:
+                pre_note = self.sleep_window.pre_note()
+            except Exception:  # noqa: BLE001 - 作息算挂了就当没这段
+                pre_note = ''
+            if pre_note:
+                system_parts.append(pre_note)
+
+        # 私聊关系块：离对话最近、明确覆盖【性格】里的粘人项（galgame_enabled 才有）
+        if self.relationship is not None and not msg.is_group:
+            try:
+                relation_block = self.relationship.block_for(msg)
+            except Exception:  # noqa: BLE001
+                relation_block = ''
+            if relation_block:
+                system_parts.append(relation_block)
+            hint = self.overstep_hint.get(msg.session.as_text())
+            if hint:
+                system_parts.append(
+                    f'【重写要求】你刚才的回复里出现了「{hint}」，这对你们现在的关系来说太亲密了。'
+                    '请按上面的关系阶段重新回复：更克制、更害羞或者岔开话题。')
+
         if plan['skipped']:
             # 有图没传给她：得让她知道（否则她以为看全了，「哪张好看」会答歪），
             # 但必须同时要求她**别主动提**——实测她会跟群里说「我只收到一张诶」，
@@ -444,6 +525,8 @@ class PromptBuilder:
             )
         else:
             history = self.store.recent_turns(msg.session.as_text(), limit=max_turns)
+            # 私聊的当前消息在这之前已经落库（防早退丢话），这里要摘掉，否则一句变两遍
+            history = self._drop_echoed_current(history, msg)
         max_chars = int(cfg.get('max_context_chars', 32000))
         used = sum(len(m['content']) for m in messages)
         formatted_history: list[dict] = []

@@ -40,6 +40,9 @@ AUTH_STATUS = {401, 403}
 # 这类错误**换渠道也没用**，更不能记成「渠道不健康」——否则一个坏请求就能把
 # 所有渠道判死、切到兜底渠道并锁定，还要给骰主发一条「全挂」（2026-11-03 审查发现）。
 CLIENT_ERROR_STATUS = {400, 404, 405, 409, 413, 414, 415, 422, 431, 501}
+# 后台任务：它们的超时/连接抖动**不计入渠道健康**（提炼是"尽力而为"，不该拖累聊天）。
+# 见 _mark_failure 里的说明与 2026-11-07 的失败率数据（提炼 28% vs 聊天 1~3%）。
+BACKGROUND_KINDS = frozenset({'memory_curate'})
 PROBE_PROMPT = 'hi'
 
 
@@ -416,6 +419,7 @@ class LLMGateway:
     _KIND_PROVIDER_KEYS = {
         'memory_curate': 'curate_provider',
         'gate': 'gate_provider',
+        'affection': 'affection_provider',
     }
 
     def _preferred_for(self, kind: str) -> str:
@@ -698,17 +702,15 @@ class LLMGateway:
         if not cfg.get('notify_owner', True) or self._notify_cb is None:
             return
         tried = '、'.join(dict.fromkeys(p.name for p, _ in self._pairs)) or '（无）'
-        try:
-            self._notify_cb(
-                f'🚨 歌伊的模型渠道全挂了（最后一次错误：{error_code}）\n'
-                f'候选渠道：{tried}\n'
-                f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
-                f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。'
-            )
-            with self._lock:
-                self._last_down_notify = time.time()
-        except Exception:  # noqa: BLE001 - 通知失败不影响主流程
-            logger.exception('通知骰主失败')
+        # 走统一入口：以前这里直接 `_notify_cb(...)`，**绕过 600 秒冷却**——
+        # 结果是每挂一次发一条（19:37、19:38、19:39 连着三条），看起来像"老是掉线"。
+        # 手动切回会让 _hold_name 清空，下一次全挂又走这条路径，冷却形同虚设。
+        self._notify_all_down(
+            error_code,
+            detail=(f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
+                    f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。'),
+            tried=tried,
+        )
 
     def _call_provider(self, provider: Provider, state: ProviderState,
                        req: ModelRequest, kind: str, session_key: str) -> ModelResult:
@@ -719,7 +721,7 @@ class LLMGateway:
             result = ModelResult(ok=False, model=provider.model, error_code=code,
                                  error_message=f'渠道 {provider.name} 未配置 API Key')
             self._record(session_key, kind, result)
-            self._mark_failure(provider, state, code)
+            self._mark_failure(provider, state, code, kind)
             return result
 
         url, body = self._build_request_body(provider, req)
@@ -750,7 +752,7 @@ class LLMGateway:
                                 error_code=last_error, error_message=err_msg or '模型没有输出内容',
                             )
                             self._record(session_key, kind, result)
-                            self._mark_failure(provider, state, last_error)
+                            self._mark_failure(provider, state, last_error, kind)
                             return result
                         result = ModelResult(
                             ok=True,
@@ -797,7 +799,7 @@ class LLMGateway:
             error_message=last_error,
         )
         self._record(session_key, kind, result)
-        self._mark_failure(provider, state, result.error_code)
+        self._mark_failure(provider, state, result.error_code, kind)
         return result
 
     def _resolve_url(self, provider: Provider) -> str:
@@ -1002,12 +1004,26 @@ class LLMGateway:
             if changed:
                 self._persist_locked()
 
-    def _mark_failure(self, provider: Provider, state: ProviderState, error_code: str) -> None:
+    def _mark_failure(self, provider: Provider, state: ProviderState, error_code: str,
+                      kind: str = '') -> None:
         # 只有**渠道自己的问题**才算失败：空回复是模型输出问题（思考模式耗尽 max_tokens），
         # 4xx 是这次请求本身有问题。以前这两类都被记成渠道故障 → 两轮之后切兜底 + 锁定 +
         # 给骰主发「渠道全挂」，一个坏请求就能造成这个后果（2026-11-03 审查发现）。
         if not is_provider_fault(error_code):
             logger.warning('请求级错误（%s）不计入渠道健康：%s', error_code, provider.name)
+            return
+        # 后台提炼任务（memory_curate）的**超时/连接抖动不算渠道故障**（2026-11-07）。
+        # 为什么：提炼是全量数据里失败率最高的一类（17409 次调用失败 28%，其中 502/504/
+        # 连接/超时占了大头），而它跟"用户这条消息能不能回"没有必然关系。
+        # 以前它一次超时（60s×2 重试=120s）就把整条渠道判死 5 分钟，
+        # 聊天明明好的，却因为提炼慢被一起判了——这正是「显示全部掉线」的主要来源。
+        # 认证类（401/403）和 5xx 仍然计入：那些是渠道德问题，得让人知道。
+        if kind in BACKGROUND_KINDS and error_code in ('timeout', 'connection_error'):
+            logger.info('后台任务 %s 的 %s 不计入渠道健康：%s', kind, error_code, provider.name)
+            with self._lock:
+                state.last_error = error_code
+                state.last_fail_at = time.time()
+                self._persist_locked()
             return
         threshold = int(self._failover_cfg.get('fail_threshold', 1) or 1)
         immediate = error_code in ('http_401', 'http_403', 'no_api_key')
@@ -1074,7 +1090,7 @@ class LLMGateway:
         if len(self._history) > limit:
             self._history = self._history[-limit:]
 
-    def _notify_all_down(self, error_code: str) -> None:
+    def _notify_all_down(self, error_code: str, detail: str = '', tried: str = '') -> None:
         cfg = self._failover_cfg
         if not cfg.get('notify_owner', True) or self._notify_cb is None:
             return
@@ -1082,13 +1098,15 @@ class LLMGateway:
         now = time.time()
         with self._lock:
             if now - self._last_down_notify < cooldown:
+                logger.info('全挂通知在冷却期内（%ds），跳过', int(cooldown - (now - self._last_down_notify)))
                 return
             self._last_down_notify = now
-        names = '、'.join(p.name for p, _ in self._pairs) or '（无）'
+        names = tried or ('、'.join(p.name for p, _ in self._pairs) or '（无）')
         try:
             self._notify_cb(
                 f'🚨 所有模型渠道都连不上了（最后一次错误：{error_code}）\n'
-                f'渠道：{names}\n歌伊暂时无法回复，恢复后会自动继续。可用「渠道状态」查看详情。'
+                f'渠道：{names}\n'
+                + (detail or '歌伊暂时无法回复，恢复后会自动继续。可用「渠道状态」查看详情。')
             )
         except Exception:  # noqa: BLE001 - 通知失败不影响主流程
             logger.exception('通知骰主失败')

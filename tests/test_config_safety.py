@@ -105,14 +105,14 @@ class NormalSaveTest(_TempState):
 
 class OwnerIdsTest(unittest.TestCase):
     def test_dirty_owner_ids_do_not_raise(self):
-        cases = [None, 1000000001, '1000000001', [], [None, 1000000001, 'abc'], {'a': 1}]
+        cases = [None, 2332239652, '2332239652', [], [None, 2332239652, 'abc'], {'a': 1}]
         for raw in cases:
             perms = Permissions({'owner_ids': raw}, owner_ids_env='')
             ids = perms._owner_set()             # 以前这里会 TypeError
             self.assertTrue(all(str(x).isdigit() for x in ids))
-        self.assertEqual(Permissions({'owner_ids': 1000000001}, '')._owner_set(), {'1000000001'})
-        self.assertEqual(Permissions({'owner_ids': ['1000000001', 'abc']}, '')._owner_set(),
-                         {'1000000001'})
+        self.assertEqual(Permissions({'owner_ids': 2332239652}, '')._owner_set(), {'2332239652'})
+        self.assertEqual(Permissions({'owner_ids': ['2332239652', 'abc']}, '')._owner_set(),
+                         {'2332239652'})
 
     def test_env_owners_are_merged(self):
         perms = Permissions({'owner_ids': None}, owner_ids_env='111，222')

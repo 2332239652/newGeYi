@@ -43,6 +43,45 @@ def extract_keywords(text: str) -> set[str]:
     return tokens
 
 
+# ==================== 事实关键词（写入端摊平语义） ====================
+# 为什么要在写入时就存关键词，而不是检索时现算：
+# 检索时现算只能拿"事实原文"做字面匹配，换说法就丢（「跑团新人」vs「刚玩 TRPG」）。
+# 让提炼模型在写入时顺手给出同义词/上位词（「跑团」「TRPG」「桌游」），
+# 检索端就只需要做一次字符串包含——0 依赖、0 延迟，效果接近轻量语义召回。
+KEYWORD_SEP = ','
+
+
+def normalize_keywords(value) -> str:
+    """把模型给的关键词/本地分词结果统一成 `a,b,c`：去重、限长 12、最多 8 个。"""
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        raw = re.split(r'[,，、;；/\s]+', value)
+    else:
+        try:
+            raw = list(value)
+        except TypeError:
+            return ''
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = str(item or '').strip()
+        if not text or len(text) > 12:
+            continue
+        low = text.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(text)
+        if len(out) >= 8:
+            break
+    return KEYWORD_SEP.join(out)
+
+
+def split_keywords(value) -> list[str]:
+    return [x for x in str(value or '').split(KEYWORD_SEP) if x]
+
+
 def text_similarity(text1: str, text2: str) -> float:
     """计算两段记忆文本之间的语义重叠相似度 (0.0 ~ 1.0)。纯本地运算，0 延迟。
     结合核心实义汉字与词汇 Overlap/Jaccard 系数。
@@ -166,10 +205,29 @@ CREATE TABLE IF NOT EXISTS user_facts(
     valid_to INTEGER DEFAULT 0,
     last_hit_at INTEGER DEFAULT 0,
     hit_count INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    keywords TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ufact ON user_facts(session_key, user_id, valid_to);
 CREATE INDEX IF NOT EXISTS idx_ufact_norm ON user_facts(session_key, user_id, fact_norm);
+
+-- 事实回收站：容量淘汰（单人 12 条 / 单群 600 条）以前是**直接 DELETE**，
+-- 淘汰掉的那条就永远没了。这里先留档再删，想看「她以前记得什么」随时能翻。
+CREATE TABLE IF NOT EXISTS user_facts_archive(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id INTEGER,
+    session_key TEXT,
+    user_id TEXT,
+    fact TEXT,
+    category TEXT,
+    source TEXT,
+    importance REAL,
+    valid_from INTEGER,
+    hit_count INTEGER,
+    archived_at INTEGER NOT NULL,
+    reason TEXT DEFAULT 'capacity'
+);
+CREATE INDEX IF NOT EXISTS idx_ufact_arch ON user_facts_archive(session_key, user_id, id);
 
 -- L3：角色自身记忆。歌伊自己的经历/承诺/情绪——通用框架都没有这层，
 -- 但角色扮演缺了它就不成立（否则她只记得你，不记得自己）。
@@ -188,12 +246,26 @@ CREATE TABLE IF NOT EXISTS self_memories(
 );
 CREATE INDEX IF NOT EXISTS idx_self_sk ON self_memories(session_key, valid_to);
 
--- L2 扩展：群友印象与羁绊卡片（跨会话高维画像）
+-- L2 扩展：群友/私聊印象与羁绊卡片（区分群聊与私聊独立画像）
 CREATE TABLE IF NOT EXISTS user_impressions(
-    user_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'group',
     summary TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, scope)
 );
+
+-- 印象历史：只追加，永不改。主表是"当前生效的那一版"，这里留每一次改动前/后的全文，
+-- 便于回溯「她对这个人的看法是怎么变的」，也避免改砸了就把旧句子永久丢掉。
+CREATE TABLE IF NOT EXISTS user_impressions_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'group',
+    summary TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    reason TEXT DEFAULT ''          -- 'create' / 'update' / 'backfill'
+);
+CREATE INDEX IF NOT EXISTS idx_imphist_uid ON user_impressions_history(user_id, id);
 
 -- 主动搭话决策日志。三道本地闸门 + 模型决策都记一条，用来观察「她多久想说一次、
 -- 被哪道闸门挡住、影子模式下本来会说什么」。这是调阈值的唯一依据。
@@ -209,9 +281,56 @@ CREATE TABLE IF NOT EXISTS active_decisions(
     latency_ms INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_adec_sk ON active_decisions(session_key, id);
+
+-- 私聊关系状态（好感度 / 阶段 / 心情 / 事件进度）。只记私聊，按用户一行。
+-- 与记忆开关无关：关掉记忆不该让所有人重新变回陌生人。
+CREATE TABLE IF NOT EXISTS user_relationship(
+    user_id TEXT PRIMARY KEY,
+    affection REAL NOT NULL DEFAULT 0,
+    stage INTEGER NOT NULL DEFAULT 0,
+    stage_since REAL NOT NULL DEFAULT 0,
+    days_active INTEGER NOT NULL DEFAULT 0,
+    last_day TEXT NOT NULL DEFAULT '',
+    gain_today REAL NOT NULL DEFAULT 0,
+    tag_counts TEXT NOT NULL DEFAULT '{}',
+    bad_streak INTEGER NOT NULL DEFAULT 0,
+    locked_until REAL NOT NULL DEFAULT 0,
+    last_advance_day TEXT NOT NULL DEFAULT '',
+    mood TEXT NOT NULL DEFAULT '',
+    mood_until REAL NOT NULL DEFAULT 0,
+    flags TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+-- 关系流水：只追加，不改不删（除非"忘了我"）。调参、申诉、复盘"她为什么突然变冷"都靠它。
+-- shadow=1 表示影子模式：评审给了分，但没有生效。
+CREATE TABLE IF NOT EXISTS relationship_log(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    delta_raw INTEGER NOT NULL DEFAULT 0,
+    delta_applied REAL NOT NULL DEFAULT 0,
+    tag TEXT NOT NULL DEFAULT '',
+    advance_level INTEGER NOT NULL DEFAULT 0,
+    aff_before REAL NOT NULL DEFAULT 0,
+    aff_after REAL NOT NULL DEFAULT 0,
+    stage_before INTEGER NOT NULL DEFAULT 0,
+    stage_after INTEGER NOT NULL DEFAULT 0,
+    shadow INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    user_text TEXT NOT NULL DEFAULT '',
+    reply_text TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rellog_uid ON relationship_log(user_id, id);
 """
 
 KEEP_TURNS_PER_SESSION = 200
+
+
+def is_private_session_key(session_key: str) -> bool:
+    """会话键是否代表私聊会话（冒号或竖线格式）。"""
+    key = str(session_key or '')
+    return ':private:' in key or '|private|' in key or key.endswith('|private')
 
 
 class SQLiteStore:
@@ -249,17 +368,74 @@ class SQLiteStore:
 
     def _init(self) -> None:
         conn = self._conn()
-        conn.executescript(_SCHEMA)
         self._migrate(conn)
+        conn.executescript(_SCHEMA)
         if self.get_setting('schema_version') is None:
             self.set_setting('schema_version', '1')
+        # 一次性清掉第一版用本地分词硬灌的关键词（噪音，见 backfill_fact_keywords 的注释）。
+        # 之后 keywords 只由提炼模型在写入时给出。
+        if self.get_setting('facts.keywords_cleanup') is None:
+            try:
+                cleared = self.backfill_fact_keywords()
+                if cleared:
+                    logger.info('清理本地分词关键词：%d 条（关键词改为只收模型给的同义词）', cleared)
+            except sqlite3.Error:
+                logger.exception('清理关键词失败（不影响启动）')
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
         """老库补列：只做加法，绝不删列——升级不能把数据搞丢。"""
         cols = {row[1] for row in conn.execute('PRAGMA table_info(api_calls)')}
-        if 'cached_tokens' not in cols:
+        if cols and 'cached_tokens' not in cols:
             conn.execute('ALTER TABLE api_calls ADD COLUMN cached_tokens INTEGER DEFAULT 0')
+        # 印象表增加 scope 支持（区分 group 与 private，独立提炼互不覆盖）
+        try:
+            imp_cols = {row[1] for row in conn.execute('PRAGMA table_info(user_impressions)')}
+            if imp_cols and 'scope' not in imp_cols:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS user_impressions_v2(
+                        user_id TEXT NOT NULL,
+                        scope TEXT NOT NULL DEFAULT 'group',
+                        summary TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY(user_id, scope)
+                    )
+                ''')
+                conn.execute('''
+                    INSERT OR IGNORE INTO user_impressions_v2(user_id, scope, summary, updated_at)
+                    SELECT user_id, 'group', summary, updated_at FROM user_impressions
+                ''')
+                conn.execute('DROP TABLE user_impressions')
+                conn.execute('ALTER TABLE user_impressions_v2 RENAME TO user_impressions')
+        except sqlite3.Error:
+            pass
+
+        try:
+            hcols = {row[1] for row in conn.execute('PRAGMA table_info(user_impressions_history)')}
+            if hcols and 'scope' not in hcols:
+                conn.execute("ALTER TABLE user_impressions_history ADD COLUMN scope TEXT DEFAULT 'group'")
+                conn.execute("UPDATE user_impressions_history SET scope='group' WHERE scope IS NULL OR scope=''")
+        except sqlite3.Error:
+            pass
+
+        # 事实关键词（写入端摊平语义，检索端做字面匹配用）：老库补列
+        try:
+            fcols = {row[1] for row in conn.execute('PRAGMA table_info(user_facts)')}
+            if fcols and 'keywords' not in fcols:
+                conn.execute("ALTER TABLE user_facts ADD COLUMN keywords TEXT DEFAULT ''")
+        except sqlite3.Error:
+            pass
+
+        # 印象历史表是后加的：第一次建好后，把**当前**这批印象作为第一版补进去，
+        # 否则老库的历史是空的，回溯时看不到"最初她是怎么看这个人的"。
+        try:
+            hist = conn.execute('SELECT COUNT(*) FROM user_impressions_history').fetchone()[0]
+            if not hist:
+                conn.execute(
+                    'INSERT INTO user_impressions_history(user_id, scope, summary, created_at, reason) '
+                    'SELECT user_id, scope, summary, updated_at, ? FROM user_impressions', ('backfill',))
+        except sqlite3.Error:
+            pass
 
     # ---------------- settings ----------------
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -272,6 +448,15 @@ class SQLiteStore:
             'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
             (key, str(value)),
         )
+
+    def settings_with_prefix(self, prefix: str) -> list:
+        """按前缀列出 (key, value)——静默状态是 `rest:<session_key>` 这样的键，
+        骰主想知道「现在都有谁被静默着」时必须能枚举出来。"""
+        rows = self._conn().execute(
+            'SELECT key, value FROM settings WHERE key LIKE ? ORDER BY key',
+            (str(prefix) + '%',),
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     # ---------------- turns ----------------
     def add_turn(
@@ -509,14 +694,23 @@ class SQLiteStore:
 
     # ==================== 记忆 L2：用户事实 ====================
     def add_user_fact(self, session_key: str, user_id: str, fact: str, category: str = '',
-                      source: str = 'inferred', importance: float = 0.5) -> int:
+                      source: str = 'inferred', importance: float = 0.5,
+                      keywords=None) -> int:
+        """写一条用户事实。
+
+        `keywords` **只收模型给的**同义词/上位词，不做本地分词兜底：
+        本地 `extract_keywords` 吐的是"喜欢/来自/和牛"这种二元组，它们本来就在
+        fact 原文里（子串匹配已经能中），再拿去当关键词只会让"喜欢"命中几十条事实、
+        把真正相关的那条挤出候选池（实测过，噪音比收益大）。没有就留空。
+        """
         now = int(time.time())
+        kw = normalize_keywords(keywords)
         cur = self._conn().execute(
             'INSERT INTO user_facts(session_key, user_id, fact, fact_norm, category, source, '
-            'importance, valid_from, valid_to, last_hit_at, hit_count, created_at) '
-            'VALUES(?,?,?,?,?,?,?,?,0,0,0,?)',
+            'importance, valid_from, valid_to, last_hit_at, hit_count, created_at, keywords) '
+            'VALUES(?,?,?,?,?,?,?,?,0,0,0,?,?)',
             (session_key, str(user_id), str(fact), normalize_fact(fact), category or '',
-             source or 'inferred', float(importance), now, now),
+             source or 'inferred', float(importance), now, now, kw),
         )
         return int(cur.lastrowid or 0)
 
@@ -546,49 +740,158 @@ class SQLiteStore:
 
     def list_user_facts(self, session_key: str, user_id: Optional[str] = None,
                         limit: int = 20, include_expired: bool = False,
-                        include_global: bool = False) -> list[dict]:
-        if include_global and user_id is not None and session_key != 'global':
-            sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
-                   'last_hit_at, hit_count, session_key FROM user_facts '
-                   'WHERE (session_key=? OR session_key=\'global\') AND user_id=?')
-            args: list = [session_key, str(user_id)]
+                        include_global: bool = False,
+                        cross_scope: bool = False) -> list[dict]:
+        is_priv = is_private_session_key(session_key)
+        args: list = []
+        if is_priv:
+            if cross_scope and user_id is not None:
+                # 私聊互通模式：查私聊事实 + 全局事实 + 该用户的群聊事实
+                sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                       'keywords, last_hit_at, hit_count, session_key FROM user_facts '
+                       'WHERE user_id=? AND (session_key=? OR session_key=\'global\' OR '
+                       '(session_key NOT LIKE \'%:private:%\' AND session_key NOT LIKE \'%|private|%\'))')
+                args = [str(user_id), session_key]
+            else:
+                # 私聊隔离模式：仅查该私聊会话的事实（不混入群聊与全局事实）
+                sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                       'keywords, last_hit_at, hit_count, session_key FROM user_facts WHERE session_key=?')
+                args = [session_key]
+                if user_id is not None:
+                    sql += ' AND user_id=?'
+                    args.append(str(user_id))
         else:
-            sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
-                   'last_hit_at, hit_count, session_key FROM user_facts WHERE session_key=?')
-            args: list = [session_key]
-            if user_id is not None:
-                sql += ' AND user_id=?'
-                args.append(str(user_id))
+            # 群聊会话
+            if cross_scope and user_id is not None:
+                # 群聊互通模式：查本群事实 + 全局事实 + 该用户的私聊事实
+                sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                       'keywords, last_hit_at, hit_count, session_key FROM user_facts '
+                       'WHERE user_id=? AND (session_key=? OR session_key=\'global\' OR '
+                       'session_key LIKE \'%:private:%\' OR session_key LIKE \'%|private|%\')')
+                args = [str(user_id), session_key]
+            elif include_global and user_id is not None and session_key != 'global':
+                # 群聊隔离模式：仅查本群 + global（不混入私聊事实）
+                sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                       'keywords, last_hit_at, hit_count, session_key FROM user_facts '
+                       'WHERE (session_key=? OR session_key=\'global\') AND user_id=?')
+                args = [session_key, str(user_id)]
+            else:
+                sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+                       'keywords, last_hit_at, hit_count, session_key FROM user_facts WHERE session_key=?')
+                args = [session_key]
+                if user_id is not None:
+                    sql += ' AND user_id=?'
+                    args.append(str(user_id))
+
         if not include_expired:
             sql += ' AND valid_to=0'
         sql += ' ORDER BY importance DESC, id DESC LIMIT ?'
         args.append(int(limit))
         rows = self._conn().execute(sql, tuple(args)).fetchall()
         return [{'id': r[0], 'user_id': r[1], 'fact': r[2], 'category': r[3], 'source': r[4],
-                 'importance': r[5], 'valid_from': r[6], 'valid_to': r[7],
-                 'last_hit_at': r[8], 'hit_count': r[9], 'session_key': r[10]} for r in rows]
+                 'importance': r[5], 'valid_from': r[6], 'valid_to': r[7], 'keywords': r[8],
+                 'last_hit_at': r[9], 'hit_count': r[10], 'session_key': r[11]} for r in rows]
 
-    def get_user_impression(self, user_id: str) -> Optional[dict]:
-        """获取群友高维印象卡片（跨群共享）。"""
+    def facts_matching(self, session_key: str, user_id: str, words, limit: int = 40,
+                       include_global: bool = True) -> list[dict]:
+        """按关键词预取候选事实（关键词命中优先，别让高重要度的废话挤掉真正相关的）。
+
+        为什么单独查一次：容量放大到几千条之后，`ORDER BY importance LIMIT N` 很容易
+        把"低重要度但正好切题"的那条挡在候选池外——检索层再聪明也看不到它。
+        这里用 `keywords` + `fact` 的 LIKE 做一次粗筛，一次几十毫秒，换回召回率。
+        """
+        keys = [str(w).strip() for w in (words or []) if len(str(w).strip()) >= 2][:6]
+        uid = str(user_id or '').strip()
+        if not keys or not uid:
+            return []
+        sessions = [str(session_key)]
+        if include_global and session_key != 'global':
+            sessions.append('global')
+        like = ' OR '.join(['keywords LIKE ?'] * len(keys) + ['fact LIKE ?'] * len(keys))
+        marks = ','.join('?' for _ in sessions)
+        sql = ('SELECT id, user_id, fact, category, source, importance, valid_from, valid_to, '
+               'keywords, last_hit_at, hit_count, session_key FROM user_facts '
+               'WHERE session_key IN (%s) AND user_id=? AND valid_to=0 AND (%s) '
+               'ORDER BY importance DESC, id DESC LIMIT ?' % (marks, like))
+        args = list(sessions) + [uid]
+        args += ['%%%s%%' % k for k in keys] * 2
+        args.append(int(limit))
+        rows = self._conn().execute(sql, tuple(args)).fetchall()
+        return [{'id': r[0], 'user_id': r[1], 'fact': r[2], 'category': r[3], 'source': r[4],
+                 'importance': r[5], 'valid_from': r[6], 'valid_to': r[7], 'keywords': r[8],
+                 'last_hit_at': r[9], 'hit_count': r[10], 'session_key': r[11]} for r in rows]
+
+    def backfill_fact_keywords(self) -> int:
+        """**清掉**早期用本地分词硬填的关键词，返回清理条数。
+
+        第一版为了"老事实也能按关键词搜到"，用 `extract_keywords` 给历史事实灌了
+        二元组（"喜欢/来自/和牛/的小"）。实测发现它们全是噪音：
+        任何一句带"喜欢"的话都会同时命中几十条事实的相关度 0.95，
+        把真正切题的那条挤出候选池。关键词只该来自模型给的同义词——
+        老数据留空即可，它们靠 `fact` 原文匹配（`facts_matching` 里同时 LIKE fact）。
+        """
+        conn = self._conn()
+        cur = conn.execute("UPDATE user_facts SET keywords='' WHERE COALESCE(keywords,'')<>''")
+        # 两个标记都置上：`keywords_cleanup` 是 _init 判重用的，旧名字留着免得老库回头又"回填"一次
+        self.set_setting('facts.keywords_cleanup', '1')
+        self.set_setting('facts.keywords_backfilled', '1')
+        return int(cur.rowcount or 0)
+
+    def get_user_impression(self, user_id: str, scope: str = 'group') -> Optional[dict]:
+        """获取用户高维印象卡片（支持 scope='group' 与 'private'，隔离提炼）。"""
+        sc = str(scope or 'group').strip().lower()
         row = self._conn().execute(
-            'SELECT user_id, summary, updated_at FROM user_impressions WHERE user_id=?',
-            (str(user_id),),
+            'SELECT user_id, summary, updated_at, scope FROM user_impressions WHERE user_id=? AND scope=?',
+            (str(user_id), sc),
         ).fetchone()
         if not row:
             return None
-        return {'user_id': row[0], 'summary': row[1], 'updated_at': row[2]}
+        return {'user_id': row[0], 'summary': row[1], 'updated_at': row[2], 'scope': row[3]}
 
-    def set_user_impression(self, user_id: str, summary: str) -> None:
-        """更新群友高维印象卡片。"""
+    def set_user_impression(self, user_id: str, summary: str, scope: str = 'group') -> bool:
+        """更新用户高维印象卡片（按 scope 隔离群聊与私聊）；**每次真实改动都追加一条历史**。返回是否真的改了。"""
         text = str(summary or '').strip()
         if not text:
-            return
+            return False
+        uid = str(user_id)
+        sc = str(scope or 'group').strip().lower()
+        conn = self._conn()
         now = int(time.time())
-        self._conn().execute(
-            'INSERT INTO user_impressions(user_id, summary, updated_at) VALUES(?,?,?) '
-            'ON CONFLICT(user_id) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at',
-            (str(user_id), text, now),
+        row = conn.execute(
+            'SELECT summary FROM user_impressions WHERE user_id=? AND scope=?',
+            (uid, sc),
+        ).fetchone()
+        if row and str(row[0] or '').strip() == text:
+            return False                      # 一字未改：不动主表，也不写历史
+        conn.execute(
+            'INSERT INTO user_impressions(user_id, scope, summary, updated_at) VALUES(?,?,?,?) '
+            'ON CONFLICT(user_id, scope) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at',
+            (uid, sc, text, now),
         )
+        try:
+            conn.execute(
+                'INSERT INTO user_impressions_history(user_id, scope, summary, created_at, reason) '
+                'VALUES(?,?,?,?,?)', (uid, sc, text, now, 'create' if not row else 'update'),
+            )
+        except sqlite3.Error:                 # 历史写失败不能拖累主表
+            pass
+        return True
+
+    def impression_history(self, user_id: str, scope: Optional[str] = 'group', limit: int = 20) -> list[dict]:
+        """这个人的印象所有历史版本，新的在前。"""
+        if scope is not None:
+            rows = self._conn().execute(
+                'SELECT id, summary, created_at, reason, scope FROM user_impressions_history '
+                'WHERE user_id=? AND scope=? ORDER BY id DESC LIMIT ?',
+                (str(user_id), str(scope), int(limit)),
+            ).fetchall()
+        else:
+            rows = self._conn().execute(
+                'SELECT id, summary, created_at, reason, scope FROM user_impressions_history '
+                'WHERE user_id=? ORDER BY id DESC LIMIT ?',
+                (str(user_id), int(limit)),
+            ).fetchall()
+        return [{'id': r[0], 'summary': r[1], 'created_at': r[2], 'reason': r[3], 'scope': r[4]} for r in rows]
 
     def touch_user_fact(self, fact_id: int) -> None:
         """命中一次：刷新时间戳与次数。衰减用 last_hit_at 而非 created_at——越用越牢。"""
@@ -639,6 +942,8 @@ class SQLiteStore:
             tuple(sessions) + (str(user_id),),
         )
         conn.execute('DELETE FROM user_impressions WHERE user_id=?', (str(user_id),))
+        # 「忘了我」要连历史一起清：历史里存的是同一批私人信息，留着等于没忘
+        conn.execute('DELETE FROM user_impressions_history WHERE user_id=?', (str(user_id),))
         return int(row[0])
 
     def migrate_legacy_memories(self) -> int:
@@ -857,7 +1162,7 @@ class SQLiteStore:
         而提炼按**消息量**算（每 `memory_curate_messages` 条一次）。
         小群一天几十次提炼，配额瞬间见底。
 
-        线上实测（群 200000005，19 人，配额 40）：
+        线上实测（群 957309761，19 人，配额 40）：
 
             09-17   提炼 39 + 被动 6 + 主动 21 = 66   ★ 超配额
             09-18   提炼 33 + 被动 0 + 主动 10 = 43   ★ 超配额
@@ -879,72 +1184,134 @@ class SQLiteStore:
 
     # ==================== 事实容量控制 ====================
     def trim_user_facts(self, session_key: str, user_id: str = '',
-                        max_per_user: int = 0, max_per_group: int = 0) -> int:
+                        max_per_user: int = 0, max_per_group: int = 0,
+                        video_share_keep: int = 0) -> int:
         """事实超容量就淘汰「最不值钱」的那几条。
 
         线上实测：一个大群一天塞进来 94 条，其中一个人占了 17 条、5 条在说同一件事
         （「跑团新人」「TRPG萌新」「刚加入群」…）。字面归一化挡不住这种换说法的重复，
         所以除了让模型自己判重（见 curator 的「已知事实」），还得有**容量硬上限**兜底：
         分数 = 重要度 + 命中次数×0.1 + 是否手工记过，低的先走。
+
+        `video_share_keep`：视频分享类单独封顶（默认 3 条）。这类是**别的插件按事件写的**，
+        每条一条、永不重复、还标了 explicit，不单独限流就会把一个人的记忆全占满
+        （线上：一个用户 12 条上限里 6 条是"分享了视频《xxx》"）。
         """
         removed = 0
         if max_per_user > 0 and user_id:
             removed += self._trim_facts(
                 'session_key=? AND user_id=? AND valid_to=0', (session_key, str(user_id)),
-                int(max_per_user))
+                int(max_per_user), int(video_share_keep))
         if max_per_group > 0:
             removed += self._trim_facts('session_key=? AND valid_to=0', (session_key,),
-                                        int(max_per_group))
+                                        int(max_per_group), int(video_share_keep))
         return removed
 
-    def _trim_facts(self, where: str, args: tuple, limit: int) -> int:
+    def _trim_facts(self, where: str, args: tuple, limit: int, video_keep: int = 0) -> int:
         conn = self._conn()
         rows = conn.execute(
-            'SELECT id, importance, hit_count, source FROM user_facts WHERE %s' % where,
-            args,
+            'SELECT id, importance, hit_count, source, category, created_at FROM user_facts'
+            ' WHERE %s' % where, args,
         ).fetchall()
-        if len(rows) <= limit:
+        if not rows:
             return 0
 
-        # 手工记的（「记住 xxx」）**不参与淘汰**：那是人明确要求留下的，
-        # 不能因为一条重要度 0.9 的推断事实就把它挤掉（实测踩过：加个 0.3 的
-        # 权重根本护不住它）。容量不够时先牺牲推断出来的。
-        explicit = [row for row in rows if str(row[3]) == 'explicit']
-        inferred = [row for row in rows if str(row[3]) != 'explicit']
+        killed: set = set()
 
-        def weight(row):
-            return float(row[1] or 0) + int(row[2] or 0) * 0.1
+        # ① 视频分享单独封顶：只留最近 N 条，先于总容量判断（否则小体量时永远触发不到）
+        #    排序用 (created_at, id)：同一秒写入多条时 created_at 全一样，
+        #    只按时间排会退化成"保留最旧的"，反而把刚分享的删了。
+        if video_keep > 0:
+            videos = [row for row in rows if str(row[4] or '') == 'bili_share']
+            if len(videos) > video_keep:
+                keep = {row[0] for row in sorted(
+                    videos, key=lambda r: (int(r[5] or 0), int(r[0])), reverse=True)[:video_keep]}
+                killed |= {row[0] for row in videos if row[0] not in keep}
 
-        room = max(0, limit - len(explicit))
-        if room == 0:                      # 手工事实本身就超了，只能按分数留
-            kept = {row[0] for row in sorted(explicit, key=weight, reverse=True)[:limit]}
-        else:
-            kept = {row[0] for row in explicit}
-            kept |= {row[0] for row in sorted(inferred, key=weight, reverse=True)[:room]}
-        doomed = [row[0] for row in rows if row[0] not in kept]
+        alive = [row for row in rows if row[0] not in killed]
+        if len(alive) > limit:
+            # 手工记的（「记住 xxx」）**不参与淘汰**：那是人明确要求留下的。
+            # 但机器按事件写的（bili_share 等）不算"手工"，它们该和推断事实一起排队。
+            def is_manual(row):
+                return str(row[3]) == 'explicit' and str(row[4] or '') != 'bili_share'
+
+            manual = [row for row in alive if is_manual(row)]
+            others = [row for row in alive if not is_manual(row)]
+
+            def weight(row):
+                return float(row[1] or 0) + int(row[2] or 0) * 0.1
+
+            room = max(0, limit - len(manual))
+            if room == 0:                  # 手工事实本身就超了，只能按分数留
+                kept = {row[0] for row in sorted(manual, key=weight, reverse=True)[:limit]}
+            else:
+                kept = {row[0] for row in manual}
+                kept |= {row[0] for row in sorted(others, key=weight, reverse=True)[:room]}
+            killed |= {row[0] for row in alive if row[0] not in kept}
+
+        if not killed:
+            return 0
+        doomed = sorted(killed)
         if doomed:
+            # 先留档再删：淘汰是「从记忆里拿掉」，不是「历史里抹掉」
+            try:
+                now = int(time.time())
+                conn.executemany(
+                    'INSERT INTO user_facts_archive(fact_id, session_key, user_id, fact, category, '
+                    'source, importance, valid_from, hit_count, archived_at, reason) '
+                    'SELECT id, session_key, user_id, fact, category, source, importance, '
+                    'valid_from, hit_count, ?, ? FROM user_facts WHERE id=?',
+                    [(now, 'capacity', i) for i in doomed],
+                )
+            except sqlite3.Error:
+                pass                        # 留档失败不能挡住淘汰（否则容量会一直涨）
             conn.executemany('DELETE FROM user_facts WHERE id=?', [(i,) for i in doomed])
         return len(doomed)
 
+    def archived_facts(self, session_key: str, user_id: str = '', limit: int = 50) -> list[dict]:
+        """回收站里的事实（被容量淘汰的那些），新的在前。"""
+        sql = ('SELECT id, session_key, user_id, fact, importance, archived_at, reason '
+               'FROM user_facts_archive WHERE session_key=?')
+        args: list = [str(session_key)]
+        if user_id:
+            sql += ' AND user_id=?'
+            args.append(str(user_id))
+        sql += ' ORDER BY id DESC LIMIT ?'
+        args.append(int(limit))
+        rows = self._conn().execute(sql, tuple(args)).fetchall()
+        return [{'id': r[0], 'session_key': r[1], 'user_id': r[2], 'fact': r[3],
+                 'importance': r[4], 'archived_at': r[5], 'reason': r[6]} for r in rows]
+
     def list_facts_of_users(self, session_key: str, user_ids, limit_per_user: int = 8) -> dict:
-        """按一批 QQ 号取现有事实（含 global 全局事实，提炼时喂给模型判重/失效用）。
+        """按一批 QQ 号取现有事实（提炼时喂给模型判重/失效用）。
+        私聊提炼只带私聊自身的事实；群聊提炼带本群与 global 事实。
         返回 {user_id: [{'id': int, 'fact': str, 'scope': str}]}。
         """
         ids = [str(u) for u in (user_ids or []) if str(u).strip()]
         if not ids:
             return {}
         marks = ','.join('?' for _ in ids)
-        rows = self._conn().execute(
-            'SELECT id, user_id, fact, session_key FROM user_facts '
-            'WHERE (session_key=? OR session_key=\'global\') AND valid_to=0 '
-            'AND user_id IN (%s) ORDER BY importance DESC, id DESC' % marks,
-            tuple([session_key] + ids),
-        ).fetchall()
+        if is_private_session_key(session_key):
+            # 私聊提炼：只带本私聊会话的事实，严禁混入群聊与全局事实
+            sql = ('SELECT id, user_id, fact, session_key FROM user_facts '
+                   'WHERE session_key=? AND valid_to=0 '
+                   'AND user_id IN (%s) ORDER BY importance DESC, id DESC' % marks)
+            args = tuple([session_key] + ids)
+        else:
+            # 群聊提炼：带本群与全局事实
+            sql = ('SELECT id, user_id, fact, session_key FROM user_facts '
+                   'WHERE (session_key=? OR session_key=\'global\') AND valid_to=0 '
+                   'AND user_id IN (%s) ORDER BY importance DESC, id DESC' % marks)
+            args = tuple([session_key] + ids)
+        rows = self._conn().execute(sql, args).fetchall()
         out: dict = {}
         for fid, user_id, fact, sk in rows:
             bucket = out.setdefault(str(user_id), [])
             if len(bucket) < int(limit_per_user):
-                bucket.append({'id': int(fid), 'fact': str(fact), 'scope': 'global' if sk == 'global' else 'group'})
+                bucket.append({
+                    'id': int(fid), 'fact': str(fact),
+                    'scope': 'global' if sk == 'global' else ('private' if is_private_session_key(sk) else 'group')
+                })
         return out
 
     # ==================== 导出（排查/备份用） ====================

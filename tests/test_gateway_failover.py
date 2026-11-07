@@ -151,7 +151,7 @@ class CycleAndEscalateTest(unittest.TestCase):
         self.assertEqual(gw._hold_name, 'official-chat')
         self.assertEqual(store.settings.get('gw.hold'), 'official-chat')
         self.assertEqual(len(notes), 1)
-        self.assertIn('全挂', notes[0])
+        self.assertIn('所有模型渠道都连不上', notes[0])
         self.assertIn('official-chat', notes[0])
 
     def test_locked_gateway_only_uses_official(self):
@@ -226,6 +226,65 @@ class CycleAndEscalateTest(unittest.TestCase):
         self.assertEqual(res.text, '收到')
         self.assertEqual(gw._hold_name, '')      # 没降级
         self.assertFalse(notes)
+
+
+class BackgroundKindTest(unittest.TestCase):
+    """后台提炼（memory_curate）的超时不该把渠道判死（2026-11-07）。
+
+    数据：提炼 17409 次调用失败 28%（其中 502/504/连接/超时占大头），
+    聊天只有 1~3%。以前提炼一次超时（60s×2 重试=120s）就把整条渠道判死 5 分钟，
+    聊天明明好的却被一起判了——「显示全部掉线」的主要来源。
+    """
+
+    @staticmethod
+    def _timeout_session(gw):
+        import requests
+
+        class TimeoutSession:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, url, headers=None, json=None, timeout=None):
+                self.posts.append(((json or {}).get('model'), url))
+                raise requests.Timeout('boom')
+
+        session = TimeoutSession()
+        gw._get_session = lambda: session          # type: ignore[assignment]
+        return session
+
+    def test_curate_timeout_keeps_provider_healthy(self):
+        gw, store, _session, _notes = build()
+        self._timeout_session(gw)
+        gw.chat(ModelRequest(messages=[{'role': 'user', 'content': 'hi'}], model='x'),
+                kind='memory_curate', session_key='t')
+        states = {p.name: st for p, st in gw._pairs}
+        for name in ('p1', 'p2'):
+            self.assertTrue(states[name].healthy, f'{name} 被提炼超时judged死了')
+        self.assertEqual(states['p1'].fail_count, 0, '不该累积 fail_count')
+
+    def test_chat_timeout_still_marks_provider(self):
+        """聊天超时仍然算渠道故障（只有后台任务被豁免）。"""
+        gw, store, _session, _notes = build(fail_threshold=1)
+        self._timeout_session(gw)
+        gw.chat(ModelRequest(messages=[{'role': 'user', 'content': 'hi'}], model='x'),
+                kind='chat', session_key='t')
+        states = {p.name: st for p, st in gw._pairs}
+        self.assertFalse(states['p1'].healthy, '聊天超时应该判死')
+
+
+class NotifyCooldownTest(unittest.TestCase):
+    """「全挂」通知必须走冷却——以前切兜底那条路径是裸发的，挂一次发一条。"""
+
+    def test_repeated_all_down_notifies_once(self):
+        gw, store, session, notes = build(notify_cooldown_seconds=600)
+        ask(gw)
+        self.assertEqual(len(notes), 1)
+        ask(gw)                       # 还在冷却里
+        self.assertEqual(len(notes), 1, '冷却期内不该再发一条')
+        # 冷却过后可以再发
+        gw._last_down_notify = 0.0
+        ask(gw)
+        self.assertEqual(len(notes), 2)
 
 
 if __name__ == '__main__':

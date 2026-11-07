@@ -110,6 +110,12 @@ REST_TAG_RE = re.compile(
 )
 # 模型可能写 OP 或 CQ 两种形态的 @，统一归一化
 AT_TAG_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)[^\]]*\]')
+# 入参侧：@码 → @名字（第二组是为了把 `,name=…` 取出来，见 op_codes_to_plain）
+AT_CODE_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)((?:,[^\]]*)?)\]')
+# 输出侧：模型爱写 `【@123456】` / `【@某人】`，括号+数字对读者毫无意义
+AT_BRACKET_RE = re.compile(r'[\[【［]\s*@\s*([^\]】］\s]{1,40})\s*[\]】］]')
+# 输出侧：没括号的光杆 @数字（`@2309394954 我错了`）
+AT_BARE_NUMBER_RE = re.compile(r'(?<![\w@])@(\d{5,12})(?!\d)')
 FENCE_RE = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
 # 模型表示「这次不回复」的标记（主动搭话用 SKIP_ACTIVE，另兼容常见写法）。
@@ -193,8 +199,57 @@ def audit_reply(text: str) -> str:
     return ''
 
 
+# ===== 神职头衔削弱（2026-11 新增，防 QQ 内容风控）=====
+# 为什么要这一层：v2.9.0 世界书上线后她身边全是教会设定，跟人玩「封官过家家」时
+# 开始自称「本教皇」「本大主教」，还顺手给别人封大主教。
+# 线上实测（turns 表 715 条回复）：自称神职高位 44 条 = 6.2%，且集中在同一分钟连发十几条。
+# 「自称宗教领袖」是 QQ 内容风控最敏感的一类，成串命中后果不可逆——消息发出去就收不回来。
+#
+# 口径（很重要）：**只削头衔，不删背景**。修女、教会、祈祷、礼拜堂、净化术是她的职业和
+# 住处，一个字都不动；教皇／大主教／主教／圣女／祭司／先知这几个「位置」才是问题。
+# 她想过家家的瘾照样过——换成世俗头衔（本队长／本店长／本大魔王）风控不管。
+#
+# 为什么是替换而不是整条不发：这条只是玩梗过火，不是错误输出。
+# 整条砍掉的代价是她突然不说话（用户那边看起来像坏了），替换之后语义还在，
+# 而且「本大主教」→「本小姐」的中二感一点没丢。
+#
+# 顺序有讲究：`大主教大人` 包含 `主教大人`，必须长的在前，否则会替成「大大人」。
+RELIGION_SELF_TITLE = (
+    ('本大主教', '本小姐'),
+    ('本教皇', '本小姐'),
+    ('本主教', '本小姐'),
+    ('本圣女', '本小姐'),
+    ('本祭司', '本小姐'),
+    ('本先知', '本小姐'),
+)
+RELIGION_ADDRESS_TITLE = (
+    ('大主教大人', '大人'),
+    ('教皇大人', '大人'),
+    ('主教大人', '大人'),
+    ('圣女大人', '大人'),
+    ('祭司大人', '大人'),
+)
+
+
+def sanitize_religion(text: str) -> tuple[str, int]:
+    """把「自称神职高位」换掉，返回 (新文本, 替换处数)。
+
+    只处理她**自称**和**称呼对方**这两种明确形态；修女／教会／祈祷这些背景词一律不动
+    ——那是她的职业与住处，去掉就不是歌伊了。
+    """
+    if not text:
+        return text, 0
+    hits = 0
+    for pattern, replacement in RELIGION_SELF_TITLE + RELIGION_ADDRESS_TITLE:
+        count = text.count(pattern)
+        if count:
+            text = text.replace(pattern, replacement)
+            hits += count
+    return text, hits
+
+
 # ===== 「把写稿备忘当台词发出去」检测（2026-11-01 线上实测）=====
-# 小群 200000005，一条 B 站愚人节剧情视频触发的**主动搭话**，模型把写给自己的提纲整段发了出去：
+# 小群 957309761，一条 B 站愚人节剧情视频触发的**主动搭话**，模型把写给自己的提纲整段发了出去：
 #
 #     （或者顺着刚才聊的边狱话题发出来的），作为歌伊，可以结合愚人节剧情被创飞的梗、
 #     或者画风突变女仆卡戎/马娘那些离谱镜像世界来吐槽或搭话。
@@ -430,11 +485,28 @@ def collapse_duplicate_lines(text: str) -> str:
     return '\n'.join(kept)
 
 
-def op_codes_to_plain(text: str) -> str:
-    """把收到的码转成模型能看懂的标记（入参前清洗，OP 为主、兼容 CQ）。"""
+def op_codes_to_plain(text: str, names: dict | None = None) -> str:
+    """把收到的码转成模型能看懂的标记（入参前清洗，OP 为主、兼容 CQ）。
+
+    `@` 一律折成 **`@名字`**：一开始这里写的是 `【@<id>】`，等于把一串数字喂给模型，
+    模型照猫画虎，自己回复里也开始 `【@2309394954】`（2026-11-04 线上原话）。
+    QQ 的 `[OP:at,id=…,name=…]` 本来就带昵称，没理由丢掉；
+    实在没有昵称（少数协议端不上报）才退成 `@某用户`，绝不再吐数字。
+    """
     if not text:
         return ''
-    text = re.sub(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)[^\]]*\]', r'【@\1】', text)
+
+    def _at(match: re.Match) -> str:
+        ident = match.group(1)
+        rest = match.group(2) or ''
+        for part in rest.split(','):
+            part = part.strip()
+            if part.startswith('name=') and part[5:].strip():
+                return '@' + part[5:].strip()
+        known = (names or {}).get(str(ident))
+        return '@' + known if known else '@某用户'
+
+    text = AT_CODE_RE.sub(_at, text)
     text = re.sub(r'\[(?:OP|CQ):image[^\]]*\]', '【图片】', text)
     text = re.sub(r'\[(?:OP|CQ):face[^\]]*\]', '【表情】', text)
     text = re.sub(r'\[(?:OP|CQ):record[^\]]*\]', '【语音】', text)
@@ -714,6 +786,12 @@ class Renderer:
             return _drop()
         # 同一句话被抄了两遍（「先想、再答」的典型副作用）
         text = collapse_duplicate_lines(text)
+        # 神职头衔削弱：放在审计之前，让审计看到的就是最终要发出去的文本
+        if self.config.get('religion_guard_enabled', True):
+            text, religion_hits = sanitize_religion(text)
+            if religion_hits:
+                logger.warning('已削弱神职头衔 %d 处（防内容风控）：%r',
+                               religion_hits, text[:100])
         # 回复审计：必须放在表情码替换**之前**——替换之后正文里会带上我们自己生成的
         # file:/// 本机路径，那时候再审计就是自己拦自己。
         if self.config.get('reply_audit_enabled', True):
@@ -745,7 +823,34 @@ class Renderer:
             text = CQ_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
             if text == before:
                 break
-        # 剥除称呼时误带的纯数字 QQ 账号（例如 "伊尔达(2397087988)" -> "伊尔达"）
+        # 模型会把「@某人」写成【@数字】——她是照着上下文里 `【@<id>】` 的旧格式学的
+        # （2026-11-04 线上原话：`【@2309394954】我刚才明明讲了流血电弧…`）。
+        # 数字对群里读者没有意义，所以这里统一收口：
+        #   @到当前发言人 → 他的昵称；不认识的人 → @某用户；括号一律去掉。
+        source = text
+
+        def _at_text(match: re.Match) -> str:
+            token = (match.group(1) or '').strip()
+            if token.isdigit():
+                if token == str(msg.sender_id) and msg.sender_name:
+                    shown = '@' + msg.sender_name
+                else:
+                    shown = '@某用户'
+            else:
+                shown = '@' + token
+            # 去掉 】之后要补一个空格，否则「@某人我刚才…」会糊在一起
+            nxt = source[match.end():match.end() + 1]
+            if nxt and not nxt.isspace() and nxt not in '，。！？、；：,.!?;:）)」』】':
+                shown += ' '
+            return shown
+
+        text = AT_BRACKET_RE.sub(_at_text, text)
+        text = AT_BARE_NUMBER_RE.sub(
+            lambda m: '@' + msg.sender_name if (m.group(1) == str(msg.sender_id)
+                                                and msg.sender_name) else '@某用户',
+            text,
+        )
+        # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(1000000001)" -> "某人"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张
         session = msg.session.as_text()

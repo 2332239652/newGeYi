@@ -24,7 +24,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.8.10'
+PLUGIN_VERSION = '2.9.9'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -119,10 +119,11 @@ DEFAULT_CONFIG = {
     # providers 留空则退回上面的 api_endpoint / api_key / fast_model 单渠道模式。
     'providers': [],
     'failover': {
-        # 失败 1 次就把当前渠道判死、下一条消息直接走备用渠道。
-        # 之所以敢用 1：/chat 内部本身还对 429/5xx/超时重试过一次（max_retries），
-        # 到这里还失败基本就是渠道真的挂了，让下一条消息再陪它浪费时间没意义。
-        'fail_threshold': 1,             # 连续失败几次判定该渠道不可用（防抖动）
+        # 失败几次判定该渠道不可用（防抖动）。
+        # 2026-11-07 从 1 改成 2：原来"一次超时就判死"，而上游偶发 60s 超时很常见
+        # （实测 star 站在晚上会出现 40~70s 的正常响应），一次抖动就把整条线判死 5 分钟，
+        # 多条线同时抖一下 = 「显示全部掉线」。两次才判死，抗抖动能力翻倍。
+        'fail_threshold': 2,             # 连续失败几次判定该渠道不可用（防抖动）
         'probe_interval_seconds': 300,   # 后台探测间隔（秒）：5 分钟爬一级
         'probe_success_needed': 1,       # 探测成功几次算恢复并切回
         'probe_repair_per_round': 2,     # 每轮顺手体检几个「挂着不可用标签」的低优先渠道
@@ -137,7 +138,11 @@ DEFAULT_CONFIG = {
         # 一次 chat() 的总时长预算（秒）：超过就不再换渠道兜圈。
         # 以前没有这条：5 候选 × 2 轮 × 单渠道超时，最坏能到 8 分钟，
         # 而调度器的看门狗是 300 秒——任务会先被当成「卡死」踢掉。
-        'total_timeout_seconds': 60,
+        # 2026-11-07 从 60 提到 150：60 秒比**单条渠道自己的超时**还小
+        # （provider.timeout 是 45~60s），第一条超时就把预算吃光，
+        # 后面几条根本没机会试——“故障转移”形同虚设，直接判成全挂。
+        # 150 秒 ≈ 两条线各超一次 + 第三条有机会回；仍在 300 秒看门狗之内。
+        'total_timeout_seconds': 150,
         # 轮满了还全挂 → 切到这个渠道并**锁定**（不再尝试其它渠道），
         # 直到骰主「切换渠道 <名称>」手动切回。空字符串 = 不降级，只发通知。
         'last_resort_provider': 'official-chat',
@@ -165,20 +170,87 @@ DEFAULT_CONFIG = {
     'mention_on_at_all': False,
     'ignore_sender_ids': [],
     'private_enabled': False,
+    # ===== 私聊闸门（并发保护）=====
+    # 私聊以前是「每句都回」，调度器只有 6 个 worker，人一多就排队、表现为"她不理人"。
+    # 下面这几个开关是同一个目的：把"每句都回"降级成可控的频次。
+    # 只在命中触发词时回应（triggers + private_trigger_extra + assistant_name）。
+    # 关掉时保持旧行为（私聊每句都回）。没命中的消息仍进记忆缓冲，她知道你在说什么。
+    'private_trigger_only': False,
+    # 私聊额外的触发词（不想动 triggers 时用这个，例如 ['在吗', '歌伊歌伊']）
+    'private_trigger_extra': [],
+    # 同一个人两条回复之间的最小间隔（秒）；期间到达的消息直接丢，不排队
+    'private_min_interval': 4,
+    # 连发达标：window 秒内超过 max 条就静默（防"连发十条追着问"）
+    'private_burst_window': 15,
+    'private_burst_max': 4,
+    # 每日限额：单人每天最多回几条 / 全体私聊每天最多回几条（0=不限）。
+    # 后者才是真正管并发的那个闸——前两个只压单个人的频率。
+    #
+    # 2026-11-07 重新分配（骰主反馈「有人太热情，一天就打满 300」）：
+    # 拉出 11-06 的真实分布后看得很清楚——12 个人 317 条，**前两名占了 50.5%**
+    # （87 + 73），前六名占 80%，中位数只有 16 条。所以瓶颈不是总量不够，
+    # 是分配极不均：两个人能把公共额度吃光，后面来的人一条都排不上。
+    #   · 单人 100 → 60：第 3 名才 34 条，60 已经覆盖 99% 的人；
+    #   · 全局 300 → 400：给更多人留位置（14 人 × 28 条 ≈ 392）；
+    #   · 再加一段「拥挤收紧」：全局用到 70% 之后，单人上限临时压到 35，
+    #     保证晚来的人还有得聊。平时完全不生效。
+    'private_daily_quota': 60,
+    'private_daily_quota_global': 400,
+    # 拥挤阈值：全局用量超过 总量×该比例 就开始收紧（0=不收紧）
+    'private_quota_squeeze_at': 0.7,
+    # 收紧后的单人上限（0=不收紧）
+    'private_quota_squeeze': 35,
     'passive_enabled': True,
     'active_enabled': True,
     'route_debug': False,
     'worldbook_enabled': False,
+    # ===== 私聊 galgame：好感度 / 关系阶段（设计见 docs/GALGAME_PLAN.md）=====
+    # 总开关。关着时私聊和以前完全一样；世界书里 min_stage>0 的深层设定也不会放行（主人除外）。
+    'galgame_enabled': False,
+    # 影子模式：评审照常运行并写入 relationship_log，但**不生效**（只有"每天来"的小奖励会计分）。
+    # 先开着观察一两周、确认评审口径没问题，再关掉让分数真正生效。
+    'galgame_shadow': True,
+    # 主人豁免：不评分、不注入关系块，世界书按最高阶段放行。
+    'galgame_owner_exempt': True,
+    # 额外豁免名单（role_prompt 里写死的主人 QQ；owner_ids 里的人也自动豁免）
+    'galgame_exempt_ids': ['2332239652'],
+    # 评审用的模型（留空沿用 fast_model）；它走 kind='affection'，可用 affection_provider 指到便宜渠道
+    'galgame_judge_model': '',
+    'galgame_judge_max_tokens': 1024,
+    'affection_provider': '',
+    # 轻微越界的宽容档（2026-11-07）：评审判「亲密程度超前」时，如果只超了这么多档以内，
+    # **不扣分**，只记一笔"轻微越界"，让她下一轮有点被打扰到的小反应。
+    # 为什么：实测 41 条扣分全部发生在 stage 0/1，其中 30 条是 L2 = 朋友间正常语气
+    # （"你真可爱""给你比心"）。全按越界扣，等于每个新用户第一句话就踩雷。
+    # 设为 0 = 恢复旧行为（超前一点也扣分）。
+    'galgame_mild_gap': 1,
+    # 短于这么多字（去标点后）的消息不送评审（"嗯""哦"）    'galgame_judge_min_chars': 4,
+    # 低于该阶段时，群聊印象/事实不会带进私聊（互通记忆开着也一样）
+    'galgame_cross_memory_min_stage': 2,
+    # 难度旋钮（长度必须是 6，对应阶段 0~5；写错会自动回退默认值）：
+    'galgame_thresholds': [0, 15, 50, 110, 190, 280],   # 进入各阶段所需分数
+    'galgame_min_days': [0, 1, 3, 7, 14, 21],           # 进入各阶段所需的"有效日"
+    'galgame_daily_cap': [12, 12, 12, 10, 9, 8],        # 各阶段每日最多加几分
+    # 同一个标签（care/share/humor/…）每天最多记几次分。
+    # 2026-11-06 从 1 改成 2：以前同一标签当天第二次起要减掉「已记过几次」，
+    # 结果是「第一次 +1、之后全 0」，实测大多数人一天只能加 3~5 点，升一档要一周。
+    # 现在改成每天两次、各自独立计分（第二次不折损），第三次起归零。
+    'galgame_tag_daily_limit': 2,
     'memory_enabled': True,
     # 注意：`auto_memory_enabled` 已经废除了——它从 v2.5 起就没有任何代码读，
     # 用户设 true 以为开了自动记忆，实际生效的一直是 memory_curator_enabled。
     # load_config 会把只写了旧键的老配置迁移成 memory_curator_enabled（见 _migrate_legacy_keys）。
     # ===== 自动记忆：批量提炼 =====
     'memory_curator_enabled': True,
-    # 私聊内容要不要进长期记忆：默认**不进**（隐私优先）。
-    # 以前 buffer_user 不分群聊私聊，私聊内容会被提炼进库、再作为"记忆"喂给模型，
-    # 而且关掉私聊之后旧缓冲还在（2026-11-03 审查发现）。
+    # 私聊与群聊记忆库互通开关：默认关闭（私聊与群聊记忆独立隔离）。
+    # 开启后，私聊里能读到群聊的记忆；是否**反向**也开放，由下面那个键决定。
+    # 关闭时，私聊和群聊各自单独提取记忆和印象，互不影响。
     'memory_private_enabled': False,
+    # 反向共享：**群聊里能不能读到私聊的记忆**（默认关）。
+    # 关着 = 单向共享（私聊知道群里聊了什么，群里不知道私聊里的事）；
+    # 这是 2026-11-05 骰主要的口径：私聊能接住群聊的话题，
+    # 又不会出现「群里好几个恋爱对象」的尴尬。
+    'memory_private_to_group': False,
     'memory_curate_messages': 40,
     'memory_curate_idle_seconds': 900,
     'memory_curate_max_messages': 40,
@@ -256,8 +328,35 @@ DEFAULT_CONFIG = {
     # 让**当前会话**安静一段时间，并私聊通知骰主。到期自动恢复。
     'rest_enabled': True,
     'rest_minutes': 10,
+    # 私聊里的退场是否无限期（默认开）：一对一骚扰是「同一个人一直追着说」，
+    # 等她自动回来=同一套话术再来一遍；只认骰主发「解除静默」。
+    'rest_private_forever': True,
+    # ===== 作息（休眠）=====
+    # 她 24 小时在线，凌晨三点还在秒回——太假了。开起来之后按这段作息走：
+    #   ① 睡前 sleep_pre_minutes 分钟内，提示词里加一段"快要去睡了"，让她自己收尾；
+    #   ② 休眠时段内第一次被叫（@ / 私聊）：回一句"睡着呢"，之后完全缄默；
+    #   ③ 休眠期间不主动搭话、不调模型（省 token，也避免半夜说话）。
+    # 时间一律本地时间；跨午夜（23:30-07:00）按区间处理。
+    # ⚠️ 骰主指令永远不受休眠影响（否则没法远程关掉它）。
+    'sleep_enabled': False,
+    'sleep_window': '23:30-07:00',
+    'sleep_pre_minutes': 30,
+    'sleep_notice_once': True,
+    'sleep_notice_text': '（迷迷糊糊翻了个身）唔……歌伊已经睡下了……有事明天说嘛……',
+    'sleep_owner_exempt': False,
+    # ===== 本地面板 =====
+    # OlivOS 的「插件页面」是 1.0.x 才有的能力（webui_config 消息桥）。核心没有它时，
+    # 插件自己起一个只绑 127.0.0.1 的小服务把同一套页面挂起来；换端口改 port，
+    # 或者干脆 false 关掉（例如升级到 1.0.x 之后走原生入口）。
+    'panel_local_enabled': True,
+    'panel_local_port': 18765,
     'reply_audit_enabled': True,
     'reply_audit_fallback': '',
+    # 神职头衔削弱：她跟人玩「封官过家家」时会自称「本教皇」「本大主教」，
+    # 甚至给别人封大主教——这是 QQ 内容风控最敏感的一类（2026-11 实测：715 条
+    # 回复里 6.2% 命中，且成串连发）。开着只削头衔，不删任何设定：
+    # 修女／教会／祈祷／礼拜堂照旧说，见 presentation/renderer.sanitize_religion。
+    'religion_guard_enabled': True,
     'incomplete_hold_seconds': 8,
     'incomplete_tails': [],
     # 私聊使用 SQLite 连续历史；群聊使用下面的实时旁观窗口
@@ -343,8 +442,17 @@ DEFAULT_CONFIG = {
     'group_quota_max': 250,
     'group_quota_default': 60,
     # ===== 记忆容量 =====
-    'memory_max_facts_per_user': 12,
-    'memory_max_facts_per_group': 600,
+    # 2026-11-05：从 12/600 放宽到 50/3000。为什么敢放宽——
+    # ① 每条事实写入时带 3-6 个检索关键词，换说法也能命中，不再靠"少存"来保精度；
+    # ② 注入端仍是每轮 12 条（私聊还要过阶段门 2~12），放宽的只是"记得住多久"；
+    # ③ 视频分享单独按条数封顶（memory_video_share_keep），不会再把人的记忆占满。
+    'memory_max_facts_per_user': 50,
+    'memory_max_facts_per_group': 3000,
+    # 召回候选池：只按重要度取，量大了会把"低重要度但正好切题"的挡在门外，
+    # 所以池子放大 + 关键词预取一次（见 MemoryRepository.recall）。
+    'memory_fact_candidates': 400,
+    # 视频分享类事实每人保留几条（bili 插件按事件写，每条一条，不封顶会占满）
+    'memory_video_share_keep': 3,
     'memory_curate_known_facts': 5,    # 提炼时给每个说话人带几条现有事实去判重
 }
 

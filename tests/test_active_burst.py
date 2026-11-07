@@ -58,6 +58,11 @@ class ActiveBurstTest(unittest.TestCase):
 
         self.rt = Runtime()
         self.rt.prompt_builder.set_role_prompt('你是歌伊，一个测试用人设。')
+        # 这一组用例断言的是"真的发出去了"，所以必须显式关掉影子模式。
+        # 以前它靠插件目录里遗留的 config.json（active_shadow: false）兜着，
+        # 一旦在**干净副本**（不含那个遗留文件）里跑，两个用例就会红——
+        # 打包发布时必须能独立跑绿，所以这里自己钉死，不依赖环境。
+        self.rt.config['active_shadow'] = False
         # 把「暴击起手」压到几乎不可能：PRD 本来有 8.5% 的概率直接从 L1 开始，
         # 断言 [0,1,2] 就变成掷骰子（整套跑的时候偶发失败过一次）。
         self.rt.config['active_prd_crit_rate'] = 0.001

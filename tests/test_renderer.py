@@ -31,6 +31,7 @@ from newGeYi.presentation.renderer import (  # noqa: E402
     Renderer,
     is_silent_reply,
     looks_like_plan,
+    op_codes_to_plain,
 )
 
 # 线上原样（去掉了群号等无关内容）
@@ -73,7 +74,7 @@ class OutlineDraftTest(unittest.TestCase):
         self.assertFalse(out.startswith('I should'), out)
         self.assertIn('诶？今天是万圣节吗？', out)
 
-        # ② 冒号 + 引号收尾（2026-10-30 大群 200000002，原文照抄）
+        # ② 冒号 + 引号收尾（2026-10-30 大群 1013491196，原文照抄）
         raw2 = ('Here\'s what I\'ll say: "哼哼，这种事情不用搜也是刻在直觉里的嘛！'
                 '而且歌靡难道不觉得现在的我才是最棒的吗～"')
         out2 = self.renderer._strip_thinking_process(raw2)
@@ -114,7 +115,7 @@ class OutlineDraftTest(unittest.TestCase):
             self.assertFalse(is_silent_reply(sample), f'正常回复被判成哨兵: {sample!r}')
 
 
-# 2026-11-01 线上原样（小群 200000005，B 站愚人节剧情视频触发的主动搭话）：
+# 2026-11-01 线上原样（小群 957309761，B 站愚人节剧情视频触发的主动搭话）：
 # 模型把「写给自己的写稿备忘」整段发了出去
 PLAN_LEAK = (
     '（或者顺着刚才聊的边狱话题发出来的），作为歌伊，可以结合愚人节剧情被创飞的梗、'
@@ -125,12 +126,12 @@ PLAN_LEAK = (
 )
 
 SESSION = SessionKey(bot_hash='hash', platform='qq', sdk='onebot',
-                     session_type='group', host_id='-', target_id='200000005')
+                     session_type='group', host_id='-', target_id='957309761')
 
 
 def fake_msg() -> IncomingMessage:
     return IncomingMessage(
-        session=SESSION, message_id='1', sender_id='3254825603', sender_name='赛博刀子',
+        session=SESSION, message_id='1', sender_id='1000000001', sender_name='赛博刀子',
         text='【[零协汉化]仲春夜之梦——2023边狱公司愚人节特别活动剧情】',
         raw_text='', is_group=True, mentioned_bot=False,
         event=None, proc=None, arrival_seq=1, sender_is_bot=False,
@@ -178,6 +179,62 @@ class PlanLeakTest(unittest.TestCase):
             rendered = self.renderer.render(sample, fake_msg())
             self.assertIsNotNone(rendered, f'正常台词被整条丢掉: {sample!r}')
             self.assertTrue(rendered.text.strip(), f'正常台词被清空: {sample!r}')
+
+
+class AtCodeTest(unittest.TestCase):
+    """@ 不许再变成一串数字。
+
+    2026-11-04 线上原话：`【@2309394954】我刚才明明讲了流血电弧和毒震波呀！`
+    —— 模型是照着上下文里 `【@<id>】` 的旧格式学的：`op_codes_to_plain` 以前把
+    `[OP:at,id=…,name=梦语熙]` 里的昵称丢掉，只吐 id。
+    """
+
+    def setUp(self):
+        self.renderer = Renderer({})
+
+    # ---- 入参：OP / CQ 的 @ 码 → @名字 ----
+    def test_op_at_uses_name(self):
+        self.assertEqual(op_codes_to_plain('[OP:at,id=2933419998,name=歌伊] 你好'),
+                         '@歌伊 你好')
+
+    def test_cq_at_uses_name(self):
+        self.assertEqual(op_codes_to_plain('[CQ:at,qq=123,name=小明] 在吗'),
+                         '@小明 在吗')
+
+    def test_at_without_name_is_not_a_number(self):
+        self.assertEqual(op_codes_to_plain('[OP:at,id=123] 在吗'), '@某用户 在吗')
+        self.assertEqual(op_codes_to_plain('[OP:at,id=123]', names={'123': '阿花'}), '@阿花')
+
+    def test_quoted_message_still_tagged(self):
+        self.assertEqual(
+            op_codes_to_plain('[OP:reply,id=1][OP:at,id=1000000001,name=测试用户] 继续'),
+            '【引用消息】@测试用户 继续')
+
+    # ---- 输出：模型自己写的【@数字】要收口 ----
+    def test_render_numeric_at_becomes_sender_name(self):
+        out = self.renderer.render('【@1000000001】我错了', fake_msg())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '@赛博刀子 我错了')
+
+    def test_render_unknown_numeric_at(self):
+        out = self.renderer.render('【@999999】？', fake_msg())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '@某用户？')
+
+    def test_render_bare_numeric_at(self):
+        out = self.renderer.render('@1000000001 我错了', fake_msg())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '@赛博刀子 我错了')
+
+    def test_render_bracket_at_with_name(self):
+        out = self.renderer.render('【@赛博刀子】好呀', fake_msg())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '@赛博刀子 好呀')
+
+    def test_plain_text_is_untouched(self):
+        out = self.renderer.render('（探头）在呢！', fake_msg())
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '（探头）在呢！')
 
 
 if __name__ == '__main__':

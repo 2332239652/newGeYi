@@ -31,6 +31,15 @@ class MessageRouter:
         val = self.r.store.get_setting(f'group_passive:{msg.session.as_text()}')
         return val != '0'
 
+    def _private_gate(self):
+        """私聊闸门实例挂在 runtime 上；没有就现建一个（测试用的最小 runtime）。"""
+        gate = getattr(self.r, 'private_gate', None)
+        if gate is None:
+            from ..runtime.private_gate import PrivateGate
+            gate = PrivateGate(self.r.store, self.r.config)
+            self.r.private_gate = gate
+        return gate
+
     # 注：这里曾经还有一个 `_group_active_on()`，跟 attention.py 里
     # `store.get_setting(f'group_active:{session_key}') == '0'` 是同一件事的两份实现，
     # 而且零调用（真正的判断一直在闸门里）。2026-10-30 删除，避免两份实现走样。
@@ -70,7 +79,14 @@ class MessageRouter:
         # 以前这里只看「有没有 @ / 有没有触发词」，结果**私聊里只要不含「歌伊」就整条丢掉**：
         # 线上实测 2026-11-01 20:47~20:50，'发语音啦'、'狗，修，金，sama~' 这样的私聊
         # 一句都没回（对方只好补一句「歌伊发语音正式一点啦」才被接住）。
-        directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text) or not msg.is_group)
+        # 2026-11-05 起可以按需切回"只在触发词命中时回应"（private_trigger_only）：
+        # 私聊多了并发扛不住时，把"每句都回"降级成"叫到才回"，其余消息照样进记忆。
+        if msg.is_group:
+            directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text))
+        elif self._private_gate().trigger_only():
+            directed = bool(msg.mentioned_bot or self._private_gate().hit_trigger(msg.text))
+        else:
+            directed = True
         gate = self._gate() if msg.is_group else None
         if gate is not None:
             # 每一条群消息都要过一遍：有人接话要记账，观察窗口到期要结算退避
@@ -82,15 +98,58 @@ class MessageRouter:
             passive_allowed = bool(cfg.get('private_enabled', False))
         self._debug(msg, directed, passive_allowed, '')
 
+        # 休眠：睡着时不接话、也不主动。第一次被叫回一句「睡着呢」，之后完全缄默。
+        # 为什么放在这里：骰主指令在上面 `commands.try_handle` 就已经返回了，
+        # 走不到这一层——否则他半夜想「休眠关」会自己被自己锁死。
+        # 消息本身仍会进旁观窗口和记忆缓冲（`handle_message` 里在 route 之前写的），
+        # 所以醒来她知道夜里有人找过她。
+        sleep = getattr(self.r, 'sleep', None)
+        if sleep is not None:
+            try:
+                sleep_phase = sleep.phase()
+            except Exception:  # noqa: BLE001 - 作息判断挂了就照常回，别把人整哑
+                logger.debug('休眠判断失败，按醒着处理', exc_info=True)
+                sleep_phase = 'off'
+            if sleep_phase == 'asleep':
+                owner_exempt = bool(cfg.get('sleep_owner_exempt', False)) and self._is_owner(msg)
+                if not owner_exempt:
+                    self._debug(msg, directed, passive_allowed, '休眠中')
+                    if directed and passive_allowed:
+                        try:
+                            first = sleep.notice_once_now(session_key)
+                        except Exception:  # noqa: BLE001
+                            first = False
+                        if first:
+                            notice = getattr(self.r, 'send_sleep_notice', None)
+                            if callable(notice):
+                                notice(msg)
+                    return
+
         # 被点名（@ 或命中触发词）：只走被动回复；
         # 被动被关时保持安静，不把「被点名」当成主动搭话的机会
         if directed:
             if passive_allowed:
+                # 私聊再过失控三道闸（触发词已在上面判过：连发间隔 / 连发条数 / 每日限额）。
+                # 闸门只挡"排一次回复"，消息本身照常进记忆缓冲——她知道你在说啥，只是不回。
+                if not msg.is_group:
+                    allowed, why = self._private_gate().allow(msg)
+                    if not allowed:
+                        if why.startswith('quota'):
+                            logger.info('私聊额度用尽（%s），本条不回 | %s',
+                                        why, msg.session.as_text()[-12:])
+                        else:
+                            logger.debug('私聊闸门拦住（%s）| %s', why,
+                                         msg.session.as_text()[-12:])
+                        self._debug(msg, directed, passive_allowed, '私聊闸门：' + why)
+                        return
                 # 提交失败（队列满）以前是彻底静默的：用户只看到「她不理我」，
                 # 日志里连一行都没有。这里补一条，和 scheduler 里的告警对得上。
                 if not self.r.scheduler.submit(msg, kind='passive'):
                     logger.warning('被动回复没能进队列（会话积压已满）| %s | %r',
                                    msg.session.as_text()[-16:], (msg.text or '')[:30])
+                elif not msg.is_group:
+                    # 只有真正排进去了才记账（队列满不扣额度）
+                    self._private_gate().commit(msg.session.as_text())
             elif self.r.config.get('route_debug'):
                 logger.info('被点名但本群被动回复已关，保持安静 | %s', msg.session.as_text()[-16:])
             return
@@ -112,6 +171,14 @@ class MessageRouter:
                 if not self.r.scheduler.submit(msg, kind='active'):
                     logger.warning('主动搭话没能进队列（会话积压已满）| %s',
                                    msg.session.as_text()[-16:])
+
+    def _is_owner(self, msg: IncomingMessage) -> bool:
+        """是不是主人（sleep_owner_exempt 用）。取不到就按"不是"，宁可她睡着。"""
+        perms = getattr(self.r, 'permissions', None)
+        try:
+            return bool(perms is not None and perms.is_owner(msg))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _features(self, msg: IncomingMessage) -> Features:
         """打分特征：全部本地就能算出来，不查库、不调模型。"""

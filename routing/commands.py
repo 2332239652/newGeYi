@@ -81,15 +81,21 @@ class CommandRouter:
             '[状态] 歌伊状态 | 今日用量',
             '[对话] 我的记忆 / 查看记忆 | 忘了我',
             '[世界书] 世界书状态',
+            '[私聊] 关系（看看她现在怎么看你）',
             '',
             '[骰主/主人] 渠道状态 | 切换渠道 <名称/序号> | 切换渠道 自动',
-            '[骰主/主人] 解除静默（提前结束本群的自我保护静默） | 测试通知',
+            '[骰主/主人] 解除静默 [号码]（私聊退场是无限期，只能手动放） | 静默列表',
+            '[骰主/主人] 面板地址（本机网页调试台，核心无 OlivOS WebUI 时用这个）',
+            '[骰主/主人] 测试通知',
             '[骰主/主人] 记忆状态 | 导出记忆',
             '[骰主/主人] 全局被动开/关 | 开启/关闭私聊',
             '[骰主/主人] 主动搭话开/关（全局） | 搭话观察 | 搭话影子开/关',
             '[骰主/主人] 设置key <API Key> | 重置上下文 | 重载设定',
             '[骰主/主人] 添加/删除触发词 <词> | 查看触发词',
             '[骰主/主人] 世界书开/关 | 世界书重载',
+            '[骰主/主人] 好感度开/关 | 好感度影子开/关 | 关系详情 <QQ> | 关系设置 <QQ> <0-5> | 关系重置 <QQ>',
+            '[骰主/主人] 私聊用量（今日额度与触发词模式） | 私聊触发词开/关',
+            '[骰主/主人] 休眠状态 | 休眠开/关 | 休眠时间 <HH:MM-HH:MM> | 休眠重置',
             '[骰主/主人] 图片理解开/关',
             '[骰主/主人] 表情包状态 | 开启/关闭表情包 | 加载表情包 <路径> | 表情包重载',
             '[骰主/主人] 语音状态 | 测试语音 [情绪] [日文] | 开启/关闭语音 | 语音重载',
@@ -149,9 +155,12 @@ class CommandRouter:
         try:
             rest = getattr(self.r, 'rest', None)
             left = rest.remaining(msg.session.as_text()) if rest else 0
-            if left:
+            if left < 0:
                 reason = rest.reason(msg.session.as_text()) or '未说明'
-                rest_line = f'自我保护静默: 本群还剩 {left // 60} 分 {left % 60} 秒（{reason}）'
+                rest_line = f'自我保护静默: 本会话无限期（{reason}），发「解除静默」恢复'
+            elif left:
+                reason = rest.reason(msg.session.as_text()) or '未说明'
+                rest_line = f'自我保护静默: 本会话还剩 {left // 60} 分 {left % 60} 秒（{reason}）'
             else:
                 rest_line = '自我保护静默: 未触发'
         except Exception:  # noqa: BLE001
@@ -205,8 +214,81 @@ class CommandRouter:
                 f'原因看 OlivOS 日志里「通知发不出去」那条；最常见是 config.json 的 '
                 f'owner_ids 是空的，填上你的 QQ 号再「重载设定」')
 
+    @staticmethod
+    def _rest_target_parts(session_key: str) -> tuple:
+        """解析会话键 → (种类, 号码)。
+
+        `models.SessionKey.as_text()` 用的是**冒号**：`h:qq:onebot:private:-:9333111`。
+        从右边切三段，前面就算带冒号也不影响（类名/机器人哈希里偶尔会有怪字符）。
+        """
+        parts = str(session_key or '').rsplit(':', 3)
+        kind = parts[1] if len(parts) == 4 else ''
+        target = parts[-1] if parts else str(session_key)
+        return kind, target
+
+    @classmethod
+    def _rest_target_label(cls, session_key: str) -> str:
+        kind, target = cls._rest_target_parts(session_key)
+        return f'私聊 {target}' if kind == 'private' else f'群 {target}'
+
+    def _cmd_rest_list(self, msg: IncomingMessage) -> str:
+        """骰主可查：现在都有谁被静默着（私聊的无限期静默只能这样发现）。"""
+        rest = getattr(self.r, 'rest', None)
+        if rest is None:
+            return '静默模块未初始化'
+        rows = rest.resting_sessions()
+        if not rows:
+            return '当前没有任何会话处于静默中'
+        lines = [f'🛑 正在静默的会话 {len(rows)} 个：']
+        for key, left, reason, forever in rows[:20]:
+            span = '无限期（等手动解除）' if forever else f'{left // 60} 分 {left % 60} 秒'
+            lines.append(f'• {self._rest_target_label(key)}｜{span}'
+                         f'{"｜" + reason if reason else ""}')
+        if len(rows) > 20:
+            lines.append(f'…另有 {len(rows) - 20} 个')
+        lines.append('解除：解除静默 <QQ号/群号>；或在该会话里直接发「解除静默」')
+        return '\n'.join(lines)
+
+    def _cmd_clear_rest_any(self, msg: IncomingMessage, target: str) -> str:
+        """骰主按号码解除静默。
+
+        必须存在的原因：私聊退场是无限期的，而「解除静默」只作用于**发命令的那个
+        会话**。陌生人私聊骚扰她之后，那个会话只有对方能"在那里发命令"——骰主的
+        窗口碰不到它，等于永久封口且无法恢复。
+        """
+        rest = getattr(self.r, 'rest', None)
+        if rest is None:
+            return '静默模块未初始化'
+        tid = str(target or '').strip()
+        if not tid.isdigit():
+            return '格式: 解除静默 <QQ号 或 群号>（不带号码就解除当前会话）'
+        cleared = []
+        for key, _left, _reason, _forever in rest.resting_sessions():
+            _kind, target = self._rest_target_parts(key)
+            if target == tid and rest.clear(key):
+                cleared.append(self._rest_target_label(key))
+        if not cleared:
+            return f'没找到 {tid} 的静默记录（发「静默列表」看现在都有谁）'
+        return f'✅ 已解除：{"、".join(cleared)}\n她现在会正常回话了'
+
+    def _cmd_panel_url(self, msg: IncomingMessage) -> str:
+        """骰主自查：本地面板地址（核心没有 OlivOS WebUI 时唯一的入口）。"""
+        server = getattr(self.r, 'panel_server', None)
+        if server is None:
+            return ('本地面板没有在跑：要么 `panel_local_enabled` 被关掉了，'
+                    '要么端口被占用（看日志「本地面板启动失败」）。')
+        url = getattr(server, 'url', '')
+        if not url:
+            return '本地面板未启动（端口可能被占用，改 config.json 的 panel_local_port 或设 0）'
+        return (f'🖥 歌伊调试台（只监听本机）\n{url}\n'
+                f'直接粘到本机浏览器打开；换端口改 panel_local_port，关掉改 panel_local_enabled=false。\n'
+                f'如果核心是 OlivOS 1.0.x，优先用原生「插件页面 → 歌伊调试台」。')
+
     def _cmd_clear_rest(self, msg: IncomingMessage) -> str:
-        """提前解除本会话的自我保护静默（骰主专用）。"""
+        """提前解除本会话的自我保护静默（骰主专用）。
+
+        私聊的静默是**无限期**的，所以这条命令就是唯一的恢复开关。
+        """
         rest = getattr(self.r, 'rest', None)
         if rest is None:
             return '静默模块未初始化'
@@ -216,8 +298,11 @@ class CommandRouter:
         had = rest.clear(session_key)
         if not had:
             return '本会话当前不在静默中'
+        tail = f'{"，" + reason if reason else ""}'
+        if left < 0:
+            return (f'✅ 已解除本会话的无限期静默{tail}\n她现在会正常回话了')
         return (f'✅ 已解除本会话的自我保护静默（原本还剩 {left // 60} 分 {left % 60} 秒'
-                f'{"，" + reason if reason else ""}）\n她现在会正常回话了')
+                f'{tail}）\n她现在会正常回话了')
 
     def _cmd_channels(self, msg: IncomingMessage) -> str:
         gateway = getattr(self.r, 'gateway', None)
@@ -294,21 +379,51 @@ class CommandRouter:
             return '唔……未能获取到你的账号信息哦。'
         session_key = msg.session.as_text()
 
-        # 1. 查找群友高维印象
+        # 1. 查找高维印象（按 scope 隔离；互相能看到时双向呈现）
         impression_text = ''
+        is_group = bool(getattr(msg, 'is_group', True))
+        # 和记忆注入用同一套方向判断：单向共享时，群聊里不该翻出私聊的印象
+        from ..memory.repository import cross_scope_enabled, relative_time
+        cross_enabled = cross_scope_enabled(self.r.config, is_group)
+        primary_scope = 'group' if is_group else 'private'
+
         if self.r.config.get('memory_impression_enabled', True):
             try:
-                imp = self.r.store.get_user_impression(uid)
-                if imp and imp.get('summary'):
-                    impression_text = str(imp['summary']).strip()
+                from ..memory.repository import relative_time
+                imp_parts = []
+                p_imp = self.r.store.get_user_impression(uid, scope=primary_scope)
+                if p_imp and p_imp.get('summary'):
+                    text = str(p_imp['summary']).strip()
+                    stamp = int(p_imp.get('updated_at') or 0)
+                    versions = len(self.r.store.impression_history(uid, scope=primary_scope, limit=200))
+                    meta = f'（{relative_time(stamp)}更新' + (f'，共 {versions} 版）' if versions > 1 else '）') if stamp else ''
+                    tag = '群聊印象' if is_group else '私聊印象'
+                    imp_parts.append(f'🌟 歌伊对你的{tag}{meta}：\n  {text}')
+
+                if cross_enabled:
+                    cross_scope = 'private' if is_group else 'group'
+                    c_imp = self.r.store.get_user_impression(uid, scope=cross_scope)
+                    if c_imp and c_imp.get('summary'):
+                        c_text = str(c_imp['summary']).strip()
+                        c_stamp = int(c_imp.get('updated_at') or 0)
+                        c_versions = len(self.r.store.impression_history(uid, scope=cross_scope, limit=200))
+                        c_meta = f'（{relative_time(c_stamp)}更新' + (f'，共 {c_versions} 版）' if c_versions > 1 else '）') if c_stamp else ''
+                        c_tag = '私聊印象（互通）' if is_group else '群聊印象（互通）'
+                        imp_parts.append(f'🌟 歌伊对你的{c_tag}{c_meta}：\n  {c_text}')
+
+                if imp_parts:
+                    impression_text = '\n'.join(imp_parts)
             except Exception:
                 pass
 
-        # 2. 查找群友事实（包含当前会话事实与跨群全局偏好）
+        # 2. 查找事实（包含当前会话事实与跨群全局偏好，按互通开关召回）
         facts: list[str] = []
         try:
             include_global = self.r.config.get('memory_cross_group_enabled', True)
-            rows = self.r.store.list_user_facts(session_key, uid, limit=20, include_global=include_global)
+            rows = self.r.store.list_user_facts(
+                session_key, uid, limit=20, include_global=include_global,
+                cross_scope=cross_enabled,
+            )
             seen = set()
             for r in rows:
                 f = str(r.get('fact') or '').strip()
@@ -323,7 +438,7 @@ class CommandRouter:
 
         lines = ['【歌伊的小本本 · 记忆档案】']
         if impression_text:
-            lines.append(f'🌟 歌伊对你的印象：\n  {impression_text}')
+            lines.append(impression_text)
         if facts:
             lines.append(f'📝 记住的事（共 {len(facts)} 条）：')
             for f in facts:
@@ -335,12 +450,48 @@ class CommandRouter:
         # 连**全局范围**的事实一起清（跨群偏好存在 session_key='global' 里），
         # 否则换个群她还记得你（2026-11-03 审查发现）。
         count = self.r.memory.clear_user(msg)
+        relationship = getattr(self.r, 'relationship', None)
+        if relationship is not None:
+            relationship.forget(msg.sender_id)        # 关系数据和流水一起清
         return f'✅ 已忘记关于你的 {count} 条记忆（含跨群偏好）'
 
     def _cmd_worldbook_status(self, msg: IncomingMessage) -> str:
         on = self.r.config.get('worldbook_enabled', False)
         count = len(self.r.worldbook.entries)
         return f'世界书: {"开" if on else "关"} | 已加载条目: {count} | 命中关键词才注入，未命中零成本'
+
+    # ------------- 私聊关系（galgame）-------------
+    def _cmd_relation(self, msg: IncomingMessage) -> str:
+        """"关系"：只给阶段名和她的一句感受，不给数字（避免变成刷分攻略）。"""
+        rel = getattr(self.r, 'relationship', None)
+        if msg.is_group:
+            return '这个要私聊我才能说哦……在大家面前，我会害羞的。'
+        if rel is None or not rel.enabled():
+            return '嗯？你想问什么呀？'
+        if rel.is_exempt(msg.sender_id):
+            return '你是我的主人呀，这还用问嘛。'
+        return rel.feeling(msg.sender_id)
+
+    def _cmd_relation_admin(self, msg: IncomingMessage, text: str) -> str:
+        rel = self.r.relationship
+        if text in ('好感度开', '好感度关'):
+            on = text.endswith('开')
+            self._save_and_reload({'galgame_enabled': on})
+            return '✅ 私聊好感度系统已' + ('开启' if on else '关闭')
+        if text in ('好感度影子开', '好感度影子关'):
+            on = text.endswith('开')
+            self._save_and_reload({'galgame_shadow': on})
+            return ('✅ 影子模式开：评审只记账不生效' if on
+                    else '✅ 影子模式关：评审结果开始真实生效')
+        parts = text.split()
+        if parts[0] == '关系详情' and len(parts) == 2:
+            return rel.describe(parts[1])
+        if parts[0] == '关系重置' and len(parts) == 2:
+            rel.reset(parts[1])
+            return f'✅ 已重置 {parts[1]} 的关系（流水保留）'
+        if parts[0] == '关系设置' and len(parts) == 3 and parts[2].isdigit():
+            return '✅ ' + rel.force_stage(parts[1], int(parts[2]))
+        return '用法：关系详情 <QQ> | 关系设置 <QQ> <0-5> | 关系重置 <QQ>'
 
     # ------------- 主人 -------------
     # 「切换模型」已删除：早期「智慧歌伊模式」的快速/推理双模型早就名存实亡，
@@ -580,7 +731,10 @@ class CommandRouter:
     # ------------- 分发 -------------
     _OWNER_CMD_EXACT = {
         '全局被动开', '全局被动关', '开启私聊', '关闭私聊',
+        '私聊用量', '私聊触发词开', '私聊触发词关',
+        '休眠状态', '休眠开', '休眠关', '休眠重置',
         '重置上下文', '重载设定', '世界书开', '世界书关', '世界书重载',
+        '好感度开', '好感度关', '好感度影子开', '好感度影子关',
         '立绘状态', '立绘重载', '开启立绘', '关闭立绘',
         '表情包状态', '表情包重载', '开启表情包', '关闭表情包',
         '主动搭话开', '主动搭话关',
@@ -588,13 +742,16 @@ class CommandRouter:
         '语音状态', '开启语音', '关闭语音', '语音重载', '测试语音',
         '.voice status', '.voice test',
         '渠道状态', '记忆状态', '导出记忆', '搭话观察',
-        '解除静默', '解除本群静默', '测试通知', '通知测试',
+        '解除静默', '解除本群静默', '静默列表', '测试通知', '通知测试',
+        '面板地址', '歌伊面板', '调试台',
         '搭话影子开', '搭话影子关',
         '切换模型',
     }
     _OWNER_CMD_PREFIX = (
         '添加触发词 ', '删除触发词 ', '加载立绘 ', '加载表情包 ', '设置key ', '切换渠道 ', '切换模型 ',
-        '测试语音 ', '.voice test ',
+        '测试语音 ', '.voice test ', '解除静默 ',
+        '关系详情 ', '关系设置 ', '关系重置 ',
+        '休眠时间 ',
     )
 
     @classmethod
@@ -659,6 +816,9 @@ class CommandRouter:
         if text == '忘了我':
             self.r.reply(msg, self._cmd_forget_me(msg))
             return True
+        if text in ('关系', '好感度'):
+            self.r.reply(msg, self._cmd_relation(msg))
+            return True
         if text == '世界书状态':
             self.r.reply(msg, self._cmd_worldbook_status(msg))
             return True
@@ -695,8 +855,70 @@ class CommandRouter:
         if text == '渠道状态':
             self.r.reply(msg, self._cmd_channels(msg))
             return True
+        if text == '私聊用量':
+            gate = getattr(self.r, 'private_gate', None)
+            if gate is None:
+                self.r.reply(msg, '私聊闸门还没初始化（重载一次试试）。')
+            else:
+                key = msg.session.as_text() if not msg.is_group else ''
+                self.r.reply(msg, '【私聊并发保护】\n' + gate.usage_text(key))
+            return True
+        if text in ('私聊触发词开', '私聊触发词关'):
+            on = text.endswith('开')
+            self._save_and_reload({'private_trigger_only': on})
+            gate = getattr(self.r, 'private_gate', None)
+            tip = ('现在私聊只在命中触发词时才回（%s）' % '、'.join(gate.trigger_words())
+                   if on and gate else '现在私聊每句都回')
+            self.r.reply(msg, '✅ ' + tip)
+            return True
+        if text == '休眠状态':
+            sleep = getattr(self.r, 'sleep', None)
+            if sleep is None:
+                self.r.reply(msg, '作息模块还没初始化（重载一次试试）。')
+            else:
+                self.r.reply(msg, '【作息】\n' + sleep.status_text())
+            return True
+        if text in ('休眠开', '休眠关'):
+            on = text.endswith('开')
+            self._save_and_reload({'sleep_enabled': on})
+            sleep = getattr(self.r, 'sleep', None)
+            head = '✅ 休眠已开启' if on else '✅ 休眠已关闭（24 小时都在）'
+            self.r.reply(msg, head if sleep is None else head + '\n' + sleep.status_text())
+            return True
+        if text.startswith('休眠时间'):
+            raw = text[len('休眠时间'):].strip()
+            if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d', raw):
+                self.r.reply(msg, '格式：休眠时间 <HH:MM-HH:MM>，例如「休眠时间 23:30-07:00」\n'
+                                  '（可以跨午夜；起止相同视为不睡）')
+                return True
+            start, end = raw.split('-', 1)
+            if start.strip() == end.strip():
+                self.r.reply(msg, '起止时间相同等于不睡，改用「休眠关」更清楚。')
+                return True
+            self._save_and_reload({'sleep_window': raw})
+            sleep = getattr(self.r, 'sleep', None)
+            self.r.reply(msg, '✅ 休眠时段已改为 %s%s' % (
+                raw, '' if sleep is None else '\n' + sleep.status_text()))
+            return True
+        if text == '休眠重置':
+            sleep = getattr(self.r, 'sleep', None)
+            if sleep is None:
+                self.r.reply(msg, '作息模块还没初始化（重载一次试试）。')
+            else:
+                sleep.reset_notice(msg.session.as_text())
+                self.r.reply(msg, '✅ 本会话的「已提示过」记录清掉了——下次被叫她会再应一句。')
+            return True
+        if text.startswith('解除静默 '):
+            self.r.reply(msg, self._cmd_clear_rest_any(msg, text[len('解除静默 '):]))
+            return True
         if text in ('解除静默', '解除本群静默'):
             self.r.reply(msg, self._cmd_clear_rest(msg))
+            return True
+        if text == '静默列表':
+            self.r.reply(msg, self._cmd_rest_list(msg))
+            return True
+        if text in ('面板地址', '歌伊面板', '调试台'):
+            self.r.reply(msg, self._cmd_panel_url(msg))
             return True
         if text in ('测试通知', '通知测试'):
             self.r.reply(msg, self._cmd_test_notify(msg))
@@ -786,6 +1008,10 @@ class CommandRouter:
             return True
         if text == '世界书重载':
             self.r.reply(msg, self._cmd_worldbook_reload(msg))
+            return True
+        if (text in ('好感度开', '好感度关', '好感度影子开', '好感度影子关')
+                or text.startswith(('关系详情 ', '关系设置 ', '关系重置 '))):
+            self.r.reply(msg, self._cmd_relation_admin(msg, text))
             return True
         # 立绘：新叫法是「立绘」，旧的「表情包」保留成别名（老用户/肌肉记忆）
         if text in ('开启立绘', '开启表情包'):

@@ -1,9 +1,9 @@
 {
-    "name": "歌伊圣堂",
+    "name": "歌伊",
     "author": "歌靡",
     "namespace": "newGeYi",
-    "info": "模块化角色扮演 AI 聊天插件：四层自动记忆 / 多渠道故障转移与手动锚点 / 世界书 / 图片理解与发送者归属 / 表情包 / 日语原声伴生语音 / 自我保护静默 / 输出安全审计",
-    "version": "2.8.10",
+    "info": "模块化角色扮演 AI 聊天插件：四层自动记忆 / 多渠道故障转移与手动锚点 / 世界书 / 图片理解与发送者归属 / 表情包 / 日语原声伴生语音 / 自我保护静默 / 输出安全审计 / 原生可视化调试台",
+    "version": "2.9.9",
     "svn": 1,
     "compatible_svn": 190,
     "priority": 10000,
@@ -18,6 +18,13 @@
             "sdk": "all",
             "platform": "all",
             "model": "all"
+        }
+    ],
+    "webui_config": [
+        {
+            "title": "歌伊调试台",
+            "type": "iframe",
+            "path": "webui/index.html"
         }
     ],
     "menu_config": [

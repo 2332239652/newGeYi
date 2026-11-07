@@ -199,6 +199,124 @@ class MemorySystemTest(unittest.TestCase):
         self.assertIsNotNone(imp)
         self.assertEqual(imp['summary'], '积极向上的研究生群友')
 
+    # 7b. 印象不再"盲写"：提炼时要把现有卡片一起喂回给模型（2026-11-04）
+    def test_existing_impression_is_fed_back_to_model(self):
+        self.store.set_user_impression('10001', '旧印象：爱在深夜聊 DND，说话带点自嘲')
+        curator = MemoryCurator(self.config, self.store, None)
+        block = curator._existing_impressions_block({'10001'})
+        self.assertIn('爱在深夜聊 DND', block)
+        self.assertIn('[10001]', block)
+        # 关掉印象功能后整块不出现（与"不注入印象"保持一致）
+        curator.config['memory_impression_enabled'] = False
+        self.assertEqual(curator._existing_impressions_block({'10001'}), '')
+        # 没有旧印象的人不占位
+        self.assertEqual(curator._existing_impressions_block({'99999'}), '')
+
+    def test_curator_prompt_contains_existing_impression(self):
+        """不只是有个方法：提炼时旧印象真的进了 prompt。"""
+        from newGeYi.models import ModelResult
+
+        self.store.set_user_impression('10001', '旧印象：爱开玩笑')
+        self.store.buffer_append('group:99999', 'user', '今天又去跑团了',
+                                 sender_id='10001', sender_name='阿花')
+        captured = {}
+
+        class _Gateway:
+            def chat(self, req, kind='chat', session_key=''):
+                captured['prompt'] = req.messages[-1]['content']
+                return ModelResult(ok=True, text='{}', model='stub',
+                                   input_tokens=1, output_tokens=1, latency_ms=1)
+
+        cfg = dict(self.config, memory_curate_messages=1, memory_curate_min_interval=0)
+        curator = MemoryCurator(cfg, self.store, _Gateway())
+        curator.run_once('group:99999')
+        self.assertIn('旧印象：爱开玩笑', captured.get('prompt', ''))
+
+    def test_short_or_identical_impression_does_not_overwrite(self):
+        self.store.set_user_impression('10001', '原来的印象写得挺细的')
+        curator = MemoryCurator(self.config, self.store, None)
+        # 太短（"好人""无"）不许把写好的覆盖掉
+        stats = curator._store_results(
+            'group:99999', {'user_impressions': [{'user_id': '10001', 'summary': '好人'}]},
+            {'10001'}, last_id=1)
+        self.assertEqual(stats['impressions'], 0)
+        self.assertEqual(self.store.get_user_impression('10001')['summary'], '原来的印象写得挺细的')
+        # 一字未改也别刷新 updated_at（否则"多久没变"失真）
+        before = self.store.get_user_impression('10001')['updated_at']
+        stats = curator._store_results(
+            'group:99999',
+            {'user_impressions': [{'user_id': '10001', 'summary': '原来的印象写得挺细的'}]},
+            {'10001'}, last_id=2)
+        self.assertEqual(stats['impressions'], 0)
+        self.assertEqual(self.store.get_user_impression('10001')['updated_at'], before)
+
+    # 7c. 印象历史（只追加，能回溯）2026-11-04
+    def test_impression_history_is_append_only(self):
+        self.store.set_user_impression('10001', '第一版印象：爱开玩笑')
+        self.store.set_user_impression('10001', '第二版印象：爱开玩笑，也爱照顾人')
+        hist = self.store.impression_history('10001', limit=10)
+        self.assertEqual([h['summary'] for h in hist],
+                         ['第二版印象：爱开玩笑，也爱照顾人', '第一版印象：爱开玩笑'])
+        self.assertEqual(hist[0]['reason'], 'update')
+        self.assertEqual(hist[1]['reason'], 'create')
+        # 主表只留最新那版
+        self.assertEqual(self.store.get_user_impression('10001')['summary'],
+                         '第二版印象：爱开玩笑，也爱照顾人')
+
+    def test_identical_impression_writes_no_history(self):
+        self.store.set_user_impression('10001', '同一句话')
+        changed = self.store.set_user_impression('10001', '同一句话')
+        self.assertFalse(changed)
+        self.assertEqual(len(self.store.impression_history('10001', limit=10)), 1)
+
+    def test_forget_me_clears_history_too(self):
+        self.store.set_user_impression('10001', '会被忘掉的印象')
+        self.store.add_user_fact('group:99999', '10001', '会被忘掉的事实')
+        self.store.purge_user_facts('group:99999', '10001', include_global=True)
+        self.assertEqual(self.store.impression_history('10001', limit=10), [])
+        self.assertIsNone(self.store.get_user_impression('10001'))
+
+    def test_panel_exposes_impression_history(self):
+        from types import SimpleNamespace
+
+        from newGeYi.panel import Panel
+
+        self.store.set_user_impression('10001', '面板里的第一版')
+        self.store.set_user_impression('10001', '面板里的第二版')
+
+        class _Stub:
+            def remaining(self, key):
+                return 0
+
+            def cursor(self, key):
+                return 0
+
+            def quota_for(self, key):
+                return {}
+
+        panel = Panel.__new__(Panel)          # 只借用 _session_get，不建真 Runtime
+        panel.runtime = SimpleNamespace(store=self.store, rest=_Stub(),
+                                        curator=_Stub(), group_profile=_Stub())
+        # 私聊：target_id 就是对方，印象直接从它取
+        data = panel._session_get({'session_key': 'h:qq:onebot:private:-:10001'})
+        layers = [m['layer'] for m in data['memories']]
+        self.assertIn('L4', layers)
+        self.assertIn('L4-history', layers)
+        current = [m for m in data['memories'] if m['layer'] == 'L4'][0]
+        self.assertEqual(current['content'], '面板里的第二版')
+
+    # 7d. 容量淘汰的事实进回收站，而不是直接消失（2026-11-04）
+    def test_evicted_fact_is_archived(self):
+        for i in range(15):
+            self.store.add_user_fact('group:99999', '10001', '第%d条事实' % i, importance=0.5 + i * 0.01)
+        removed = self.store.trim_user_facts('group:99999', '10001', max_per_user=12, max_per_group=0)
+        self.assertEqual(removed, 3)
+        self.assertEqual(self.store.count_user_facts('group:99999', '10001'), 12)
+        archive = self.store.archived_facts('group:99999', '10001', limit=10)
+        self.assertEqual(len(archive), 3)
+        self.assertTrue(all('第' in row['fact'] for row in archive))
+        self.assertEqual(archive[0]['reason'], 'capacity')
+
     # 8. 文本相似度计算测试
     def test_text_similarity(self):
         from newGeYi.storage.database import text_similarity
@@ -302,6 +420,106 @@ class MemorySystemTest(unittest.TestCase):
         # 确认没有时间戳前缀
         self.assertNotIn('[刚刚]', res)
         self.assertNotIn('[今天]', res)
+
+    def test_private_and_group_impressions_are_isolated(self):
+        """群聊印象与私聊印象互不干扰、独立提炼。"""
+        self.store.set_user_impression('10001', '群聊印象：很活泼爱水群', scope='group')
+        self.store.set_user_impression('10001', '私聊印象：说话温和认真', scope='private')
+
+        group_imp = self.store.get_user_impression('10001', scope='group')
+        private_imp = self.store.get_user_impression('10001', scope='private')
+        self.assertEqual(group_imp['summary'], '群聊印象：很活泼爱水群')
+        self.assertEqual(private_imp['summary'], '私聊印象：说话温和认真')
+
+        self.store.set_user_impression('10001', '群聊印象：更新后第二版', scope='group')
+        group_hist = self.store.impression_history('10001', scope='group')
+        private_hist = self.store.impression_history('10001', scope='private')
+        self.assertEqual(len(group_hist), 2)
+        self.assertEqual(len(private_hist), 1)
+
+    def test_curator_isolates_private_and_group_sessions(self):
+        """提炼器在私聊提炼私聊印象与私聊事实，在群聊提炼群聊印象与群聊事实。"""
+        curator = MemoryCurator(self.config, self.store, None)
+        priv_sk = 'bot:qq:onebot:private:-:10001'
+        grp_sk = 'bot:qq:onebot:group:-:20001'
+
+        curator._store_results(grp_sk, {
+            'user_impressions': [{'user_id': '10001', 'summary': '群聊印象：群里的技术大佬'}],
+            'user_facts': [{'user_id': '10001', 'fact': '群里经常写Python脚本', 'scope': 'group'}],
+        }, {'10001'}, last_id=1)
+
+        curator._store_results(priv_sk, {
+            'user_impressions': [{'user_id': '10001', 'summary': '私聊印象：私底下是个喜欢二次元的可爱群友'}],
+            'user_facts': [{'user_id': '10001', 'fact': '私聊时说过喜欢看动画电影', 'scope': 'global'}],
+        }, {'10001'}, last_id=2)
+
+        self.assertEqual(self.store.get_user_impression('10001', scope='group')['summary'],
+                         '群聊印象：群里的技术大佬')
+        self.assertEqual(self.store.get_user_impression('10001', scope='private')['summary'],
+                         '私聊印象：私底下是个喜欢二次元的可爱群友')
+
+        priv_facts = self.store.list_user_facts(priv_sk, '10001')
+        self.assertTrue(all(f['session_key'] == priv_sk for f in priv_facts))
+
+    def test_cross_scope_memory_recall_isolation_and_interconnection(self):
+        """互通开关开启与关闭时，私聊与群聊记忆库召回的完整验证。"""
+        from newGeYi.models import IncomingMessage, SessionKey
+
+        repo = MemoryRepository(self.store, dict(self.config))
+        priv_session = SessionKey('bot', 'qq', 'onebot', 'private', '-', '10001')
+        grp_session = SessionKey('bot', 'qq', 'onebot', 'group', '-', '20001')
+        priv_msg = IncomingMessage(
+            session=priv_session, message_id='m1', sender_id='10001', sender_name='测试者',
+            text='你好呀', raw_text='你好呀', is_group=False, mentioned_bot=True,
+            event=None, proc=None
+        )
+        grp_msg = IncomingMessage(
+            session=grp_session, message_id='m2', sender_id='10001', sender_name='测试者',
+            text='大家好', raw_text='大家好', is_group=True, mentioned_bot=True,
+            event=None, proc=None
+        )
+
+        self.store.set_user_impression('10001', '群聊印象卡片', scope='group')
+        self.store.set_user_impression('10001', '私聊印象卡片', scope='private')
+        self.store.add_user_fact(grp_session.as_text(), '10001', '群里爱吃辣')
+        self.store.add_user_fact(priv_session.as_text(), '10001', '私聊说讨厌胡萝卜')
+
+        # 1. 互通开关关闭：完全隔离
+        repo.config['memory_private_enabled'] = False
+
+        priv_block = repo.build_block(priv_msg)
+        self.assertIn('私聊印象卡片', priv_block)
+        self.assertNotIn('群聊印象卡片', priv_block)
+        self.assertIn('私聊说讨厌胡萝卜', priv_block)
+        self.assertNotIn('群里爱吃辣', priv_block)
+
+        grp_block = repo.build_block(grp_msg)
+        self.assertIn('群聊印象卡片', grp_block)
+        self.assertNotIn('私聊印象卡片', grp_block)
+        self.assertIn('群里爱吃辣', grp_block)
+        self.assertNotIn('私聊说讨厌胡萝卜', grp_block)
+
+        # 2. 只开总闸（默认口径）：**单向**——私聊能读到群聊，群聊读不到私聊
+        repo.config['memory_private_enabled'] = True
+
+        priv_cross_block = repo.build_block(priv_msg)
+        self.assertIn('私聊印象卡片', priv_cross_block)
+        self.assertIn('群聊印象卡片', priv_cross_block)
+        self.assertIn('私聊说讨厌胡萝卜', priv_cross_block)
+        self.assertIn('群里爱吃辣', priv_cross_block)
+
+        grp_cross_block = repo.build_block(grp_msg)
+        self.assertIn('群聊印象卡片', grp_cross_block)
+        self.assertIn('群里爱吃辣', grp_cross_block)
+        # 2026-11-05：单向共享——群里不该翻出私聊的记忆/印象（否则"好几个恋爱对象"）
+        self.assertNotIn('私聊印象卡片', grp_cross_block)
+        self.assertNotIn('私聊说讨厌胡萝卜', grp_cross_block)
+
+        # 3. 再把反向闸打开：才恢复双向互通
+        repo.config['memory_private_to_group'] = True
+        grp_two_way = repo.build_block(grp_msg)
+        self.assertIn('私聊印象卡片', grp_two_way)
+        self.assertIn('私聊说讨厌胡萝卜', grp_two_way)
 
 
 if __name__ == '__main__':

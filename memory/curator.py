@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 
@@ -22,6 +23,43 @@ from ..models import ModelRequest
 from ..storage.database import SQLiteStore
 
 logger = logging.getLogger('newGeYi.curator')
+
+# ==================== 视频/链接降噪 ====================
+# 为什么单独做：QQ 的 B 站分享卡片进到消息文本里只剩一串 BV 号（"歌伊看看BV1cPuAzDEZP"）。
+# 提炼模型看到编号往往会老实记一条「对方分享了B站视频（BV1xx）」——零信息量，
+# 还因为 bili 插件写的那条是 explicit（免淘汰）而越积越多。
+# 处理原则：编号换成「（分享了视频）」这种可读占位；整条只有链接的更直接不记。
+_BV_RE = re.compile(r'(?<![0-9A-Za-z])BV[0-9A-Za-z]{8,12}')
+_VIDEO_URL_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?(?:bilibili\.com|b23\.tv|bili2233\.cn)/[^\s，,。）)]*', re.I)
+_OP_CODE_RE = re.compile(r'\[(?:OP|CQ):[^\]]*\]')
+
+# 只剩"看看/听听/这个"这类指令词时，说明这条消息除了分享没别的内容
+_STUB_WORDS = ('看看这个', '看一下', '看看嘛', '看看', '看下', '康康', '听听',
+               '这条', '这个', '视频', '分享', '快看', '歌伊', '你')
+
+
+def clean_video_noise(text) -> tuple[str, bool]:
+    """去视频编号/链接。返回 (清理后的文本, 是否整条只是分享)。
+
+    第二个返回值为 True 时调用方应当**整条丢弃**：除了一个链接它什么信息都没有。
+    """
+    raw = str(text or '')
+    if not raw:
+        return '', False
+    stripped = _OP_CODE_RE.sub(' ', raw)
+    stripped = _VIDEO_URL_RE.sub(' ', stripped)
+    stripped = _BV_RE.sub(' ', stripped)
+    if stripped == raw:                     # 没有视频/链接，原样返回
+        return raw, False
+
+    stub = re.sub(r'\s+', '', stripped).strip('，,。.!！?？~～:：、')
+    for word in _STUB_WORDS:
+        stub = stub.replace(word, '')
+    if len(stub) <= 1:                      # 去掉编号后只剩指令词
+        return '', True
+    cleaned = re.sub(r'[ \t]{2,}', ' ', stripped).strip()
+    return (cleaned + '（分享了视频）'), False
 
 CURATOR_SYSTEM = '你是记忆整理助手，只输出 JSON，不要任何解释、不要 Markdown 代码块。'
 
@@ -40,7 +78,7 @@ CURATOR_RULES = """下面是一个 QQ 群最近的一段聊天记录（每行开
 {{
   "group_summary": "这段群聊发生了什么（1-2 句，只写公共事件）",
   "user_facts": [
-    {{"user_id": "QQ号", "fact": "关于这个人的稳定事实", "category": "身份/偏好/习惯/经历", "importance": 0.6, "scope": "global/group"}}
+    {{"user_id": "QQ号", "fact": "关于这个人的稳定事实", "category": "身份/偏好/习惯/经历", "importance": 0.6, "scope": "global/group", "keywords": "检索关键词，逗号分隔，3-6个"}}
   ],
   "expired_fact_ids": [被新事实替代或已失效的已知事实ID数字列表],
   "user_impressions": [
@@ -57,22 +95,45 @@ CURATOR_RULES = """下面是一个 QQ 群最近的一段聊天记录（每行开
    - 不记：一次性的互动、玩笑、角色扮演内容、情绪化的气话
    - 不记：{assistant}（AI）说的话——那是 AI 自己的事，不属于任何用户
    - scope：通用个人特质/偏好填 "global"，本群特有梗/职务填 "group"
+   - keywords：给 3-6 个**将来能用来搜到这条事实**的词，逗号分隔：
+     · 同义词和上位词都要给（事实写「跑团」，补「TRPG,桌游」；写「原神」，补「手游,米哈游」）；
+     · 带上具体名词（游戏名、作品名、地点、宠物名、职业）；
+     · 不要放"喜欢/觉得/今天"这种虚词，也不要抄整句原文。
    - 没把握的宁可不记
 3. expired_fact_ids：如果已知事实里某条信息已被本批次的新事实推翻或替代（例如「准备考研」变成「考研已上岸」），请在 user_facts 写入新事实，并在 expired_fact_ids 列出被替代的已知事实 ID。没有失效的不要填。
-4. user_impressions：仅在群友展现出鲜明性格或与{assistant}有深度互动时更新，写 1 句高维印象。
+4. user_impressions：只有在**现有印象**的基础上确实有新的认识时才更新，写 1 句高维印象。
+   - 会整句覆盖旧印象，所以要写**完整的说法**，不要把原来写对的内容丢掉；
+   - 没有值得改的就**不要输出这个人**（不输出 = 保留原样），不要为了凑数重写一遍；
+   - 第一次见到这个人时，才凭这一批聊天新建。
 5. self_memories 只记「{assistant}自己」的经历、答应过的承诺、明显的情绪波动。不记：关于年龄、称呼的口舌争辩或群友的调侃打趣。
    也不要用「软件/程序/数据」的视角写她：不要出现「接入模型」「部署在服务器」「功能上线」「测试数据」「代码 / bug / 接口」这类措辞，
    更不要写成「我是数据」「我是 AI」「靠电活着」。主人给她改东西，就用她的说法记成「主人在她的圣堂里添了东西、给她调了法器」。
 6. group_summary 只写公共事件，不要写任何人的私人信息。
 7. 没有可记的内容就留空数组，不要硬凑。
-8. **已经在「已知事实」里的有效信息不要再重复记一遍**。"""
+8. **已经在「已知事实」里的有效信息不要再重复记一遍**。
+9. 视频/链接/图片这类分享：**不要记录编号、BV 号、URL、也不要记「分享了视频」这个动作本身**。
+   要记的是「他喜欢看什么」——比如「偏好《怪物猎人》开荒实况」「关注 AI 视频生成」。
+   一条消息除了分享什么都没说（例如只发了个链接），就当它没发生，不要产出任何事实。
+   同理，「对方发了张图」「对方拍了张照」也不记。"""
 
 # 动态部分：这两块每轮都变，必须排在静态规则之后
-CURATOR_TAIL = """{known}
+CURATOR_TAIL = """{known}{impressions}
 聊天记录：
 {records}
 """
 
+
+
+def _is_private_session(session_key: str) -> bool:
+    """会话键里这一段是不是 private。
+
+    ⚠️ 真实格式是**冒号**分隔：`bot_hash:platform:sdk:private:host:target`
+    （`models.SessionKey.as_text()`）。以前这里写的是 `'|private|'`，于是判断**永远为假**
+    —— `memory_private_enabled=false` 时本该「丢弃私聊缓冲、不提炼」，实际上既没丢、
+    也照炼（2026-11-04 复查发现，测试用的是竖线格式才没暴露）。这里两种都认，兼容老数据。
+    """
+    key = str(session_key or '')
+    return ':private:' in key or '|private|' in key or key.endswith('|private')
 
 
 def clamp01(value, default: float = 0.5) -> float:
@@ -124,6 +185,8 @@ class MemoryCurator:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._last_stats: dict = {}
+        # 私聊关系系统（galgame）：由 Runtime 挂上；私聊印象据此带"关系阶段"视角
+        self.relationship = None
 
     # ==================== 写入缓冲（L0）====================
     def buffer_user(self, msg) -> int:
@@ -131,11 +194,18 @@ class MemoryCurator:
 
         机器人的话不进记忆：骰子结果、插件播报不是群友的真实表达，
         提炼进库只会污染人格（而且它们本来就不该被「记住」）。
+
+        视频/链接先降噪：QQ 分享卡片到这里只剩一串 BV 号，提炼出来就是
+        「对方分享了视频 BV1xx」这种废物事实（还因为 explicit 免淘汰越积越多）。
         """
         if getattr(msg, 'sender_is_bot', False):
             return 0
+        text, pure_share = clean_video_noise(msg.text)
+        if pure_share:
+            logger.debug('整条都是视频/链接分享，不进记忆缓冲 | %s', msg.sender_id)
+            return 0
         return self.store.buffer_append(
-            msg.session.as_text(), 'user', msg.text,
+            msg.session.as_text(), 'user', text,
             sender_id=msg.sender_id, sender_name=msg.sender_name,
         )
 
@@ -203,11 +273,6 @@ class MemoryCurator:
             return False
         if not cfg.get('memory_enabled', True):
             return False
-        if '|private|' in str(session_key) and not cfg.get('memory_private_enabled', False):
-            # 私聊默认不进记忆（隐私）。历史版本缓冲下来的私聊内容在这里一并清掉，
-            # 否则关掉之后这些内容还会被提炼进库、再喂给模型。
-            self._drop_backlog(session_key)
-            return False
         cursor = self.cursor(session_key)
         pending = self.store.buffer_pending(session_key, cursor)
         if pending <= 0:
@@ -245,6 +310,10 @@ class MemoryCurator:
             if row.get('role') == 'assistant':
                 lines.append(f'[AI {self.assistant_name}] {content}')
                 continue
+            # 历史缓冲里可能还有没降噪过的视频分享（带 BV 号），这里再兜一层
+            content, pure_share = clean_video_noise(content)
+            if pure_share or not content:
+                continue
             uid = str(row.get('sender_id') or '').strip()
             name = str(row.get('sender_name') or '用户').strip()
             if uid and uid not in ('-1', 'None'):
@@ -271,10 +340,23 @@ class MemoryCurator:
                 self.set_cursor(session_key, rows[-1]['id'])
                 return stats
 
+            is_priv = _is_private_session(session_key)
+            cur_scope = 'private' if is_priv else 'group'
             known_text, allowed_fact_ids = self._known_facts_block(session_key, valid_ids)
+            impression_text = self._existing_impressions_block(valid_ids, scope=cur_scope)
+            if impression_text:
+                # 留一行可核对的现场证据：提炼时到底带了几张旧卡片进去
+                logger.info('提炼带上 %d 张现有印象 | %s',
+                            impression_text.count('\n  - '), session_key[-16:])
+            if is_priv and self.relationship is not None:
+                try:
+                    impression_text = self.relationship.curator_hint(session_key) + impression_text
+                except Exception:  # noqa: BLE001 - 取不到阶段就按老样子提炼
+                    logger.exception('取关系阶段失败')
             tail = CURATOR_TAIL.format(
                 records=records[:8000],
                 known=known_text,
+                impressions=impression_text,
             )
             data = self._request_and_parse(tail, session_key)
             if isinstance(data, str):
@@ -286,6 +368,8 @@ class MemoryCurator:
             stats.update(self._store_results(session_key, data, valid_ids,
                                              rows[-1]['id'], allowed_fact_ids))
             self._note_success(session_key)
+            if is_priv and self.relationship is not None:
+                self.relationship.mark_impression_done(session_key)
             self._last_stats = dict(stats)
             return stats
         except Exception as exc:  # noqa: BLE001 - 提炼永不抛出
@@ -349,6 +433,27 @@ class MemoryCurator:
             logger.warning('第 %d 次提炼未返回合法 JSON：%s',
                            attempt, last_text[:200].replace('\n', ' '))
         return 'bad_json'
+
+    def _existing_impressions_block(self, valid_ids, scope: str = 'group') -> str:
+        """把本批说话人**现有的印象**带给模型，让它「保留 / 补充 / 改写」而不是每次盲写。
+        按 scope 区分群聊印象与私聊印象，独立提炼互不覆盖。
+        """
+        if not self.config.get('memory_impression_enabled', True) or not valid_ids:
+            return ''
+        lines: list[str] = []
+        for uid in list(valid_ids)[:30]:
+            try:
+                row = self.store.get_user_impression(str(uid), scope=scope)
+            except Exception:  # noqa: BLE001 - 读不到就当这个人没有旧印象
+                continue
+            summary = str((row or {}).get('summary') or '').strip()
+            if summary:
+                lines.append(f'  - [{uid}] {summary[:200]}')
+        if not lines:
+            return ''
+        scope_name = '私聊' if scope == 'private' else '群聊'
+        return (f'这些人现有的{scope_name}印象（要更新就在 user_impressions 里写**完整的新句子**，'
+                '会整句覆盖；没有新认识就不要输出他）：\n' + '\n'.join(lines) + '\n\n')
 
     def _known_facts_block(self, session_key: str, valid_ids) -> tuple[str, set]:
         """带上去重用的已知事实；返回 (文本, 本批**允许失效**的事实 ID 集合)。
@@ -418,15 +523,22 @@ class MemoryCurator:
             except Exception:  # noqa: BLE001 - 单条失败不该中断整批
                 logger.exception('标记事实失效失败（ID=%s）', fid_int)
 
-        # ---- 群友高维印象更新 ----
+        is_priv = _is_private_session(session_key)
+        cur_scope = 'private' if is_priv else 'group'
+
+        # ---- 群友/私聊高维印象更新（按 scope 隔离）----
         for imp in data.get('user_impressions') or []:
             if not isinstance(imp, dict):
                 continue
             uid = str(imp.get('user_id') or '').strip()
             imp_summary = str(imp.get('summary') or '').strip()
+            # 太短的（"无明显特质""是个群友"）不覆盖已有卡片：宁可留旧的，别把写好的写没了
+            if len(imp_summary) < 6:
+                continue
             if uid in valid_ids and imp_summary and len(imp_summary) <= 200:
-                self.store.set_user_impression(uid, imp_summary)
-                stats['impressions'] += 1
+                # set_user_impression 自己会挡住"一字未改"的写入，并按需追加历史
+                if self.store.set_user_impression(uid, imp_summary, scope=cur_scope):
+                    stats['impressions'] += 1
 
         # ---- L2 用户事实（speaker 硬校验）----
         for item in (data.get('user_facts') or [])[:20]:
@@ -442,8 +554,12 @@ class MemoryCurator:
                 logger.debug('丢弃来源不明的用户事实：%s / %s', uid, fact[:40])
                 continue
             fact = fact[:200]
-            scope = str(item.get('scope') or 'group').strip().lower()
-            target_session = 'global' if (scope == 'global' and self.config.get('memory_cross_group_enabled', True)) else session_key
+            if is_priv:
+                # 私聊提炼：事实严格绑定当前私聊会话，绝不设为 global 跨群扩散
+                target_session = session_key
+            else:
+                scope = str(item.get('scope') or 'group').strip().lower()
+                target_session = 'global' if (scope == 'global' and self.config.get('memory_cross_group_enabled', True)) else session_key
             fuzzy_thresh = float(self.config.get('memory_fuzzy_dedup_threshold', 0.60))
 
             existing = self.store.find_similar_user_fact(target_session, uid, fact, threshold=fuzzy_thresh)
@@ -456,13 +572,16 @@ class MemoryCurator:
                 category=str(item.get('category') or '').strip()[:12],
                 source='inferred',
                 importance=clamp01(item.get('importance'), 0.5),
+                # 模型给的同义/上位词：检索端靠它实现「换说法也能搜到」
+                keywords=item.get('keywords'),
             )
             stats['facts'] += 1
             # 容量兜底：字面归一化挡不住换说法的重复，超量就淘汰分数最低的
             stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
                 target_session, uid,
-                max_per_user=int(self.config.get('memory_max_facts_per_user', 12) or 0),
+                max_per_user=int(self.config.get('memory_max_facts_per_user', 50) or 0),
                 max_per_group=0,
+                video_share_keep=int(self.config.get('memory_video_share_keep', 3) or 0),
             )
 
         # ---- L3 角色自身记忆 ----
@@ -492,7 +611,8 @@ class MemoryCurator:
         stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
             session_key, '',
             max_per_user=0,
-            max_per_group=int(self.config.get('memory_max_facts_per_group', 600) or 0),
+            max_per_group=int(self.config.get('memory_max_facts_per_group', 3000) or 0),
+            video_share_keep=int(self.config.get('memory_video_share_keep', 3) or 0),
         )
         return stats
 
