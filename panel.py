@@ -375,9 +375,11 @@ class Panel:
                 gate = getattr(self.runtime, 'private_gate', None)
                 if gate is not None:
                     info['private_used_today'] = gate.used_today(key)
-                    # 拥挤期单人上限会被收紧，所以面板要显示**当前生效的**那个
-                    info['private_quota'] = int(gate._effective_user_quota() or 0)
+                    # 拥挤期单人上限会被收紧、赞助者上限另算，所以显示**当前生效的**那个
+                    uid = str(key).rsplit(':', 1)[-1]
+                    info['private_quota'] = int(gate._effective_user_quota(uid) or 0)
                     info['private_squeezed'] = gate.squeezed()
+                    info['private_sponsor'] = gate.is_sponsor(uid)
                     info['private_used_global'] = gate.used_today_global()
                     info['private_quota_global'] = int(
                         self.runtime.config.get('private_daily_quota_global', 400) or 0)

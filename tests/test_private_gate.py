@@ -184,6 +184,49 @@ class PrivateGateTest(unittest.TestCase):
         self.assertTrue(self.gate.squeezed())
         self.assertEqual(self.gate._effective_user_quota(), 10)
 
+    # ---- 支持者（爱发电赞助）----
+    def test_sponsor_gets_higher_quota(self):
+        self.config.update({'private_daily_quota': 60,
+                            'private_daily_quota_sponsor': 120,
+                            'sponsor_ids': ['8888']})
+        self.assertTrue(self.gate.is_sponsor('8888'))
+        self.assertFalse(self.gate.is_sponsor('9999'))
+        self.assertEqual(self.gate._effective_user_quota('8888'), 120)
+        self.assertEqual(self.gate._effective_user_quota('9999'), 60)
+
+    def test_sponsor_ignores_squeeze(self):
+        """赞助者不受拥挤期收紧影响（人家出钱是为了稳定）。"""
+        self.config.update({'private_daily_quota': 60,
+                            'private_daily_quota_sponsor': 120,
+                            'sponsor_ids': ['8888'],
+                            'private_daily_quota_global': 4,
+                            'private_quota_squeeze_at': 0.25,
+                            'private_quota_squeeze': 10})
+        for uid in ('9001', '9002', '9003'):
+            self.gate.commit(make_private_msg(uid).session.as_text())
+        self.assertTrue(self.gate.squeezed())
+        self.assertEqual(self.gate._effective_user_quota('9999'), 10, '普通用户被收紧')
+        self.assertEqual(self.gate._effective_user_quota('8888'), 120, '赞助者不收紧')
+
+    def test_sponsor_quota_off_by_default(self):
+        self.config['sponsor_ids'] = ['8888']
+        self.assertEqual(self.gate._effective_user_quota('8888'), 0,
+                         'private_daily_quota_sponsor 为 0 时功能不启用')
+
+    def test_sponsor_tolerates_dirty_list(self):
+        for bad in (None, '', 123, {'8888': 1}):
+            self.config['sponsor_ids'] = bad
+            self.assertEqual(self.gate.sponsor_ids(), set(), f'{bad!r} 应被忽略')
+            self.assertFalse(self.gate.is_sponsor('8888'))
+
+    def test_sponsor_usage_text_marks_sponsor(self):
+        self.config.update({'private_daily_quota': 60,
+                            'private_daily_quota_sponsor': 120,
+                            'sponsor_ids': ['8888']})
+        text = self.gate.usage_text('h:qq:onebot:private:-:8888')
+        self.assertIn('赞助者', text)
+        self.assertIn('限额 120', text)
+
 
 class PrivateGateRoutingTest(unittest.TestCase):
     """走真实 route()：确认被闸门拦住时**根本不会提交任务**（这才是省并发的地方）。"""

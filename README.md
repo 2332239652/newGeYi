@@ -354,3 +354,17 @@ v2.8.10 上线 16 小时后的线上数据 + 两条新需求：
   - 聊天中发送「导出记忆」，会将当前群的四层记忆持久化为一份人类可读的纯文本和一个自洽的 SQLite 快照。
 - **表情包系统数据驱动**：
   - `data/emotes.json` 配置模型触发词与文件映射，严格节流。
+
+---
+
+## 关于模型渠道
+
+插件不绑定任何厂商：`config.json` 的 `providers` 填任意 OpenAI / Anthropic 兼容接口就能跑，
+每家一个 `endpoint` + `api_key` + `model`，坏了会自动按 `priority` 往下切。
+
+我自己目前在用这个中转站跑 Gemini / Claude：
+
+**[star-token.ljj233.top](https://star-token.ljj233.top/register?aff=NAFGRLXYVA8N)**
+
+说明一下：上面是**邀请返利链接**。你觉得好用、从这儿注册的话我能拿一点返利，
+你的价格不受影响。不好用就换别家，`providers` 里改一下就行——这个插件对渠道没有偏好。

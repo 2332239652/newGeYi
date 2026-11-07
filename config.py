@@ -24,7 +24,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.9.9'
+PLUGIN_VERSION = '2.9.10'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -200,6 +200,16 @@ DEFAULT_CONFIG = {
     'private_quota_squeeze_at': 0.7,
     # 收紧后的单人上限（0=不收紧）
     'private_quota_squeeze': 35,
+    # ===== 支持者（爱发电赞助）=====
+    # 白名单：这些 QQ 号走下面那个更高的上限，且**不受拥挤期收紧影响**
+    # （人家出钱是为了稳定，不能一挤就被压到 35）。
+    # 为什么是人工白名单而不是自动同步：
+    #   ① 爱发电对小项目没有稳定回调；
+    #   ② "付钱→额度立刻到账"会把"赞助"变成"交易"，性质完全不同。
+    #      人工加名单，这件事就还停在"谢谢支持，给你留个位置"。
+    # 默认空 + 上限 0 = 功能关闭，不影响任何人。
+    'sponsor_ids': [],
+    'private_daily_quota_sponsor': 0,
     'passive_enabled': True,
     'active_enabled': True,
     'route_debug': False,

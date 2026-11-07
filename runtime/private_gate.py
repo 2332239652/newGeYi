@@ -218,12 +218,18 @@ class PrivateGate:
     def usage_text(self, session_key: str = '') -> str:
         """给面板/命令看的一行摘要。"""
         lines = []
-        quota = self._effective_user_quota()
+        uid = str(session_key).rsplit(':', 1)[-1] if session_key else ''
+        quota = self._effective_user_quota(uid)
         gquota = self._num('private_daily_quota_global', 0)
         if session_key:
             used = self.used_today(session_key)
             if quota > 0:
-                tip = '（限额 %d%s）' % (quota, '，拥挤期已收紧' if self.squeezed() else '')
+                tags = ''
+                if self.is_sponsor(uid):
+                    tags = '，赞助者'
+                elif self.squeezed():
+                    tags = '，拥挤期已收紧'
+                tip = '（限额 %d%s）' % (quota, tags)
             else:
                 tip = '（未设单人限额）'
             lines.append('本会话今日私聊回复 %d 条%s' % (used, tip))
