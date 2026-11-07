@@ -26,6 +26,7 @@ BOOL_KEYS = {
     'galgame_enabled', 'galgame_shadow', 'galgame_owner_exempt',
     'reply_audit_enabled', 'religion_guard_enabled',
     'sleep_enabled', 'sleep_notice_once', 'sleep_owner_exempt',
+    'sponsor_memory_keep',
     'memory_relevance_enabled', 'memory_temporal_anchor', 'memory_cross_group_enabled',
     'memory_impression_enabled', 'memory_diversity_enabled', 'time_awareness_enabled',
     'active_escalate_enabled', 'gate_scorer_enabled', 'group_quota_enabled',
@@ -73,13 +74,18 @@ NUMBER_KEYS = {
     'group_quota_default': (0, 100000, True),
     'sleep_pre_minutes': (0, 180, True),
     'private_daily_quota_sponsor': (0, 100000, True),
+    'private_daily_quota_sponsor_tier1': (0, 100000, True),
+    'private_daily_quota_sponsor_tier2': (0, 100000, True),
+    'sponsor_fact_floor': (0, 100, True),
 }
 STRING_KEYS = {'assistant_name': 80, 'active_quiet_hours': 11, 'reply_audit_fallback': 2000,
                'galgame_judge_model': 120, 'affection_provider': 80,
+               'sponsor_thanks_text': 200,
                'sleep_window': 11, 'sleep_notice_text': 120}
 LIST_KEYS = {'triggers': (50, 80), 'owner_ids': (50, 40), 'ignore_sender_ids': (200, 40),
              'incomplete_tails': (100, 80), 'galgame_exempt_ids': (50, 40),
-             'sponsor_ids': (500, 40),
+             'sponsor_ids': (500, 40), 'sponsor_tier1_ids': (500, 40),
+             'sponsor_tier2_ids': (500, 40), 'beta_ids': (200, 40),
              'private_trigger_extra': (50, 40)}
 # 难度数组：长度必须是 6（对应阶段 0~5），每项 (最小值, 最大值)；阈值还要求单调不减
 GALGAME_ARRAYS = {'galgame_thresholds': (0, 300), 'galgame_min_days': (0, 365),

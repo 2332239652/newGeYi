@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..memory.worldbook import WorldbookService
 from ..models import IncomingMessage, ModelRequest
+from ..runtime import sponsors
 from ..storage.database import SQLiteStore, text_similarity
 from .judge import build_judge_messages, parse_verdict
 from .stages import (FACT_LIMIT_BY_STAGE, FEELINGS, MAX_STAGE, MILESTONES, STAGE_NAMES,
@@ -257,10 +258,16 @@ class RelationshipService:
         except Exception:  # noqa: BLE001
             return None
         min_cross = int(self.config.get('galgame_cross_memory_min_stage', 2))
+        # 二档赞助者有一个**下限**（默认 8 条）：陌生阶段只给 2 条时她几乎等于
+        # 没有记忆，而这个下限只是「记得住的条目多一点」，不改关系阶段本身。
+        limit = FACT_LIMIT_BY_STAGE[stage]
+        floor = sponsors.fact_floor(self.config, msg.sender_id)
+        if floor > limit:
+            limit = floor
         return {
             'stage': stage,
             'cross': stage >= min_cross,
-            'max_facts': FACT_LIMIT_BY_STAGE[stage],
+            'max_facts': limit,
             'hedge': stage <= 2,
         }
 

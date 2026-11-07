@@ -20,6 +20,7 @@ import threading
 import time
 
 from ..models import ModelRequest
+from ..runtime import sponsors
 from ..storage.database import SQLiteStore
 
 logger = logging.getLogger('newGeYi.curator')
@@ -576,12 +577,14 @@ class MemoryCurator:
                 keywords=item.get('keywords'),
             )
             stats['facts'] += 1
-            # 容量兜底：字面归一化挡不住换说法的重复，超量就淘汰分数最低的
+            # 容量兜底：字面归一化挡不住换说法的重复，超量就淘汰分数最低的。
+            # 二档赞助者的记忆不参与淘汰（protect_ids），单人裁剪和按群总量裁剪都认。
             stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
                 target_session, uid,
                 max_per_user=int(self.config.get('memory_max_facts_per_user', 50) or 0),
                 max_per_group=0,
                 video_share_keep=int(self.config.get('memory_video_share_keep', 3) or 0),
+                protect_ids=sponsors.protected_ids(self.config),
             )
 
         # ---- L3 角色自身记忆 ----
@@ -613,6 +616,7 @@ class MemoryCurator:
             max_per_user=0,
             max_per_group=int(self.config.get('memory_max_facts_per_group', 3000) or 0),
             video_share_keep=int(self.config.get('memory_video_share_keep', 3) or 0),
+            protect_ids=sponsors.protected_ids(self.config),
         )
         return stats
 

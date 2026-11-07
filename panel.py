@@ -22,6 +22,7 @@ from .panel_helpers import (
     EDITABLE_KEYS, SECRET_FIELDS, PanelError, Redactor, integer, text_value, validate_patch,
 )
 from .routing.likelihood import Features, contributions, resolve_threshold, score, weights_from_config
+from .runtime import sponsors
 
 EVENT_NAME = 'newGeYi_WebUI'
 MAX_REQUEST_BYTES = 262144
@@ -380,6 +381,8 @@ class Panel:
                     info['private_quota'] = int(gate._effective_user_quota(uid) or 0)
                     info['private_squeezed'] = gate.squeezed()
                     info['private_sponsor'] = gate.is_sponsor(uid)
+                    info['private_sponsor_tier'] = gate.sponsor_tier(uid)
+                    info['private_sponsor_beta'] = sponsors.is_beta(self.runtime.config, uid)
                     info['private_used_global'] = gate.used_today_global()
                     info['private_quota_global'] = int(
                         self.runtime.config.get('private_daily_quota_global', 400) or 0)

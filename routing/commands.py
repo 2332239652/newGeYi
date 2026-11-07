@@ -15,6 +15,7 @@ from ..config import SKIP_ACTIVE
 from ..memory.exporter import export_memory
 from ..models import IncomingMessage
 from ..presentation.renderer import load_emote_table  # noqa: F401  （保留导出）
+from ..runtime import sponsors
 
 logger = logging.getLogger('newGeYi.commands')
 
@@ -33,8 +34,20 @@ KIND_LABELS = {
     'active': '主动回复',
     'passive': '被动回复',
     'memory_curate': '记忆提炼',
+    'affection': '好感评审',
     'chat': '聊天',
 }
+
+# 按会话维度拆账的标签
+SCOPE_LABELS = {'group': '群聊', 'private': '私聊', 'other': '其它'}
+
+
+def fmt_tokens(value) -> str:
+    """token 数带上千分位。状态行里数字动辄六位，不加分隔符看着像瞎写。"""
+    try:
+        return format(int(value or 0), ',')
+    except (TypeError, ValueError):
+        return str(value)
 
 
 class CommandRouter:
@@ -95,6 +108,7 @@ class CommandRouter:
             '[骰主/主人] 世界书开/关 | 世界书重载',
             '[骰主/主人] 好感度开/关 | 好感度影子开/关 | 关系详情 <QQ> | 关系设置 <QQ> <0-5> | 关系重置 <QQ>',
             '[骰主/主人] 私聊用量（今日额度与触发词模式） | 私聊触发词开/关',
+            '[骰主/主人] 赞助名单 | 赞助加 <QQ> [1/2] | 赞助删 <QQ>',
             '[骰主/主人] 休眠状态 | 休眠开/关 | 休眠时间 <HH:MM-HH:MM> | 休眠重置',
             '[骰主/主人] 图片理解开/关',
             '[骰主/主人] 表情包状态 | 开启/关闭表情包 | 加载表情包 <路径> | 表情包重载',
@@ -107,6 +121,10 @@ class CommandRouter:
             f'世界书: {wb_state} | 主动搭话: {active_state} | 自动记忆: {memory_state}',
             f'图片理解: {"开" if cfg.get("image_enabled", True) else "关"} | 伴生语音: {"开" if cfg.get("voice_enabled", True) else "关"}',
         ]
+        # 菜单里**不放任何赞助内容**（2026-11-08 骰主定）：赞助相关一律收进「赞助名单」，
+        # 这里只保留「赞助名单」这条指令本身（在上面的主人指令列表里）。
+        # 公开命令里一旦出现档位、人数、额度或鸣谢，效果都只有两个：
+        # 看起来像在卖服务，以及招来「凭什么他有 100 我只有 60」。
         return '\n'.join(lines)
 
     def _cmd_status(self, msg: IncomingMessage) -> str:
@@ -191,10 +209,26 @@ class CommandRouter:
             quota_line,
             rest_line,
             queue_line,
-            f'今日调用: {today["calls"]}/{budget} | 今日输出token: {today["output_tokens"]}',
-            f'今日主动搭话: {today["active_calls"]} 次',
+            self._token_line(today),
+            f'今日调用: {today["calls"]}/{budget} | 主动搭话: {today["active_calls"]} 次',
             f'触发词: {", ".join(cfg.get("triggers", [])) or "歌伊"}',
         ])
+
+    def _token_line(self, today: dict) -> str:
+        """状态里那一行总 token。
+
+        骰主要的是「今天一共消耗多少 token」这一个数，所以**合计放最前面**，
+        输入/输出/缓存命中作为解释跟在后面。缓存命中率是省钱改造的尺子：
+        渠道不透传 usage 时它就是 0%，看到 0% 该怀疑渠道而不是插件。
+        """
+        total = int(today.get('total_tokens') or 0)
+        inp = int(today.get('input_tokens') or 0)
+        out = int(today.get('output_tokens') or 0)
+        cached = int(today.get('cached_tokens') or 0)
+        rate = (cached * 100 // inp) if inp else 0
+        return ('今日 token: %s（输入 %s + 输出 %s｜缓存命中 %s，%d%%）'
+                % (fmt_tokens(total), fmt_tokens(inp), fmt_tokens(out),
+                   fmt_tokens(cached), rate))
 
     def _cmd_test_notify(self, msg: IncomingMessage) -> str:
         """骰主自查：私聊通道到底通不通（退场通知、渠道全挂通知都走这条路）。"""
@@ -348,25 +382,152 @@ class CommandRouter:
         budget = int(self.r.config.get('daily_call_budget', 999999))
         out_budget = int(self.r.config.get('daily_output_token_budget', 99999999))
         input_tokens = int(today.get('input_tokens') or 0)
+        output_tokens = int(today.get('output_tokens') or 0)
+        total_tokens = int(today.get('total_tokens') or 0)
         cached = int(today.get('cached_tokens') or 0)
         rate = (cached * 100 // input_tokens) if input_tokens else 0
         lines = [
-            f'今日调用 {today["calls"]}/{budget} 次，输出 {today["output_tokens"]}/{out_budget} tokens',
+            '今日合计 %s tokens（输入 %s + 输出 %s）' % (
+                fmt_tokens(total_tokens), fmt_tokens(input_tokens), fmt_tokens(output_tokens)),
+            '调用 %s/%s 次（成功 %s / 失败 %s），输出 %s/%s tokens' % (
+                fmt_tokens(today['calls']), fmt_tokens(budget),
+                fmt_tokens(today.get('ok_calls')), fmt_tokens(today.get('failed_calls')),
+                fmt_tokens(output_tokens), fmt_tokens(out_budget)),
             # 缓存命中率是省钱改造的尺子：渠道不透传就是 0%，别以为是插件没做
-            f'输入 {input_tokens} tokens，其中缓存命中 {cached}（{rate}%）',
-            f'其中主动搭话触发 {today["active_calls"]} 次',
+            '输入里缓存命中 %s（%d%%）' % (fmt_tokens(cached), rate),
+            '其中主动搭话触发 %s 次' % fmt_tokens(today['active_calls']),
         ]
+        # 按会话拆账：同样一个「被动回复」，群里接话和私聊长聊的成本差着几倍，
+        # 只按 kind 拆是看不出来的（两类共用 passive 这个 kind）。
+        try:
+            scope_parts = []
+            for row in self.r.store.today_stats_by_scope():
+                label = SCOPE_LABELS.get(row['scope'], row['scope'] or '未知')
+                scope_parts.append('%s %s 次 / %s' % (
+                    label, fmt_tokens(row['calls']), fmt_tokens(row['total_tokens'])))
+            if scope_parts:
+                lines.append('按场景: ' + ' · '.join(scope_parts))
+        except Exception:  # noqa: BLE001 - 拆账失败不该让用量命令报错
+            pass
         # 拆账：判断/主动/被动/提炼的单价差一个量级，混在一起看不出钱花在哪
         try:
             parts = []
-            for row in self.r.store.today_stats_by_kind()[:4]:
+            for row in self.r.store.today_stats_by_kind()[:5]:
                 label = KIND_LABELS.get(row['kind'], row['kind'] or '未知')
-                parts.append(f'{label} {row["calls"]}次/{row["input_tokens"] // 1000}k')
+                parts.append('%s %s次/%s' % (
+                    label, fmt_tokens(row['calls']), fmt_tokens(row.get('total_tokens'))))
             if parts:
-                lines.append('按用途：' + ' · '.join(parts))
+                lines.append('按用途: ' + ' · '.join(parts))
         except Exception:  # noqa: BLE001 - 拆账失败不该让用量命令报错
             pass
         return '\n'.join(lines)
+
+    # ==================== 赞助名单 ====================
+    # 为什么做成命令而不是只改 config.json：加人这件事是**手工、偶发、要核对**的，
+    # 而 config.json 有两个问题——手改容易碰坏别的东西（整份文件重写），
+    # 而且改完还得重载。做成命令，一步到位，还有回执。
+    #
+    # 档位写法的取舍：`赞助加 123 1` 太隐晦，`赞助加 123 一档` 要处理各种别名。
+    # 折中——不写档位默认一档，写「2」「二档」都认，其余明确报错。
+    _TIER_ALIAS = {
+        '': 1, '1': 1, '一': 1, '1档': 1, '一档': 1, '一天饭': 1,
+        '2': 2, '二': 2, '2档': 2, '二档': 2, '半个月': 2, '房子': 2,
+    }
+
+    def _sponsor_key(self, tier: int) -> str:
+        return 'sponsor_tier%d_ids' % (2 if int(tier) >= 2 else 1)
+
+    def _cmd_sponsor_list(self, msg: IncomingMessage) -> str:
+        cfg = self.r.config
+        lines = ['--- 赞助档位 ---']
+        for tier in (1, 2):
+            key = self._sponsor_key(tier)
+            ids = sorted(sponsors.id_set(cfg, key))
+            quota = int(sponsors.quota_for(cfg, ids[0])) if ids else 0
+            lines.append('%s：%d 人%s' % (
+                sponsors.TIER_NAMES[tier], len(ids),
+                ('（额度 %d）' % quota) if ids else ''))
+            lines.extend('  · ' + uid for uid in ids[:30])
+            if len(ids) > 30:
+                lines.append('  …另有 %d 人' % (len(ids) - 30))
+        legacy = sorted(sponsors.id_set(cfg, 'sponsor_ids'))
+        if legacy:
+            lines.append('旧名单 sponsor_ids（按一档算）：%d 人' % len(legacy))
+        beta = sorted(sponsors.id_set(cfg, 'beta_ids'))
+        if beta:
+            lines.append('内测额外名单：%d 人' % len(beta))
+        lines.append('')
+        lines.append('加：赞助加 <QQ> [1/2]   删：赞助删 <QQ>')
+        lines.append('两档都免拥挤期收紧；额度 %d / %d 条'
+                     % (int(cfg.get('private_daily_quota_sponsor_tier1', 100) or 0),
+                        int(cfg.get('private_daily_quota_sponsor_tier2', 120) or 0)))
+        lines.append('二档额外：记忆不裁剪 + 记忆召回下限 %d 条 + 内测优先'
+                     % int(cfg.get('sponsor_fact_floor', 8) or 0))
+        lines.append('')
+        # 鸣谢文案只在这里露面。公开命令里一个字都不提赞助（骰主 2026-11-08 定），
+        # 所以这段文字要给人看的时候，是贴到爱发电页面或群里，不是靠菜单自动显示。
+        thanks = str(cfg.get('sponsor_thanks_text') or '').strip()
+        lines.append('鸣谢文案: ' + (thanks if thanks else '（未设置）'))
+        lines.append('改法：面板改 sponsor_thanks_text，或手改 config.json 后「重载设定」')
+        return '\n'.join(lines)
+
+    @staticmethod
+    def _parse_sponsor_arg(arg: str) -> tuple:
+        parts = str(arg or '').split()
+        if not parts:
+            return '', 0
+        uid = parts[0].strip()
+        if not uid.isdigit():
+            return '', 0
+        alias = parts[1].strip() if len(parts) > 1 else ''
+        return uid, CommandRouter._TIER_ALIAS.get(alias, 0)
+
+    def _cmd_sponsor_add(self, msg: IncomingMessage, arg: str) -> str:
+        uid, tier = self._parse_sponsor_arg(arg)
+        if not uid:
+            return '格式: 赞助加 <QQ号> [1 或 2]（不写档位按一档算）'
+        if not tier:
+            return '档位只认 1 / 2（或「一档」「二档」）。1 = 6 元档，2 = 20 元档。'
+        cfg = self.r.config
+        changes = {}
+        # 同一人只该出现在一个档位里（档位是累计的，二档已经包含一档的权益），
+        # 所以加进新档时把它从别的名单里摘掉——否则降档后旧权益还在。
+        for key in ('sponsor_ids', self._sponsor_key(1), self._sponsor_key(2)):
+            current = sponsors.id_set(cfg, key)
+            if key == self._sponsor_key(tier):
+                current.add(uid)
+            elif uid in current:
+                current.discard(uid)
+            else:
+                continue
+            changes[key] = sorted(current)
+        self._save_and_reload(changes)
+        quota = int(sponsors.quota_for(self.r.config, uid))
+        extra = ''
+        if tier >= 2:
+            extra = '，记忆不裁剪 + 记忆召回下限 %d 条 + 内测优先' % int(
+                self.r.config.get('sponsor_fact_floor', 8) or 0)
+        return ('✅ 已加入「%s」\n'
+                '私聊额度 %d，拥挤期不收紧%s\n'
+                '（爱发电那边确认收到钱再加人，别提前加）'
+                % (sponsors.TIER_NAMES[tier], quota, extra))
+
+    def _cmd_sponsor_remove(self, msg: IncomingMessage, arg: str) -> str:
+        uid = str(arg or '').strip().split()[0] if str(arg or '').strip() else ''
+        if not uid.isdigit():
+            return '格式: 赞助删 <QQ号>'
+        changes = {}
+        hit = False
+        for key in ('sponsor_ids', self._sponsor_key(1), self._sponsor_key(2)):
+            current = sponsors.id_set(self.r.config, key)
+            if uid in current:
+                current.discard(uid)
+                changes[key] = sorted(current)
+                hit = True
+        if not hit:
+            return '这个号不在任何赞助名单里（赞助名单 可看当前成员）'
+        self._save_and_reload(changes)
+        return '✅ 已把 %s 从赞助名单移除，额度恢复为普通用户' % uid
 
     def _cmd_remember(self, msg: IncomingMessage, arg: str) -> str:
         # 墓碑：显式「记住 xxx」已被废除，避免提示词注入与越狱投毒风险。
@@ -742,6 +903,7 @@ class CommandRouter:
         '语音状态', '开启语音', '关闭语音', '语音重载', '测试语音',
         '.voice status', '.voice test',
         '渠道状态', '记忆状态', '导出记忆', '搭话观察',
+        '赞助名单',
         '解除静默', '解除本群静默', '静默列表', '测试通知', '通知测试',
         '面板地址', '歌伊面板', '调试台',
         '搭话影子开', '搭话影子关',
@@ -751,6 +913,7 @@ class CommandRouter:
         '添加触发词 ', '删除触发词 ', '加载立绘 ', '加载表情包 ', '设置key ', '切换渠道 ', '切换模型 ',
         '测试语音 ', '.voice test ', '解除静默 ',
         '关系详情 ', '关系设置 ', '关系重置 ',
+        '赞助加 ', '赞助删 ',
         '休眠时间 ',
     )
 
@@ -854,6 +1017,15 @@ class CommandRouter:
             return True
         if text == '渠道状态':
             self.r.reply(msg, self._cmd_channels(msg))
+            return True
+        if text == '赞助名单':
+            self.r.reply(msg, self._cmd_sponsor_list(msg))
+            return True
+        if text.startswith('赞助加 '):
+            self.r.reply(msg, self._cmd_sponsor_add(msg, text[4:]))
+            return True
+        if text.startswith('赞助删 '):
+            self.r.reply(msg, self._cmd_sponsor_remove(msg, text[4:]))
             return True
         if text == '私聊用量':
             gate = getattr(self.r, 'private_gate', None)

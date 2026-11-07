@@ -570,12 +570,19 @@ class SQLiteStore:
         )
 
     def today_stats(self) -> dict:
-        """今日统计：总调用数、输入/输出 token、其中命中缓存的输入 token。"""
+        """今日统计：调用数、输入/输出 token、命中缓存的输入 token、总消耗。
+
+        `total_tokens`（2026-11-08 新增）：骰主要的是「今天一共花掉多少 token」这一个数，
+        以前得自己在「今日用量」里把输入和输出加起来。失败调用的行也算在内——
+        上游已经计费了就该算，何况失败的多数根本没有 usage，加不加都是 0。
+        """
         day = time.strftime('%Y-%m-%d')
         row = self._conn().execute(
             'SELECT COUNT(*), COALESCE(SUM(out_tokens), 0), '
             "COALESCE(SUM(CASE WHEN kind = 'active' THEN 1 ELSE 0 END), 0), "
-            'COALESCE(SUM(in_tokens), 0), COALESCE(SUM(cached_tokens), 0) '
+            'COALESCE(SUM(in_tokens), 0), COALESCE(SUM(cached_tokens), 0), '
+            'COALESCE(SUM(in_tokens + out_tokens), 0), '
+            'COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) '
             'FROM api_calls WHERE day=?',
             (day,),
         ).fetchone()
@@ -585,24 +592,79 @@ class SQLiteStore:
             'active_calls': int(row[2]),
             'input_tokens': int(row[3]),
             'cached_tokens': int(row[4]),
+            'total_tokens': int(row[5]),
+            'ok_calls': int(row[6]),
+            'failed_calls': int(row[0]) - int(row[6]),
         }
 
     def today_stats_by_kind(self) -> list[dict]:
-        """今天按用途拆账：kind / 次数 / 输入 token（大的排前面）。
+        """今天按用途拆账：kind / 次数 / 输入 / 输出 / 合计 token（大的排前面）。
 
         拆账的意义在于回答「钱到底花在哪」——搭话判断、主动回复、被动回复、
         记忆提炼的单价和频次差着一个量级，混成一个总数什么也看不出来。
+
+        2026-11-08：以前只统计输入 token，而「记忆提炼」恰恰是输入巨大、输出很小
+        的一类（一轮几十条消息压进去、只吐一小段 JSON）。只看输入会把它算成
+        头号开销，看合计才对得上账单。
         """
         day = time.strftime('%Y-%m-%d')
         rows = self._conn().execute(
-            'SELECT kind, COUNT(*), COALESCE(SUM(in_tokens), 0) '
-            'FROM api_calls WHERE day=? GROUP BY kind ORDER BY 3 DESC',
+            'SELECT kind, COUNT(*), COALESCE(SUM(in_tokens), 0), COALESCE(SUM(out_tokens), 0), '
+            'COALESCE(SUM(in_tokens + out_tokens), 0) '
+            'FROM api_calls WHERE day=? GROUP BY kind ORDER BY 5 DESC',
             (day,),
         ).fetchall()
         return [
-            {'kind': str(r[0] or ''), 'calls': int(r[1]), 'input_tokens': int(r[2])}
+            {'kind': str(r[0] or ''), 'calls': int(r[1]), 'input_tokens': int(r[2]),
+             'output_tokens': int(r[3]), 'total_tokens': int(r[4])}
             for r in rows
         ]
+
+    def today_stats_by_scope(self) -> list[dict]:
+        """今天按「群聊 / 私聊 / 其它」拆 token。
+
+        为什么单独一个维度：`kind` 只分「被动 / 主动」，而这两类**群聊和私聊共用**
+        ——同一个 passive 既可能是群里接一句话，也可能是私聊里聊了半小时。
+        骰主要看「群聊私聊各花了多少」，只能靠会话键区分。
+
+        `session_key` 形如 `h:qq:onebot:private:-:9333111` / `...:group:123:456`；
+        好感评审传的是空串（不属于任何会话），归到「其它」。
+        """
+        day = time.strftime('%Y-%m-%d')
+        rows = self._conn().execute(
+            "SELECT CASE "
+            "         WHEN instr(session_key, ':private:') > 0 THEN 'private' "
+            "         WHEN instr(session_key, ':group:') > 0 THEN 'group' "
+            "         ELSE 'other' END AS scope, "
+            'COUNT(*), COALESCE(SUM(in_tokens), 0), COALESCE(SUM(out_tokens), 0), '
+            'COALESCE(SUM(in_tokens + out_tokens), 0) '
+            'FROM api_calls WHERE day=? GROUP BY scope ORDER BY 5 DESC',
+            (day,),
+        ).fetchall()
+        return [
+            {'scope': str(r[0] or 'other'), 'calls': int(r[1]), 'input_tokens': int(r[2]),
+             'output_tokens': int(r[3]), 'total_tokens': int(r[4])}
+            for r in rows
+        ]
+
+    def range_stats(self, days: int = 30) -> dict:
+        """最近 N 天（含今天）的合计，给「月度账本」用。
+
+        只看 `day` 字段的字符串比较——它本来就是 `%Y-%m-%d`，字典序即时间序。
+        """
+        span = max(1, int(days))
+        since = time.strftime('%Y-%m-%d', time.localtime(time.time() - (span - 1) * 86400))
+        row = self._conn().execute(
+            'SELECT COUNT(*), COALESCE(SUM(in_tokens), 0), COALESCE(SUM(out_tokens), 0), '
+            'COALESCE(SUM(in_tokens + out_tokens), 0), COALESCE(SUM(cached_tokens), 0) '
+            'FROM api_calls WHERE day>=?',
+            (since,),
+        ).fetchone()
+        return {
+            'days': span, 'since': since, 'calls': int(row[0]),
+            'input_tokens': int(row[1]), 'output_tokens': int(row[2]),
+            'total_tokens': int(row[3]), 'cached_tokens': int(row[4]),
+        }
 
     # ==================== 记忆 L0：原始缓冲 ====================
     def buffer_append(self, session_key: str, role: str, content: str,
@@ -1185,7 +1247,7 @@ class SQLiteStore:
     # ==================== 事实容量控制 ====================
     def trim_user_facts(self, session_key: str, user_id: str = '',
                         max_per_user: int = 0, max_per_group: int = 0,
-                        video_share_keep: int = 0) -> int:
+                        video_share_keep: int = 0, protect_ids=None) -> int:
         """事实超容量就淘汰「最不值钱」的那几条。
 
         线上实测：一个大群一天塞进来 94 条，其中一个人占了 17 条、5 条在说同一件事
@@ -1196,25 +1258,41 @@ class SQLiteStore:
         `video_share_keep`：视频分享类单独封顶（默认 3 条）。这类是**别的插件按事件写的**，
         每条一条、永不重复、还标了 explicit，不单独限流就会把一个人的记忆全占满
         （线上：一个用户 12 条上限里 6 条是"分享了视频《xxx》"）。
+
+        `protect_ids`（2026-11-08）：**二档赞助者的记忆不参与淘汰**（见 runtime/sponsors.py）。
+        两处裁剪都要认这份名单——只跳过单人裁剪是不够的，按群总量的那次一样会把他
+        当成"低分条目"挤掉，那样"记忆不裁剪"就只是半句话。
         """
         removed = 0
+        protected = {str(x).strip() for x in (protect_ids or ()) if str(x).strip()}
         if max_per_user > 0 and user_id:
             removed += self._trim_facts(
                 'session_key=? AND user_id=? AND valid_to=0', (session_key, str(user_id)),
-                int(max_per_user), int(video_share_keep))
+                int(max_per_user), int(video_share_keep), protected)
         if max_per_group > 0:
             removed += self._trim_facts('session_key=? AND valid_to=0', (session_key,),
-                                        int(max_per_group), int(video_share_keep))
+                                        int(max_per_group), int(video_share_keep), protected)
         return removed
 
-    def _trim_facts(self, where: str, args: tuple, limit: int, video_keep: int = 0) -> int:
+    def _trim_facts(self, where: str, args: tuple, limit: int, video_keep: int = 0,
+                    protect_ids=None) -> int:
+        protected = {str(x).strip() for x in (protect_ids or ()) if str(x).strip()}
         conn = self._conn()
         rows = conn.execute(
-            'SELECT id, importance, hit_count, source, category, created_at FROM user_facts'
+            'SELECT id, importance, hit_count, source, category, created_at, user_id FROM user_facts'
             ' WHERE %s' % where, args,
         ).fetchall()
         if not rows:
             return 0
+
+        # 受保护的人（二档赞助者）整个移出裁剪候选集：**不参与淘汰，也不占名额**。
+        # 为什么不能只把它们标成 manual：manual 在「手工事实本身就超了」那条分支里
+        # 照样会按分数砍到 limit 以内（线上真有人手工记了 60 条）。赞助者要的是
+        # 「一条都不少」，所以只能先摘出去再算容量。
+        if protected:
+            rows = [row for row in rows if str(row[6] or '') not in protected]
+            if not rows:
+                return 0
 
         killed: set = set()
 

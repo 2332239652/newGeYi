@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 import time
 
+from . import sponsors
+
 logger = logging.getLogger('newGeYi.private_gate')
 
 
@@ -153,30 +155,31 @@ class PrivateGate:
         return self.used_today_global() >= global_quota * squeeze_at
 
     def sponsor_ids(self) -> set:
-        """支持者名单（爱发电赞助过的人）。
+        """全部支持者（两档 + 旧名单的并集），只用于「是不是赞助者」这类粗判断。
 
-        **为什么是白名单而不是自动同步**：爱发电没有稳定的公开回调给这种小项目，
-        而且"付了钱系统立刻生效"本身就把赠与变成了交易。人工加白名单既简单，
-        也让这件事保持在「赞助的谢礼」这个位置上。
+        档位判定一律走 `sponsors.tier_of`，别在这里再写一遍名单比较。
         """
-        raw = self.config.get('sponsor_ids')
-        if not isinstance(raw, (list, tuple)):
-            return set()
-        return {str(x).strip() for x in raw if str(x).strip()}
+        return sponsors.all_sponsors(self.config)
 
     def is_sponsor(self, sender_id: str) -> bool:
-        return str(sender_id or '').strip() in self.sponsor_ids()
+        return sponsors.is_sponsor(self.config, sender_id)
+
+    def sponsor_tier(self, sender_id: str) -> int:
+        return sponsors.tier_of(self.config, sender_id)
 
     def _effective_user_quota(self, sender_id: str = '') -> float:
         """当前生效的单人上限。0 表示不限。
 
-        支持者的上限走 `private_daily_quota_sponsor`，而且**不受拥挤期收紧影响**——
+        赞助者走 `sponsors.quota_for()`（两档各有一个额度键），而且**不受拥挤期收紧影响**——
         人家赞助是为了稳定，不能一挤就被压到 35。
+
+        2026-11-08 分档后这里只负责「两档都是赞助、都免收紧」，具体额度归 sponsors.py，
+        免得一个额度规则散在两个文件里。
         """
         quota = self._num('private_daily_quota', 0)
-        sponsor = self._num('private_daily_quota_sponsor', 0)
-        if sponsor > 0 and self.is_sponsor(sender_id):
-            return max(quota, sponsor)
+        sponsor_quota = sponsors.quota_for(self.config, sender_id)
+        if sponsor_quota > 0:
+            return max(quota, sponsor_quota)
         if quota <= 0:
             return 0
         if self.squeezed():
@@ -225,8 +228,9 @@ class PrivateGate:
             used = self.used_today(session_key)
             if quota > 0:
                 tags = ''
-                if self.is_sponsor(uid):
-                    tags = '，赞助者'
+                tier = self.sponsor_tier(uid)
+                if tier:
+                    tags = '，赞助者（%s）' % sponsors.TIER_NAMES.get(tier, '档位未知')
                 elif self.squeezed():
                     tags = '，拥挤期已收紧'
                 tip = '（限额 %d%s）' % (quota, tags)
