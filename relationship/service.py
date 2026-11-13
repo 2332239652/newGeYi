@@ -179,7 +179,7 @@ class RelationshipService:
             return ''
         try:
             now = time.time()
-            with self._lock_for(msg.sender_id):
+            with self._lock_for(msg.sender_id), self.store.transaction():
                 rel = self.load(msg.sender_id)
                 mood = rel.mood if rel.mood_until > now else ''
                 event = str(rel.flags.get('pending_event') or '')
@@ -204,7 +204,7 @@ class RelationshipService:
             return ''
         try:
             now = time.time()
-            with self._lock_for(msg.sender_id):
+            with self._lock_for(msg.sender_id), self.store.transaction():
                 rel = self.load(msg.sender_id)
                 mood = rel.mood if rel.mood_until > now else ''
                 event = str(rel.flags.get('pending_event') or '')
@@ -330,13 +330,25 @@ class RelationshipService:
         }
 
     # ==================== 回复后评审 ====================
-    def after_reply(self, msg: IncomingMessage, reply_text: str) -> None:
+    def after_reply(self, msg: IncomingMessage, reply_text: str, *, history=None,
+                    now: float | None = None) -> None:
         if not self.active_for(msg):
             return
+        if history is None:
+            # 兼容旧调用：仅在入队时识别并移除已提交的当前轮，worker 永不读取最新历史。
+            history = self.store.recent_turns(msg.session.as_text(), limit=10)
+            if (len(history) >= 2 and history[-2].get('role') == 'user'
+                    and history[-2].get('content') == msg.text
+                    and history[-1].get('role') == 'assistant'
+                    and history[-1].get('content') == reply_text):
+                history = history[:-2]
         job = {
             'uid': str(msg.sender_id), 'name': str(msg.sender_name or '对方'),
             'session_key': msg.session.as_text(), 'user_text': str(msg.text or ''),
             'reply_text': str(reply_text or ''),
+            'history': tuple(dict(turn) for turn in history),
+            'now': time.time() if now is None else now,
+            'generation': self.store.forget_generation('relationship', str(msg.sender_id)),
         }
         try:
             self._pool.submit(self._run_job, job)
@@ -350,13 +362,28 @@ class RelationshipService:
             logger.exception('关系评审失败 | %s', job.get('uid'))
 
     def process_interaction(self, uid: str, name: str, session_key: str, user_text: str,
-                            reply_text: str, now: float | None = None, judge=None) -> dict:
-        """处理一轮互动。`judge` 可注入（测试用），默认调模型。返回摘要 dict。"""
-        now = now or time.time()
+                            reply_text: str, now: float | None = None, judge=None,
+                            generation: int | None = None, history=None) -> dict:
+        """处理一轮互动；history 为本轮之前的冻结历史，judge 可注入测试。"""
+        now = time.time() if now is None else now
         p = self.params()
         shadow = self.shadow()
-        turns = self.store.recent_turns(session_key, limit=10)
-        history = turns[:-2] if len(turns) >= 2 else []
+        with self._lock_for(uid), self.store.transaction():
+            current = self.store.forget_generation('relationship', uid)
+            if generation is None:
+                generation = current
+            if generation != current:
+                return {'discarded': True, 'reason': 'forgotten'}
+            rel = self.load(uid)
+        # 直接调用也只采一次快照；显式 history 的空元组表示确实没有前序消息。
+        if history is None:
+            history = self.store.recent_turns(session_key, limit=10)
+            if (len(history) >= 2 and history[-2].get('role') == 'user'
+                    and history[-2].get('content') == user_text
+                    and history[-1].get('role') == 'assistant'
+                    and history[-1].get('content') == reply_text):
+                history = history[:-2]
+        history = tuple(dict(turn) for turn in history)
         # 带上时间戳：刷屏判定要有时间窗，否则低频私聊里"三天前说过的话"也会被判复读
         # （2026-11-10 抽查：7 天 30 条 spam 里约 1/4 是跨小时的误判）。
         recent_users = [(t['content'], t.get('created_at') or 0)
@@ -364,7 +391,21 @@ class RelationshipService:
         recent_lines = [('对方：' if t.get('role') == 'user' else '歌伊：') + str(t.get('content'))[:120]
                         for t in history[-6:]]
 
-        with self._lock_for(uid):
+        # 入队时的代际由 after_reply 传入；直接调用在上面的快照事务中捕获。
+        trivial = is_trivial(user_text, int(self.config.get('galgame_judge_min_chars', 4)))
+        spam = is_repeat(user_text, recent_users, text_similarity,
+                         window_seconds=float(self.config.get('galgame_repeat_window_seconds', 1800) or 0),
+                         now=now)
+        hijack = is_narration_hijack(user_text)
+        verdict = None
+        if not spam and not hijack and not trivial:
+            verdict = (judge or self._judge)(rel, recent_lines, user_text, reply_text,
+                                            str(rel.flags.get('pending_event') or ''))
+
+        with self._lock_for(uid), self.store.transaction():
+            if generation != self.store.forget_generation('relationship', uid):
+                return {'discarded': True, 'reason': 'forgotten'}
+            # 同代际下其他本地写入也可能已发生，应用评审时重载最新状态。
             rel = self.load(uid)
             stage_before, aff_before = rel.stage, rel.affection
             trivial = is_trivial(user_text, int(self.config.get('galgame_judge_min_chars', 4)))
@@ -374,14 +415,12 @@ class RelationshipService:
             hijack = is_narration_hijack(user_text)
 
             pending = str(rel.flags.get('pending_event') or '')
-            verdict = None
             raw, tag, level, note = 0, 'neutral', 0, ''
             if spam:
                 raw, tag, note = -1, 'spam', 'repeat'
             elif hijack:
                 raw, tag, note = 0, 'pushy', 'narration'
             elif not trivial:
-                verdict = (judge or self._judge)(rel, recent_lines, user_text, reply_text, pending)
                 if verdict is None:
                     tag, note = 'judge_fail', 'judge_fail'
                 else:
@@ -418,7 +457,7 @@ class RelationshipService:
                         total.stage_after = rel.stage
             else:
                 # 刷屏不再吞掉「今日首次互动」的加成：以前 spam 会连 +1 一起跳过，
-                # 等于同一件事罚两次（2026-11-10 抽查：748048217 只说了 1 句就从 2.0 掉到 1.0）。
+                # 等于同一件事罚两次（回归样例：一次互动不应同时承担两次扣分）。
                 if not trivial and day_key(now) != rel.last_day:
                     applied += apply_presence(rel, now, p).applied
                 out = apply_delta(rel, raw, tag, now, p)
@@ -524,7 +563,7 @@ class RelationshipService:
         if not uid:
             return
         try:
-            with self._lock_for(uid):
+            with self._lock_for(uid), self.store.transaction():
                 rel = self.load(uid)
                 if rel.flags.get('impression_dirty'):
                     rel.flags['impression_dirty'] = False
@@ -627,20 +666,20 @@ class RelationshipService:
         }
 
     def force_stage(self, uid: str, stage: int) -> str:
-        with self._lock_for(uid):
+        with self._lock_for(uid), self.store.transaction():
             rel = self.load(uid)
             set_stage(rel, stage, time.time(), self.params())
             self.save(rel)
         return f'已把 {uid} 设为「{STAGE_NAMES[rel.stage]}」'
 
     def reset(self, uid: str) -> None:
-        with self._lock_for(uid):
+        with self._lock_for(uid), self.store.transaction():
             self.store._conn().execute('DELETE FROM user_relationship WHERE user_id=?', (str(uid),))
 
     def forget(self, uid: str) -> None:
         """"忘了我"：关系数据和流水一起清（和印象历史一致的隐私承诺）。"""
-        with self._lock_for(uid):
-            conn = self.store._conn()
+        with self._lock_for(uid), self.store.transaction() as conn:
+            self.store._advance_forget('relationship', uid, self.store._buffer_high_watermark())
             conn.execute('DELETE FROM user_relationship WHERE user_id=?', (str(uid),))
             conn.execute('DELETE FROM relationship_log WHERE user_id=?', (str(uid),))
 

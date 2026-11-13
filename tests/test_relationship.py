@@ -26,7 +26,7 @@ from newGeYi.relationship.stages import (EVENTS, STAGE_NAMES, audit_overstep,  #
                                          build_relation_block)
 
 BOT = 'hash'
-OWNER = '9000000001'
+OWNER = '2332239652'
 USER = '1000000002'
 DAY = 86400.0
 
@@ -374,7 +374,8 @@ class ServiceTest(unittest.TestCase):
         from newGeYi.runtime.app import Runtime
         self.rt = Runtime()
         self.rt.config.update({'galgame_enabled': True, 'galgame_shadow': False,
-                               'worldbook_enabled': True, 'galgame_owner_exempt': True, 'owner_ids': [OWNER]})
+                               'worldbook_enabled': True, 'galgame_owner_exempt': True,
+                               'owner_ids': [OWNER]})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.svc.worldbook = self.rt.worldbook = self.rt.prompt_builder.worldbook = _wb([
@@ -854,3 +855,4 @@ class DiminishingTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

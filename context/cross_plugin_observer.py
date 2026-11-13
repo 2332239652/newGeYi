@@ -16,7 +16,43 @@ import threading
 import time
 from typing import Any
 
+from ..models import SessionKey
 from ..presentation.renderer import op_codes_to_plain
+
+
+def _identity(value: Any) -> str:
+    """会话分量须明确且可按 SessionKey 的冒号格式无歧义表示。"""
+    if value is None:
+        return ''
+    text = str(value).strip()
+    return text if text and text != '-' and ':' not in text else ''
+
+
+def _event_group_session(event: Any, group_id: Any, host_id: Any = None) -> SessionKey | None:
+    """从真实事件取机器人/平台身份；目标和 host 来自已确认的群发送参数。"""
+    bot = getattr(event, 'bot_info', None)
+    platform_info = getattr(event, 'platform', None)
+    if not isinstance(platform_info, dict):
+        return None
+    bot_hash = _identity(getattr(bot, 'hash', None))
+    platform = _identity(platform_info.get('platform'))
+    sdk = _identity(platform_info.get('sdk'))
+    target = _identity(group_id)
+    if not all((bot_hash, platform, sdk, target)):
+        return None
+    # None / '' 是 OlivOS 官方文档规定的无上层群，不借用其他会话的 host。
+    host = '' if host_id in (None, '') else _identity(host_id)
+    if host_id not in (None, '') and not host:
+        return None
+    return SessionKey(bot_hash, platform, sdk, 'group', host, target)
+
+
+def _is_group_event(event: Any) -> bool:
+    plugin_info = getattr(event, 'plugin_info', None)
+    func_type = plugin_info.get('func_type') if isinstance(plugin_info, dict) else None
+    if func_type in ('private_message', 'private_message_sent'):
+        return False
+    return bool(_identity(getattr(getattr(event, 'data', None), 'group_id', None)))
 
 logger = logging.getLogger("newGeYi.cross_plugin")
 
@@ -54,7 +90,7 @@ class CrossPluginObserver:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
         self._lock = threading.Lock()
-        # 去重缓冲：(group_id, text_prefix) -> timestamp (TTL 10s)
+        # 去重缓冲：(完整 session, 完整文本) -> timestamp (TTL 10s)
         self._seen_messages: dict[tuple[str, str], float] = {}
         # 卸载钩子用的回调（install 时登记，save 时反向执行）
         self._detachers: list = []
@@ -99,12 +135,19 @@ class CrossPluginObserver:
             if now - self._seen_messages[k] > 10.0:
                 self._seen_messages.pop(k, None)
 
-    def on_other_plugin_sent(self, group_id: str, raw_message: Any, bot_id: str = "") -> None:
-        """当捕获到其他插件向群聊发信时触发记录。"""
-        if not group_id or not raw_message:
+    def on_other_plugin_sent(self, session: SessionKey, raw_message: Any, bot_id: str = '') -> None:
+        """记录已确认身份的群发送；缺字段直接跳过，不搜索活跃会话或猜机器人。"""
+        if not isinstance(session, SessionKey) or session.session_type != 'group' or not raw_message:
             return
-
-        gid = str(group_id).strip()
+        if not all(_identity(value) for value in (session.bot_hash, session.platform, session.sdk, session.target_id)):
+            return
+        if session.host_id and not _identity(session.host_id):
+            return
+        bot_id = _identity(bot_id)
+        if not bot_id:
+            return
+        gid = session.target_id
+        session_key = session.as_text()
         now = time.time()
 
         # 归一化消息文本
@@ -134,33 +177,16 @@ class CrossPluginObserver:
             return
 
         # 检查是否为歌伊 newGeYi 自身刚刚发出的回复（避免自己记自己两次）
-        if hasattr(self.runtime, "is_recently_sent_by_self") and self.runtime.is_recently_sent_by_self(gid, text):
+        if hasattr(self.runtime, "is_recently_sent_by_self") and self.runtime.is_recently_sent_by_self(session_key, text):
             return
 
         # 幂等去重检查（防止 OneBot 路由层与 OlivaDiceCore 钩子双重触发）
-        sig = (gid, text[:80])
+        sig = (session_key, text)
         with self._lock:
             self._cleanup_seen(now)
             if sig in self._seen_messages:
                 return
             self._seen_messages[sig] = now
-
-        # 获取机器人的 QQ 号
-        if not bot_id and hasattr(self.runtime, "_bot_account_ids"):
-            bids = self.runtime._bot_account_ids()
-            if bids:
-                bot_id = next(iter(bids))
-
-        # 定位目标群的活跃 session_key
-        session_key = ""
-        if hasattr(self.runtime, "live_context") and hasattr(self.runtime.live_context, "_states"):
-            for sk in self.runtime.live_context._states.keys():
-                if sk.endswith(f":{gid}"):
-                    session_key = sk
-                    break
-
-        if not session_key:
-            session_key = f"default:qq:onebot:group:-:{gid}"
 
         label = guess_plugin_sender_label(text)
         seq = self.runtime._next_arrival_seq()
@@ -219,11 +245,15 @@ def install_cross_plugin_observer(runtime: Any) -> CrossPluginObserver:
             def _hooked_dice_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs):
                 res = orig_msg_hook(event, funcType, sender, dectData, message, *args, **kwargs) if orig_msg_hook else None
                 try:
-                    if funcType in ("reply", "send_group") and dectData and len(dectData) >= 2:
-                        group_id = str(dectData[1] or "")
-                        if group_id:
-                            bot_id = str((sender or {}).get("id", ""))
-                            observer.on_other_plugin_sent(group_id, message, bot_id=bot_id)
+                    # crossHook dectData = [host_id, group_id, user_id]。
+                    # reply 沿用原事件类型；私聊即使 dectData[1] 有值也绝不写进群。
+                    if funcType in ('reply', 'send_group') and dectData and len(dectData) == 3:
+                        if funcType == 'reply' and not _is_group_event(event):
+                            return res
+                        session = _event_group_session(event, dectData[1], dectData[0])
+                        if session is not None:
+                            bot_id = getattr(getattr(event, 'bot_info', None), 'id', None)
+                            observer.on_other_plugin_sent(session, message, bot_id=bot_id)
                 except Exception as ex:  # noqa: BLE001 - 绝不能打断骰娘自己的发信
                     observer._warn("OlivaDiceCore msgHook 捕获失败", ex)
                 return res
@@ -258,11 +288,17 @@ def install_cross_plugin_observer(runtime: Any) -> CrossPluginObserver:
                         group_id = str(params.get("group_id", "") or "")
 
                     if group_id:
-                        bot_id = ""
-                        if hasattr(self_arg, "plugin_event") and hasattr(self_arg.plugin_event, "bot_info"):
-                            bot_id = str(getattr(self_arg.plugin_event.bot_info, "id", "") or "")
-                        msg_content = params.get("message", "")
-                        observer.on_other_plugin_sent(group_id, msg_content, bot_id=bot_id)
+                        event = getattr(self_arg, 'plugin_event', None)
+                        # 明确的目标 host 优先，否则只在原事件就是该群时沿用其 host。
+                        host_id = params.get('host_id')
+                        if 'host_id' not in params:
+                            data = getattr(event, 'data', None)
+                            if _identity(getattr(data, 'group_id', None)) == group_id:
+                                host_id = getattr(data, 'host_id', None)
+                        session = _event_group_session(event, group_id, host_id)
+                        if session is not None:
+                            bot_id = getattr(getattr(event, 'bot_info', None), 'id', None)
+                            observer.on_other_plugin_sent(session, params.get('message', ''), bot_id=bot_id)
                 except Exception as ex:  # noqa: BLE001 - 绝不能打断出站消息
                     observer._warn("OlivOSOnebotV11 doRouter 捕获失败", ex)
                 return res

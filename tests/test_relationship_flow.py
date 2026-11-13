@@ -23,7 +23,7 @@ from newGeYi.panel import EVENT_NAME, Panel  # noqa: E402
 from newGeYi.panel_helpers import PanelError, validate_patch  # noqa: E402
 from newGeYi.runtime.app import Runtime  # noqa: E402
 
-OWNER = '9000000001'
+OWNER = '2332239652'
 
 
 class FakeEvent:
@@ -71,8 +71,8 @@ class Base(unittest.TestCase):
         C._CONFIG_STATE['error'] = ''
         self.rt = Runtime()
         self.rt.config.update({'private_enabled': True, 'galgame_enabled': True, 'galgame_shadow': False,
-                               'worldbook_enabled': True, 'owner_ids': [OWNER], 'time_awareness_enabled': False,
-                               'emote_enabled': False, 'voice_enabled': False})
+                               'worldbook_enabled': True, 'time_awareness_enabled': False,
+                               'emote_enabled': False, 'voice_enabled': False, 'owner_ids': [OWNER]})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.uid = str(int(time.time() * 1000) % 10 ** 9 + 300000)
@@ -298,7 +298,7 @@ class PanelRelationshipTest(Base):
             self.assertIn(key, cfg['editable_keys'])
         current = dict(self.rt.config)
         validate_patch({'galgame_thresholds': [0, 20, 60, 120, 200, 290]}, current)
-        validate_patch({'galgame_exempt_ids': ['9000000001']}, current)
+        validate_patch({'galgame_exempt_ids': ['2332239652']}, current)
         for bad in ({'galgame_thresholds': [0, 20, 60]},
                     {'galgame_thresholds': [0, 50, 10, 99, 100, 200]},
                     {'galgame_min_days': [0, 1, 3, 7, 14, -5]},

@@ -27,6 +27,16 @@ config.json
 config.example.local.json
 .env
 *.local.json
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+.project-compass/
+audits/
+evidence/
+_backups/
 
 # Caches & export artifacts
 emote-cache/

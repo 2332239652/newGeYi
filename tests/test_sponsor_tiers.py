@@ -269,9 +269,9 @@ class SponsorVisibilityTest(unittest.TestCase):
     def test_menu_thanks_uses_alias_then_masked_id(self):
         """有「叫我」称呼用称呼；没有就脱敏号码，绝不印完整 QQ 号。"""
         config = dict(self.CONFIG)
-        config['sponsor_tier1_ids'] = ['9000000001']
+        config['sponsor_tier1_ids'] = ['2332239652']
         config['sponsor_tier2_ids'] = ['3000011111']
-        text = self._router(config, aliases={'9000000001': '阿P'})._cmd_menu(None)
+        text = self._router(config, aliases={'2332239652': '阿P'})._cmd_menu(None)
         self.assertIn('阿P', text)
         self.assertIn('3*****1111', text)          # 没设称呼 → 脱敏
         self.assertNotIn('3000011111', text, '不该出现完整号码')

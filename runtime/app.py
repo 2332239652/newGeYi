@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
+from dataclasses import dataclass
+import copy
 import logging
 import os
 import random
@@ -107,6 +109,18 @@ class _ProcLogHandler(logging.Handler):
             pass
 
 
+@dataclass(frozen=True)
+class DeliveryResult:
+    """发送 API 的本地结果；accepted 不代表平台已确认收到。"""
+
+    accepted: bool
+    confirmed: bool = False
+    error: str = ''
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
 class Runtime:
     def __init__(self):
         self.proc = None
@@ -158,6 +172,7 @@ class Runtime:
         self.web_context = None
         self._self_sent_lock = threading.Lock()
         self._recent_self_sent: deque[tuple[str, str, float]] = deque(maxlen=40)
+        self._inflight_self_sent: Counter[tuple[str, str]] = Counter()
         self.cross_plugin_observer = None
         self._arrival_lock = threading.Lock()
         self._arrival_seq = 0
@@ -171,34 +186,54 @@ class Runtime:
     # 以前每个开关命令都 `self.r.config = load_config()`，换的只是这一个属性，
     # 而 attention / permissions / curator 等组件怀里抱的还是启动时那份字典
     # —— 于是命令回「✅」、行为却不变（第二次开关尤其明显）。见交接文档 §28。
-    _CFG_HOLDERS = ('prompt_builder', 'gateway', 'renderer', 'curator', 'images',
+    _CFG_HOLDERS = ('prompt_builder', 'renderer', 'curator', 'images',
                     'attention', 'permissions', 'group_profile', 'rest', 'memory', 'relationship')
 
+    @plugin_config.config_locked
     def apply_config(self) -> dict:
-        """把当前 self.config 推给所有缓存了配置的组件。"""
+        """Publish configuration to components while configuration writers serialize."""
         for name in self._CFG_HOLDERS:
             comp = getattr(self, name, None)
             if comp is not None and hasattr(comp, 'config'):
                 comp.config = self.config
+        gateway = getattr(self, 'gateway', None)
+        if gateway is not None:
+            gateway.reload(self.config)
         voice = getattr(self, 'voice_manager', None)
         if voice is not None:
             try:
                 voice.reload(self.config)
-            except Exception:  # noqa: BLE001 - 语音配置坏了不该挡住其它热更新
+            except Exception:
                 logger.exception('重载语音配置失败')
+                raise
         return self.config
 
+    @plugin_config.config_locked
+    def commit_config(self, candidate: dict, *, persist: bool = True) -> dict:
+        """Commit disk before publishing; never replace the shared dict identity."""
+        fresh = copy.deepcopy(candidate)
+        if persist:
+            plugin_config.save_config(fresh)
+        gateway = getattr(self, 'gateway', None)
+        invalidate = getattr(gateway, 'invalidate_config', None)
+        if callable(invalidate):
+            invalidate()
+        obsolete = set(self.config) - set(fresh)
+        self.config.update(fresh)
+        for key in obsolete:
+            del self.config[key]
+        self.apply_config()
+        return self.config
+
+    @plugin_config.config_locked
     def reload_config(self) -> str:
-        """重新读盘并**原地**更新配置，返回人话错误说明（空串 = 成功）。"""
+        if not plugin_config.get_config_path().is_file():
+            return '⚠ 配置文件缺失，保留上一份有效运行配置；请恢复文件后重载。'
         fresh = plugin_config.load_config()
         error = plugin_config.config_load_error()
-        self.config.clear()
-        self.config.update(fresh)
-        self.apply_config()
         if error:
-            return ('⚠ 配置文件解析失败：%s\n'
-                    '本次按默认值运行，磁盘上的文件**没有被覆盖**（已另存 .broken 备份）。'
-                    '改好 JSON 再发「重载设定」。' % error)
+            return ('⚠ 配置文件解析失败：%s\n保留上一份有效运行配置；磁盘原件及备份均保留。' % error)
+        self.commit_config(fresh, persist=False)
         return ''
 
     # ==================== 初始化 ====================
@@ -312,6 +347,10 @@ class Runtime:
             self.scheduler.shutdown()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            self.voice_manager.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception('关闭语音线程池失败')
         # 还原猴补丁：跨插件钩子是直接替换别人模块属性，不还原就会随重载层层嵌套
         try:
             if self.cross_plugin_observer is not None:
@@ -409,7 +448,8 @@ class Runtime:
         # 这句不走 process_job，所以私聊的用户轮要在这里补记：
         # 否则历史里会出现一条「她回了句睡下了」但前面没有对应提问的孤儿助手轮。
         self._remember_user_turn(msg)
-        self.reply(msg, text)
+        if not self.reply(msg, text).accepted:
+            return
         try:
             self._track_self_sent(msg.session, text, msg.is_group)
         except Exception:  # noqa: BLE001 - 记账失败不影响已经发出去的那句话
@@ -526,7 +566,7 @@ class Runtime:
             sender_name = aliases.display(self.store, sender_id, sender_name)
             session = self._session_key(event, is_group)
             # @码 → @名字：少数协议端不带 name=，这时至少把「@她自己」说成 @你，
-            # 别让模型看到一串数字（2026-11-04：她学会了写【@2309394954】）。
+            # 避免模型模仿账号数字前缀，显示名称统一由程序解析。
             try:
                 self_id = str((getattr(event, 'base_info', None) or {}).get('self_id', '') or '')
             except Exception:  # noqa: BLE001 - base_info 结构变了就当没有
@@ -794,13 +834,16 @@ class Runtime:
         cfg = self.config
         # 命令重载后组件重新读取最新配置
         self.prompt_builder.config = cfg
-        self.gateway.config = cfg
         self.renderer.config = cfg
         is_active = kind == 'active'
         session_key = msg.session.as_text()
         # 私聊先记账：后面有六条早退分支，以前每一条都会把她这句话弄丢
         remember_user = not msg.is_group
+        # 在写本轮用户消息之前冻结前序历史；后台评审延迟时也不会读到未来轮次。
+        relationship_history = ()
+        interaction_at = time.time()
         if remember_user:
+            relationship_history = tuple(dict(turn) for turn in self.store.recent_turns(session_key, limit=8))
             self._remember_user_turn(msg)
         # 静默期内不回复：以前只有 router 拦住了**新到**的消息，
         # 队列里已经排着的任务照样落地（静默刚生效时最明显）。
@@ -882,60 +925,24 @@ class Runtime:
                             spoken_level, msg.session.as_text()[-16:])
                 return
 
-        # 伴生原声语音派发与双轨输出
-        voice_annotation = ""
-        if rendered.voice_payload:
-            v_emotion, v_japanese = rendered.voice_payload
-            is_active_req = self.voice_manager.is_user_requesting_voice(msg.text)
-            group_id = str(msg.session.target_id) if msg.is_group else ""
-            group_name = ""
-            if msg.is_group and hasattr(self, 'group_profile'):
-                try:
-                    prof = self.group_profile.get(msg.session.as_text())
-                    if prof and getattr(prof, 'name', None):
-                        group_name = prof.name
-                except Exception:
-                    pass
-
-            queued = self.voice_manager.dispatch_voice(
-                event=msg.event,
-                session_type='group' if msg.is_group else 'private',
-                target_id=msg.session.target_id,
-                session_key=msg.session.as_text(),
-                emotion=v_emotion,
-                japanese_text=v_japanese,
-                is_active_request=is_active_req,
-                group_id=group_id,
-                group_name=group_name,
-                sender_name=msg.sender_name,
-            )
-            # 只有**真的排上了**才写进历史。以前不管发没发出去都写 [VOICE:…]，
-            # 于是网关离线或冷却拦下时，她之后会「记得」自己发过一条根本不存在的语音。
-            if queued:
-                voice_annotation = f" [VOICE:{v_emotion}|{v_japanese}]"
-            else:
-                logger.info('语音未发出（冷却/熔断/关闭），本次不写进历史：%s',
-                            msg.session.as_text()[-16:])
-        else:
-            self.voice_manager.mark_turn_without_voice(msg.session.as_text())
-
         plain_reply = op_codes_to_plain(rendered.text, names={msg.sender_id: msg.sender_name})
-        content_to_record = plain_reply + voice_annotation
-
-        # 状态提交：用户轮 + 回复轮（回复以纯文本入库，避免 OP 码污染上下文；附带语音事实）
-        # 私聊的用户轮已经在 process_job 开头记过了（保证早退分支也不丢）。
+        content_to_record = plain_reply
+        # 网关已独立记录每次调用用量；发送失败只阻止已发事实，不抹除生成成本。
+        delivery = self.reply(msg, rendered.text)
+        if not delivery.accepted:
+            return
+        # 普通 OlivOS send 返回 None：这里只确认 API 无异常返回，未获得平台 ack。
         if not remember_user:
-            self.store.add_turn(msg.session.as_text(), 'user', msg.text,
-                                msg.sender_id, msg.sender_name)
+            self.store.add_turn(session_key, 'user', msg.text, msg.sender_id, msg.sender_name)
         self.store.add_turn(
-            msg.session.as_text(), 'assistant', content_to_record,
+            session_key, 'assistant', content_to_record,
             model=result.model, in_tokens=result.input_tokens, out_tokens=result.output_tokens,
         )
-        self.reply(msg, rendered.text)
         # 私聊 galgame：回复发出后异步评审（不增加回复延迟，结果影响下一轮）
         if not msg.is_group:
             try:
-                self.relationship.after_reply(msg, plain_reply)
+                self.relationship.after_reply(
+                    msg, plain_reply, history=relationship_history, now=interaction_at)
             except Exception:  # noqa: BLE001 - 评审再出事也不能影响聊天
                 logger.exception('触发关系评审失败')
         # 遥测上报：记录一条已发出的文本回复（无论是否配音），点亮控制台触发率
@@ -979,19 +986,65 @@ class Runtime:
                 msg.session.as_text(), msg.arrival_seq, content_to_record
             )
 
-    # ==================== 回复发送 ====================
-    def reply(self, msg: IncomingMessage, text: str) -> None:
+        # 文字提交完成后再排语音；快回调也只会追加独立事实，不会重写后续轮次。
+        if rendered.voice_payload:
+            self._dispatch_reply_voice(msg, rendered.voice_payload)
+        else:
+            self.voice_manager.mark_turn_without_voice(session_key)
+
+    def _dispatch_reply_voice(self, msg: IncomingMessage, payload: tuple[str, str]) -> None:
+        emotion, japanese = payload
+        # 默认参数绑定冻结会话/文本；回调执行时不读取可变化的 rendered/result/config。
+        def on_success(_key, sent_emotion, sent_text, snapshot=msg):
+            self._track_self_sent(
+                snapshot.session, f'[VOICE:{sent_emotion}|{sent_text}]', snapshot.is_group)
+
+        group_name = ''
+        if msg.is_group:
+            try:
+                profile = self.group_profile.get(msg.session.as_text())
+                group_name = str(getattr(profile, 'name', '') or '')
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            event = msg.event
-            plain = op_codes_to_plain(text).strip()
-            with self._self_sent_lock:
-                self._recent_self_sent.append((str(msg.session.target_id), plain, time.time()))
-            if msg.is_group:
-                event.send('group', msg.session.target_id, text)
-            else:
-                event.send('private', msg.session.target_id, text)
+            self.voice_manager.dispatch_voice(
+                event=msg.event, session_type='group' if msg.is_group else 'private',
+                target_id=msg.session.target_id, session_key=msg.session.as_text(),
+                emotion=emotion, japanese_text=japanese,
+                is_active_request=self.voice_manager.is_user_requesting_voice(msg.text),
+                group_id=str(msg.session.target_id) if msg.is_group else '',
+                group_name=group_name, sender_name=msg.sender_name, on_success=on_success,
+            )
         except Exception:  # noqa: BLE001
+            logger.exception('语音入队失败')
+
+    # ==================== 回复发送 ====================
+    def reply(self, msg: IncomingMessage, text: str) -> DeliveryResult:
+        plain = op_codes_to_plain(text).strip()
+        cache_key = (msg.session.as_text(), plain)
+        # 同步出站观察钩子可在 send 返回前触发；临时抑制不代表已发事实。
+        with self._self_sent_lock:
+            self._inflight_self_sent[cache_key] += 1
+        try:
+            response = msg.event.send('group' if msg.is_group else 'private', msg.session.target_id, text)
+            # send() 当前无返回；仅对适配器明确报告的错误作失败处理。
+            failed = response is False
+            if isinstance(response, dict):
+                failed = (response.get('active') is False or response.get('status') == 'failed'
+                          or ('retcode' in response and response['retcode'] != 0))
+            if failed:
+                return DeliveryResult(False, error='adapter_rejected')
+            with self._self_sent_lock:
+                self._recent_self_sent.append((cache_key[0], plain, time.time()))
+            return DeliveryResult(True)
+        except Exception as ex:  # noqa: BLE001
             logger.exception('reply failed')
+            return DeliveryResult(False, error=str(ex))
+        finally:
+            with self._self_sent_lock:
+                self._inflight_self_sent[cache_key] -= 1
+                if self._inflight_self_sent[cache_key] <= 0:
+                    del self._inflight_self_sent[cache_key]
 
     def _track_self_sent(self, session, text: str, is_group: bool) -> None:
         """把她自己发出的一句话记进「她说过什么」的账本。
@@ -1009,7 +1062,7 @@ class Runtime:
             return
         try:
             with self._self_sent_lock:
-                self._recent_self_sent.append((str(session.target_id), plain, time.time()))
+                self._recent_self_sent.append((session.as_text(), plain, time.time()))
         except Exception:  # noqa: BLE001 - 记账失败不能影响已经发出去的消息
             pass
         try:
@@ -1023,16 +1076,18 @@ class Runtime:
             except Exception:  # noqa: BLE001
                 logger.debug('戳一戳回复写入旁观窗口失败', exc_info=True)
 
-    def is_recently_sent_by_self(self, target_id: str, text: str) -> bool:
-        """检查指定文本是否为歌伊本体最近发出的回复。"""
+    def is_recently_sent_by_self(self, session_key: str, text: str) -> bool:
+        """按完整会话与完整文本识别本体回复，避免同号群/私聊跨实例误抑制。"""
         now = time.time()
-        tid = str(target_id).strip()
+        tid = str(session_key).strip()
         clean = op_codes_to_plain(text).strip()
         with self._self_sent_lock:
+            if self._inflight_self_sent.get((tid, clean), 0):
+                return True
             while self._recent_self_sent and now - self._recent_self_sent[0][2] > 10.0:
                 self._recent_self_sent.popleft()
             for gid, sent_text, _ in self._recent_self_sent:
-                if gid == tid and (sent_text == clean or clean in sent_text or sent_text in clean):
+                if gid == tid and sent_text == clean:
                     return True
         return False
 

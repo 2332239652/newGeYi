@@ -34,14 +34,25 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import logging
+import os
 import re
+import socket
 import threading
 import time
 from collections import deque
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+    from urllib3.util import Timeout
+    PINNING_AVAILABLE = True
+except ImportError:
+    # 裁剪过的宿主缺少连接能力时保持插件加载；网络图片按失败处理。
+    PINNING_AVAILABLE = False
 
 logger = logging.getLogger('newGeYi.images')
 
@@ -49,14 +60,9 @@ logger = logging.getLogger('newGeYi.images')
 # 一个恶意/异常链接就能把内存吃满，或者借她的进程去访问本机服务）
 DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024
 DEFAULT_MAX_REDIRECTS = 3
-# 裸 base64 只接受「一看就是图片」的载荷：短于这个长度或解出来不是图片就丢掉，
-# 否则任何字符串都会被 `b64decode(validate=False)` 当成图片塞进请求体。
-B64_SHAPE_RE = re.compile(r'^[A-Za-z0-9+/\s]{64,}={0,2}$')
-MIN_B64_CHARS = 64
-
 # 收到的是 OP 码或 CQ 码都可能（取决于 message_mode），两种都认
 IMAGE_CODE_RE = re.compile(r'\[(?:OP|CQ):image([^\]]*)\]')
-PARAM_RE = re.compile(r'([A-Za-z_]+)=([^,\]]*)')
+PARAM_RE = re.compile(r'([A-Za-z_]+)=((?:(?!,[A-Za-z_]+=)[^\]])*)')
 # 「这条消息在说图」——只有这种消息才允许跨发送者回溯
 IMAGE_WORD_RE = re.compile(r'立绘|图|照片|截图|相片|表情包|这张|那张|这图|看|这是啥|这是什么|发了啥|发了什么|上面|评价|识别')
 
@@ -88,9 +94,117 @@ def host_is_local(host: str) -> bool:
     try:
         addr = ipaddress.ip_address(name)
     except ValueError:
-        return False                      # 普通域名：不做 DNS（会在取图线程里多一次阻塞）
-    return bool(addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
+        return False                      # 普通域名由 _target 检查全部 DNS 结果。
+    mapped = getattr(addr, 'ipv4_mapped', None)
+    if mapped is not None:
+        addr = mapped
+    return not addr.is_global or addr.is_multicast or addr.is_unspecified
+
+
+class _ImageSession(requests.Session):
+    def resolve_redirects(self, *args, **kwargs):
+        # requests 即使 allow_redirects=False 也会为 Response.next 预读跳转体；禁用该路径。
+        return iter(())
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """仅本次图片请求使用；TCP 直连验证过的 sockaddr，TLS 仍验证原域名。"""
+
+    def __init__(self, scheme, host, port, address, deadline, monotonic):
+        self._deadline = deadline
+        self._monotonic = monotonic
+        self._sockets = []
+        self._socket_lock = threading.Lock()
+        self._expired = False
+        owner = self
+
+        class PinnedConnection:
+            def _new_conn(self):
+                family, socktype, proto, sockaddr = address
+                sock = socket.socket(family, socktype, proto)
+                with owner._socket_lock:
+                    if owner._expired:
+                        sock.close()
+                        raise TimeoutError('image deadline exceeded')
+                    owner._sockets.append(sock)
+                try:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('image deadline exceeded')
+                    sock.settimeout(remaining)
+                    for option in self.socket_options or ():
+                        sock.setsockopt(*option)
+                    sock.connect(sockaddr)
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('image deadline exceeded')
+                    # TLS 握手继承重算后的剩余时间，而非 connect 开始时的预算。
+                    sock.settimeout(remaining)
+                    return sock
+                except Exception:
+                    sock.close()
+                    raise
+
+            def connect(self):
+                super().connect()
+                # HTTPS wrap_socket 创建了新 socket 对象；到期时也要关闭它。
+                with owner._socket_lock:
+                    if owner._expired:
+                        self.sock.close()
+                        raise TimeoutError('image deadline exceeded')
+                    owner._sockets.append(self.sock)
+
+        class PinnedHTTP(PinnedConnection, HTTPConnection):
+            pass
+
+        class PinnedHTTPS(PinnedConnection, HTTPSConnection):
+            pass
+
+        super().__init__(max_retries=0)
+        if scheme == 'https':
+            self._pool = HTTPSConnectionPool(host, port, maxsize=1, block=True,
+                                            assert_hostname=host, server_hostname=host)
+            self._pool.ConnectionCls = PinnedHTTPS
+        else:
+            self._pool = HTTPConnectionPool(host, port, maxsize=1, block=True)
+            self._pool.ConnectionCls = PinnedHTTP
+        self._timer = threading.Timer(max(0.001, deadline - monotonic()), self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _expire(self):
+        with self._socket_lock:
+            self._expired = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+    def get_connection(self, url, proxies=None):
+        if proxies:
+            raise ValueError('image proxy is disabled')
+        return self._pool
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if verify is not True or cert is not None:
+            raise ValueError('image TLS verification is required')
+        return self.get_connection(request.url, proxies)
+
+    def send(self, request, **kwargs):
+        if kwargs.get('verify', True) is not True or kwargs.get('proxies'):
+            raise ValueError('image TLS/proxy policy violation')
+        if self._monotonic() >= self._deadline:
+            raise TimeoutError('image deadline exceeded')
+        return super().send(request, **kwargs)
+
+    def close(self):
+        self._timer.cancel()
+        self._expire()
+        self._pool.close()
+        super().close()
 
 
 MIME_BY_SUFFIX = {
@@ -161,24 +275,23 @@ def _downscale(payload: bytes, max_bytes: int) -> tuple[bytes, str] | None:
     return None
 
 
-def _guess_mime(source: str, content_type: str = '') -> str:
-    """按 Content-Type 优先、其次按后缀猜 MIME。"""
-    ctype = (content_type or '').split(';')[0].strip().lower()
-    if ctype in SUPPORTED_MIMES:
-        return 'image/jpeg' if ctype == 'image/jpg' else ctype
-    lowered = str(source or '').lower().split('?')[0]
-    for suffix, mime in MIME_BY_SUFFIX.items():
-        if lowered.endswith(suffix):
-            return mime
-    return 'image/jpeg'
-
-
 class ImageContext:
     """按会话记住最近收到的图，并在需要时转成可发送的 data URL。"""
 
-    def __init__(self, config: dict, http=None, clock=time.time):
+    def __init__(self, config: dict, http=None, clock=time.time, *, resolver=None,
+                 monotonic=time.monotonic):
         self.config = config
-        self._http = http or requests
+        if not PINNING_AVAILABLE:
+            logger.warning('宿主缺少 urllib3 IP 绑定能力，跳过网络图片')
+        # http 只作离线测试传输注入；生产流量始终使用私有 pinned Session。
+        self._http = http
+        self._resolver = resolver or socket.getaddrinfo
+        self._monotonic = monotonic
+        self._dns_slots = threading.BoundedSemaphore(2)
+        roots = config.get('image_local_allowed_roots', [])
+        self._local_roots = tuple(os.path.normcase(os.path.realpath(root)) for root in roots
+                                  if isinstance(root, str) and os.path.isabs(root) and os.path.isdir(root)) \
+            if isinstance(roots, (list, tuple)) else ()
         self._clock = clock
         self._lock = threading.RLock()
         # session_key -> deque[(sender_id, [refs], ts)]，只留最近几张
@@ -416,7 +529,13 @@ class ImageContext:
         以前超过 4MB 直接丢（线上一天能丢好几次 5~12MB 的截图）。现在能压就压，
         压不下来才算"没收到"。
         """
-        max_bytes = int(self.config.get('image_max_bytes', DEFAULT_MAX_BYTES) or DEFAULT_MAX_BYTES)
+        actual = sniff_image_mime(payload)
+        if not actual or actual not in SUPPORTED_MIMES or len(payload) > self._input_cap():
+            return ''
+        if mime and self._normal_mime(mime) != actual:
+            return ''
+        mime = actual
+        max_bytes = max(1, int(self.config.get('image_max_bytes', DEFAULT_MAX_BYTES) or DEFAULT_MAX_BYTES))
         if len(payload) > max_bytes:
             original_kb = len(payload) / 1024
             fitted = _downscale(payload, max_bytes)
@@ -474,8 +593,6 @@ class ImageContext:
         ref = str(ref or '').strip()
         if not ref:
             return ''
-        if ref.startswith('data:'):
-            return ref
         cached = self._cache_get(ref)
         if cached:
             return cached
@@ -498,113 +615,222 @@ class ImageContext:
         self._cache_put(ref, data_url)
         return data_url
 
-    def _fetch(self, ref: str) -> tuple[bytes, str]:
-        """把一个来源取成 (字节, MIME)。取不到返回 (b'', '')。"""
-        if ref.startswith(('http://', 'https://')):
-            return self._fetch_url(ref)
-        # 本地路径（支持 file:/// 协议与常规绝对路径，自动适配 Windows 盘符与 Linux 根路径）
-        import os
-        import urllib.parse
-        import urllib.request
-        local = ref
-        if local.startswith(('file:///', 'file://')):
-            parsed = urllib.parse.urlparse(local)
-            local = urllib.request.url2pathname(urllib.parse.unquote(parsed.path))
-            if not local and parsed.netloc:
-                local = urllib.request.url2pathname(urllib.parse.unquote(parsed.netloc))
-        else:
-            local = urllib.parse.unquote(local)
-        if os.path.isfile(local):
-            with open(local, 'rb') as handle:
-                return handle.read(), _guess_mime(local)
-        if os.path.isfile(ref):
-            with open(ref, 'rb') as handle:
-                return handle.read(), _guess_mime(ref)
-        # 裸 base64：只认「长得像 base64 且解出来真是图片」的。
-        # 以前任何字符串都会 b64decode(validate=False) → 一串普通文字也会被当成图片
-        # 塞进请求体，既浪费 token 又更容易造出 400（2026-11-03 审查发现）。
-        slim = str(ref or '').strip()
-        if len(slim) < MIN_B64_CHARS or not B64_SHAPE_RE.match(slim):
-            return b'', ''
-        try:
-            payload = base64.b64decode(slim, validate=True)
-        except Exception:  # noqa: BLE001
-            return b'', ''
-        mime = sniff_image_mime(payload)
-        if not mime:
-            return b'', ''
-        return payload, mime
-
-    def _fetch_url(self, url: str) -> tuple[bytes, str]:
-        """下载一张网络图片：限体积、限重定向、拒绝内网地址。"""
-        try:
-            host = urlparse(url).hostname or ''
-        except ValueError:
-            host = ''
-        if host_is_local(host):
-            self._log_once(url, '图片地址指向本机/内网（%s），已拒绝下载' % (host or '?'), warn=True)
-            return b'', ''
-        timeout = float(self.config.get('image_download_timeout', DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
-        cap = int(self.config.get('image_download_max_bytes', DEFAULT_MAX_DOWNLOAD) or 0)
-        max_redirects = int(self.config.get('image_download_max_redirects',
-                                            DEFAULT_MAX_REDIRECTS) or 0)
-        try:
-            resp = self._http.get(url, timeout=timeout, stream=True)
-        except TypeError:                       # 注入的 http 客户端可能不认 stream
-            resp = self._http.get(url, timeout=timeout)
-        status = getattr(resp, 'status_code', 200)
-        if status != 200:
-            # QQ 图链过期会返回 400 + {"retcode":-5503007,"download url has expired"}，
-            # 把这句话抄进日志，不然只看"取图失败"根本不知道为什么
-            body = ''
-            try:
-                body = str(resp.text or '')[:120].replace('\n', ' ')
-            except Exception:  # noqa: BLE001
-                pass
-            self._log_once(url, '图片下载被拒（HTTP %s）：%s' % (status, body), warn=True)
-            return b'', ''
-        redirects = len(getattr(resp, 'history', ()) or ())
-        if max_redirects >= 0 and redirects > max_redirects:
-            self._log_once(url, '图片下载重定向过多（%d 次），已放弃' % redirects, warn=True)
-            return b'', ''
-        headers = getattr(resp, 'headers', {}) or {}
-        ctype = str(headers.get('Content-Type', '') or '')
-        if ctype and not ctype.lower().startswith(
-                ('image/', 'application/octet-stream', 'binary/octet-stream')):
-            self._log_once(url, '下载到的不是图片（Content-Type=%s），已丢弃' % ctype[:40], warn=True)
-            return b'', ''
-        payload = self._read_capped(resp, cap)
-        if not payload:
-            if cap:
-                self._log_once(url, '图片超过大小上限（%d KB），已跳过' % (cap // 1024), warn=True)
-            return b'', ''
-        mime = sniff_image_mime(payload) or _guess_mime(url, ctype)
-        return payload, mime
+    def _input_cap(self):
+        # 0/负值不再表示无限；绝对上限也约束管理员误配。
+        configured = int(self.config.get('image_download_max_bytes', DEFAULT_MAX_DOWNLOAD) or 0)
+        return min(configured, DEFAULT_MAX_DOWNLOAD) if configured > 0 else DEFAULT_MAX_DOWNLOAD
 
     @staticmethod
-    def _read_capped(resp, cap: int) -> bytes:
-        """读响应体，超过 `cap` 就整体放弃（不把超大体留在内存里）。"""
-        chunks: list[bytes] = []
-        total = 0
-        iterator = None
-        if hasattr(resp, 'iter_content'):
+    def _normal_mime(mime):
+        mime = str(mime or '').split(';', 1)[0].strip().lower()
+        return 'image/jpeg' if mime == 'image/jpg' else mime
+
+    def _validated(self, payload, declared=''):
+        mime = sniff_image_mime(payload)
+        declared = self._normal_mime(declared)
+        if not payload or len(payload) > self._input_cap() or mime not in SUPPORTED_MIMES:
+            return b'', ''
+        if declared and declared not in ('application/octet-stream', 'binary/octet-stream') and declared != mime:
+            return b'', ''
+        return payload, mime
+
+    def _decode_base64(self, encoded, declared=''):
+        cap = self._input_cap()
+        if not encoded or len(encoded) > 4 * ((cap + 2) // 3):
+            return b'', ''
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            return b'', ''
+        return self._validated(payload, declared)
+
+    def _fetch(self, ref: str) -> tuple[bytes, str]:
+        """本地、data、HTTP 入口都走有限读取和魔数/MIME 校验。"""
+        ref = str(ref or '').strip()
+        if ref.startswith(('http://', 'https://')):
+            return self._fetch_url(ref)
+        if ref.startswith('data:'):
+            header, sep, encoded = ref.partition(',')
+            declared = header[5:-7] if header.endswith(';base64') else ''
+            if not sep or self._normal_mime(declared) not in SUPPORTED_MIMES:
+                return b'', ''
+            return self._decode_base64(encoded, declared)
+        if ref.startswith('base64://'):
+            return self._decode_base64(ref[9:])
+        # 仅管理员确认的 adapter 缓存目录；没有可信 root 就跳过本地引用。
+        local = unquote(ref)
+        if ref.startswith('file:'):
+            parsed = urlparse(ref)
+            if parsed.netloc or parsed.query or parsed.fragment:
+                return b'', ''
+            local = unquote(parsed.path)
+            if os.name == 'nt' and re.match(r'^/[A-Za-z]:/', local):
+                local = local[1:]
+        if os.path.isabs(local):
+            if not self._local_roots or local.startswith(('\\\\', '//', '\\\\?\\', '\\\\.\\')):
+                return b'', ''
+            real = os.path.normcase(os.path.realpath(local))
+            # Windows ADS 也不当作缓存文件。
+            if os.name == 'nt' and ':' in os.path.splitdrive(real)[1]:
+                return b'', ''
             try:
-                iterator = resp.iter_content(65536)
-            except TypeError:
-                iterator = None
-        if iterator is None:
-            body = getattr(resp, 'content', b'') or b''
-            if cap and len(body) > cap:
+                if not any(os.path.commonpath((root, real)) == root for root in self._local_roots):
+                    return b'', ''
+                if not os.path.isfile(real) or os.path.getsize(real) > self._input_cap():
+                    return b'', ''
+                with open(real, 'rb') as handle:
+                    if os.fstat(handle.fileno()).st_size > self._input_cap():
+                        return b'', ''
+                    payload = handle.read(self._input_cap() + 1)
+                return self._validated(payload)
+            except (OSError, ValueError):
+                return b'', ''
+        return self._decode_base64(ref)
+
+    def _resolve(self, host, port, deadline):
+        """调用方等待有界；系统 DNS 可能继续阻塞，最多留两个 daemon 查询。"""
+        if not self._dns_slots.acquire(blocking=False):
+            return []
+        done = threading.Event()
+        result = []
+
+        def query():
+            try:
+                result.extend(self._resolver(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM))
+            except Exception:  # DNS 失败只丢图
+                pass
+            finally:
+                self._dns_slots.release()
+                done.set()
+
+        try:
+            thread = threading.Thread(target=query, name='geyi-image-dns', daemon=True)
+            thread.start()
+        except Exception:
+            self._dns_slots.release()
+            return []
+        if not done.wait(max(0, deadline - self._monotonic())):
+            return []
+        return result if self._monotonic() < deadline else []
+
+    def _target(self, url, deadline):
+        if any(char.isspace() or ord(char) < 32 for char in url) or '\\' in url:
+            return None
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ('http', 'https') or parsed.username is not None or parsed.password is not None:
+                return None
+            host = (parsed.hostname or '').encode('idna').decode('ascii').lower()
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == 'https' else 80)
+            if not 0 < port <= 65535 or '%' in host or host_is_local(host):
+                return None
+            records = self._resolve(host, port, deadline)
+            if not records:
+                return None
+            addresses = []
+            for family, kind, proto, _, sockaddr in records:
+                if family not in (socket.AF_INET, socket.AF_INET6) or kind != socket.SOCK_STREAM:
+                    return None
+                ipaddress.ip_address(sockaddr[0])  # sockaddr 必须是 IP，绝不再次解析名字。
+                if sockaddr[1] != port or host_is_local(sockaddr[0]):
+                    return None
+                address = (family, kind, proto, sockaddr)
+                if address not in addresses:
+                    addresses.append(address)
+            return parsed.scheme, host, port, addresses[0]
+        except (ValueError, UnicodeError, IndexError, TypeError):
+            return None
+
+    def _request_pinned(self, url, target, deadline):
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError('image deadline exceeded')
+        if self._http is not None:
+            # 测试注入也必须接受禁跳转语义；不降级到会自动跳转的 get(url)。
+            return self._http.get(url, timeout=remaining, stream=True, allow_redirects=False), None
+        if not PINNING_AVAILABLE:
+            raise RuntimeError('image IP pinning unavailable')
+        scheme, host, port, address = target
+        session = _ImageSession()
+        session.trust_env = False  # 不走环境代理/netrc，防代理端再次解析域名。
+        adapter = _PinnedAdapter(scheme, host, port, address, deadline, self._monotonic)
+        session.mount(scheme + '://', adapter)
+        authority = '[' + host + ']' if ':' in host else host
+        if port != (443 if scheme == 'https' else 80):
+            authority += ':' + str(port)
+        try:
+            response = session.get(url, headers={'Host': authority, 'Accept-Encoding': 'identity'},
+                                   stream=True, allow_redirects=False, verify=True, proxies={},
+                                   timeout=Timeout(total=remaining, connect=remaining, read=remaining))
+            return response, session
+        except Exception:
+            session.close()
+            raise
+
+    def _fetch_url(self, url: str) -> tuple[bytes, str]:
+        """每跳连接前验证全部 DNS 结果；下载共享 deadline、绝对字节上限。"""
+        timeout = float(self.config.get('image_download_timeout', DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+        timeout = min(max(timeout, 0.001), 60.0)
+        deadline = self._monotonic() + timeout
+        cap = self._input_cap()
+        max_redirects = min(max(0, int(self.config.get('image_download_max_redirects',
+                                                     DEFAULT_MAX_REDIRECTS) or 0)), DEFAULT_MAX_REDIRECTS)
+        for hop in range(max_redirects + 1):
+            target = self._target(url, deadline)
+            if target is None or self._monotonic() >= deadline:
+                return b'', ''
+            resp = session = None
+            try:
+                resp, session = self._request_pinned(url, target, deadline)
+                if self._monotonic() >= deadline:
+                    return b'', ''
+                headers = resp.headers or {}
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = str(headers.get('Location', '') or '')
+                    if not location or hop >= max_redirects:
+                        return b'', ''
+                    url = urljoin(url, location)
+                    continue
+                if resp.status_code != 200:
+                    # 不读取错误响应的 text/content；错误页也可能无限大。
+                    return b'', ''
+                ctype = self._normal_mime(headers.get('Content-Type', ''))
+                if ctype and ctype not in SUPPORTED_MIMES | {'application/octet-stream', 'binary/octet-stream'}:
+                    return b'', ''
+                encoding = str(headers.get('Content-Encoding', 'identity')).strip().lower()
+                if encoding not in ('', 'identity'):
+                    return b'', ''  # 不让压缩流在解压器里先膨胀。
+                length = headers.get('Content-Length')
+                if length is not None and (int(length) < 0 or int(length) > cap):
+                    return b'', ''
+                payload = self._read_capped(resp, cap, deadline)
+                return self._validated(payload, ctype)
+            except Exception as exc:
+                self._log_once(url, '图片下载失败（%s）' % type(exc).__name__)
+                return b'', ''
+            finally:
+                try:
+                    if resp is not None:
+                        resp.close()
+                finally:
+                    if session is not None:
+                        session.close()
+        return b'', ''
+
+    def _read_capped(self, resp, cap: int, deadline: float) -> bytes:
+        chunks = []
+        total = 0
+        # 不访问 response.content/text（它们会先完整读入内存）。
+        for chunk in resp.iter_content(chunk_size=min(65536, cap + 1)):
+            if self._monotonic() >= deadline:
                 return b''
-            return bytes(body)
-        for chunk in iterator:
             if not chunk:
                 continue
             total += len(chunk)
-            if cap and total > cap:
+            if total > cap:
                 return b''
             chunks.append(chunk)
-        return b''.join(chunks)
+        return b''.join(chunks) if self._monotonic() < deadline else b''
 
     # ==================== 缓存 ====================
     def _cache_get_locked(self, ref: str, now: float | None = None) -> str:

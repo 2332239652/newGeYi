@@ -92,24 +92,17 @@ class CommandRouter:
         self._pending_forget: dict[str, float] = {}
 
     # ------------- 公共 -------------
+    @plugin_config.config_locked
     def _save_and_reload(self, changes: dict | None = None) -> None:
-        """改配置 + 写盘 + 热更新（配置字典 identity 不变，所有组件立刻看到新值）。
-
-        - `changes` 是要改的键值；**先快照再改**，所以写盘失败能把内存一起回滚
-          （否则会出现「命令说没写盘、行为却已经变了」这种更难查的状态）。
-        - 写盘失败抛 `ConfigWriteBlocked`，由 `try_handle` 统一回一句「没有写盘」，
-          **绝不**用默认配置覆盖用户手改的文件。
-        """
-        cfg = self.r.config
-        snapshot = copy.deepcopy(cfg)
-        if changes:
-            cfg.update(changes)
-        try:
-            plugin_config.save_config(cfg)
-        except Exception:
-            cfg.clear()
-            cfg.update(snapshot)
-            raise
+        candidate = copy.deepcopy(self.r.config)
+        candidate.update(changes or {})
+        commit = getattr(self.r, 'commit_config', None)
+        if callable(commit):
+            commit(candidate)
+            return
+        # Lightweight runtimes used by integrations retain the same writer order.
+        plugin_config.save_config(candidate)
+        self.r.config.update(candidate)
         reload_fn = getattr(self.r, 'reload_config', None)
         if callable(reload_fn):
             error = reload_fn()
@@ -557,6 +550,7 @@ class CommandRouter:
         alias = parts[1].strip() if len(parts) > 1 else ''
         return uid, CommandRouter._TIER_ALIAS.get(alias, 0)
 
+    @plugin_config.config_locked
     def _cmd_sponsor_add(self, msg: IncomingMessage, arg: str) -> str:
         uid, tier = self._parse_sponsor_arg(arg)
         if not uid:
@@ -587,6 +581,7 @@ class CommandRouter:
                 '（爱发电那边确认收到钱再加人，别提前加）'
                 % (sponsors.TIER_NAMES[tier], quota, extra))
 
+    @plugin_config.config_locked
     def _cmd_sponsor_remove(self, msg: IncomingMessage, arg: str) -> str:
         uid = str(arg or '').strip().split()[0] if str(arg or '').strip() else ''
         if not uid.isdigit():
@@ -728,7 +723,7 @@ class CommandRouter:
             return f'找不到序号为 {idx} 的记忆呢。请发送「我的记忆」确认序号（目前共有 1~{len(fact_items)} 条）～'
 
         fact_id, fact_text = fact_items[idx - 1]
-        deleted = self.r.store.delete_user_fact_by_id(fact_id, uid)
+        deleted = self.r.store.delete_user_fact_by_id(fact_id, uid, source_session=session_key)
         if deleted:
             return f'✅ 已为你删除第 {idx} 条记忆：「{fact_text}」'
         return '删除失败，该条记忆可能已被删除。请发送「我的记忆」刷新查看～'
@@ -1035,6 +1030,7 @@ class CommandRouter:
         self.r.store.clear_turns(msg.session.as_text())
         return '✅ 已重置当前会话上下文'
 
+    @plugin_config.config_locked
     def _cmd_reload(self, msg: IncomingMessage) -> str:
         """重新读盘并热更新：配置 / 角色设定 / 世界书 / 语音 / 静默 / 记忆。
 
@@ -1053,6 +1049,7 @@ class CommandRouter:
             return error + '\n（其它组件已按内存里现有的配置重新读过；磁盘文件没有被覆盖）'
         return '✅ 已重载 配置/角色设定/世界书/权限/群额度/记忆/静默/语音'
 
+    @plugin_config.config_locked
     def _cmd_trigger_add(self, msg: IncomingMessage, arg: str) -> str:
         arg = arg.strip()
         if not arg:
@@ -1063,6 +1060,7 @@ class CommandRouter:
             self._save_and_reload({'triggers': triggers})
         return f'✅ 触发词: {", ".join(self.r.config.get("triggers", []))}'
 
+    @plugin_config.config_locked
     def _cmd_trigger_del(self, msg: IncomingMessage, arg: str) -> str:
         arg = arg.strip()
         if not arg:
@@ -1242,10 +1240,13 @@ class CommandRouter:
             self.r.voice_manager.reload(self.r.config)
         return f"✅ 已{'开启' if enable else '关闭'}伴生语音输出"
 
+    @plugin_config.config_locked
     def _cmd_voice_reload(self, msg: IncomingMessage) -> str:
         reload_fn = getattr(self.r, 'reload_config', None)
         if callable(reload_fn):
-            reload_fn()
+            error = reload_fn()
+            if error:
+                return str(error)
         if hasattr(self.r, 'voice_manager'):
             self.r.voice_manager.reload(self.r.config)
         return "✅ 已重新加载语音配置与预设词库"
@@ -1568,19 +1569,18 @@ class CommandRouter:
             # 只写**当前正在用的那一个渠道**。以前会把同一个 key 灌进所有「还没填 key」
             # 的渠道，而那些渠道可能是别家厂商——key 一通、全线 401，等于把钥匙到处撒。
             # 在副本上改，再一次性提交：写盘失败时内存也不会被带歪。
-            providers = copy.deepcopy(self.r.config.get('providers') or [])
-            name = str(getattr(self.r.gateway, '_current_name', '') or '')
-            hit = False
-            for prov in providers:
-                if isinstance(prov, dict) and name and prov.get('name') == name:
-                    prov['api_key'] = key
-                    hit = True
-            changes = {'api_key': key}
-            if hit:
-                changes['providers'] = providers
-            self._save_and_reload(changes)
-            if self.r.gateway:
-                self.r.gateway.reload(self.r.config)
+            with plugin_config.CONFIG_LOCK:
+                providers = copy.deepcopy(self.r.config.get('providers') or [])
+                name = str(getattr(self.r.gateway, '_current_name', '') or '')
+                hit = False
+                for prov in providers:
+                    if isinstance(prov, dict) and name and prov.get('name') == name:
+                        prov['api_key'] = key
+                        hit = True
+                changes = {'api_key': key}
+                if hit:
+                    changes['providers'] = providers
+                self._save_and_reload(changes)
             where = f'渠道「{name}」' if hit else '单渠道模式（api_key）'
             self.r.reply(msg, f'✅ 已设置 {where} 的 API Key（{_mask_key(key)}），已重载网关并立即生效\n'
                               f'数据保存在 {plugin_config.get_config_path()}')

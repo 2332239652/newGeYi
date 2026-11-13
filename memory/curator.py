@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -174,6 +175,45 @@ def extract_json(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def validate_curator_data(data: dict) -> None:
+    """完整校验已知 schema 后才允许写库；缺省字段兼容合法空对象。"""
+    if not isinstance(data, dict):
+        raise ValueError('curator schema: expected object')
+    if 'group_summary' in data and not isinstance(data['group_summary'], str):
+        raise ValueError('curator schema: group_summary must be string')
+    fields = {
+        'user_facts': ('user_id', 'fact', 'category', 'scope'),
+        'user_impressions': ('user_id', 'summary'),
+        'self_memories': ('content', 'kind'),
+    }
+    required = {'user_facts': ('user_id', 'fact'),
+                'user_impressions': ('user_id', 'summary'), 'self_memories': ('content',)}
+    for field, strings in fields.items():
+        items = data.get(field, [])
+        if not isinstance(items, list):
+            raise ValueError(f'curator schema: {field} must be array')
+        # 连同超过写入条数上限的尾项一起验证，避免半批合法掩盖坏输出。
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(f'curator schema: {field} item must be object')
+            for key in strings:
+                if (key in item or key in required[field]) and not isinstance(item.get(key), str):
+                    raise ValueError(f'curator schema: {field}.{key} must be string')
+            if 'importance' in item:
+                value = item['importance']
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not 0 <= value <= 1 or not math.isfinite(value)):
+                    raise ValueError(f'curator schema: {field}.importance must be finite number in [0,1]')
+            if 'keywords' in item:
+                value = item['keywords']
+                if not (isinstance(value, str) or
+                        isinstance(value, list) and all(isinstance(word, str) for word in value)):
+                    raise ValueError(f'curator schema: {field}.keywords must be string or string array')
+    expired = data.get('expired_fact_ids', [])
+    if not isinstance(expired, list) or any(type(fid) is not int or fid <= 0 for fid in expired):
+        raise ValueError('curator schema: expired_fact_ids must be positive integer array')
+
+
 class MemoryCurator:
     """后台把缓冲消息提炼进四层记忆。"""
 
@@ -324,6 +364,61 @@ class MemoryCurator:
                 lines.append(f'[未知用户 {name}] {content}')
         return '\n'.join(lines), valid_ids
 
+    def _fragment_state(self, session_key: str) -> tuple[int, int]:
+        raw = self.store.get_setting(f'mem.fragment:{session_key}', '[0,0]')
+        try:
+            row_id, offset = json.loads(raw)
+            if type(row_id) is int and type(offset) is int and row_id >= 0 and offset >= 0:
+                return row_id, offset
+        except (ValueError, TypeError):
+            pass
+        return 0, 0
+
+    def _select_records(self, fetched: list[dict], rows: list[dict], cursor: int,
+                        fragment: tuple[int, int]) -> tuple[str, list[dict], int, tuple[int, int]]:
+        """普通记录完整装入8000字符预算；超长首条逐片提交，原文留在L0。"""
+        budget = 8000
+        allowed = {row['id'] for row in rows}
+        lines, selected = [], []
+        last_id, used = cursor, 0
+        for row in fetched:
+            if row['id'] not in allowed:
+                last_id = row['id']       # 遗忘水位明确排除的原文
+                continue
+            # 分片偏移基于稳定渲染；assistant_name可在重启时改变，别让可变前缀
+            # 挪动已持久化的字符位置。用户行使用L0里保存的昵称，天然稳定。
+            if row.get('role') == 'assistant':
+                content = str(row.get('content') or '').strip()
+                line = f'[AI] {content}' if content else ''
+            else:
+                line, _ = self._build_records([row])
+            if not line.strip():
+                last_id = row['id']       # 空白/纯分享由既有降噪策略明确排除
+                continue
+            offset = fragment[1] if fragment[0] == row['id'] else 0
+            if offset or len(line) > budget:
+                if lines:
+                    break
+                # 分片只切渲染后的记录；每片注明来源/范围，续片不被当成完整句子。
+                label = (f'[记录ID={row["id"]} 发送者={str(row.get("sender_id") or "AI")[:80]} '
+                         f'续片起点={offset} 总字符={len(line)}；仅按本片明确内容提炼]\n')
+                end = min(len(line), offset + budget - len(label))
+                if offset >= len(line):
+                    raise ValueError('curator fragment offset exceeds record')
+                selected.append(row)
+                text = label + line[offset:end]
+                if end == len(line):
+                    return text, selected, row['id'], (0, 0)
+                return text, selected, last_id, (row['id'], end)
+            cost = len(line) + (1 if lines else 0)
+            if used + cost > budget:
+                break
+            lines.append(line)
+            selected.append(row)
+            used += cost
+            last_id = row['id']
+        return '\n'.join(lines), selected, last_id, (0, 0)
+
     def run_once(self, session_key: str) -> dict:
         """提炼一批。返回统计；失败时不推进光标，下轮重试。"""
         stats = {'summary': 0, 'facts': 0, 'self': 0, 'skipped': 0, 'error': ''}
@@ -331,14 +426,35 @@ class MemoryCurator:
             stats['error'] = 'busy'
             return stats
         try:
-            cursor = self.cursor(session_key)
-            limit = int(self.config.get('memory_curate_max_messages', 40) or 40)
-            rows = self.store.buffer_fetch(session_key, cursor, limit=limit)
-            if not rows:
+            # 水位、版本、原文在同一短事务中快照；网络调用期间不占数据库锁。
+            with self.store.transaction() as conn:
+                epoch = self.store.forget_epoch()
+                cursor = self.cursor(session_key)
+                limit = int(self.config.get('memory_curate_max_messages', 40) or 40)
+                fetched = self.store.buffer_fetch(session_key, cursor, limit=limit)
+                local_high = conn.execute(
+                    'SELECT COALESCE(MAX(buffer_id),0) FROM forget_state WHERE scope=?',
+                    (session_key,)).fetchone()[0]
+                rows = [row for row in fetched if (
+                    row['id'] > (local_high if row['role'] == 'assistant' else
+                                 self.store.forget_watermark(session_key, row['sender_id'])))]
+                fragment = self._fragment_state(session_key)
+                records, selected, last_id, next_fragment = self._select_records(
+                    fetched, rows, cursor, fragment)
+                source_ids = {}
+                for row in selected:
+                    if row['role'] == 'user' and row['sender_id']:
+                        uid = str(row['sender_id'])
+                        source_ids[uid] = min(source_ids.get(uid, row['id']), row['id'])
+                _, valid_ids = self._build_records(selected)
+            if not fetched:
                 return stats
-            records, valid_ids = self._build_records(rows)
             if not records.strip():
-                self.set_cursor(session_key, rows[-1]['id'])
+                with self.store.transaction():
+                    if (self.store.forget_epoch() == epoch and self.cursor(session_key) == cursor
+                            and self._fragment_state(session_key) == fragment):
+                        self.set_cursor(session_key, last_id)
+                        self.store.set_setting(f'mem.fragment:{session_key}', '[0,0]')
                 return stats
 
             is_priv = _is_private_session(session_key)
@@ -355,7 +471,7 @@ class MemoryCurator:
                 except Exception:  # noqa: BLE001 - 取不到阶段就按老样子提炼
                     logger.exception('取关系阶段失败')
             tail = CURATOR_TAIL.format(
-                records=records[:8000],
+                records=records,
                 known=known_text,
                 impressions=impression_text,
             )
@@ -366,9 +482,26 @@ class MemoryCurator:
                 logger.warning('记忆提炼 %s 未完成（%s），%.0f 分钟后再试',
                                session_key, data, wait / 60.0)
                 return stats
-            stats.update(self._store_results(session_key, data, valid_ids,
-                                             rows[-1]['id'], allowed_fact_ids))
-            self._note_success(session_key)
+            try:
+                validate_curator_data(data)
+            except ValueError:
+                stats['error'] = 'bad_schema'
+                self._note_failure(session_key)
+                logger.warning('记忆提炼输出schema无效 | %s', session_key)
+                return stats
+            # BEGIN IMMEDIATE 将版本/进度校验与整批写回串行化。
+            with self.store.transaction():
+                if self.store.forget_epoch() != epoch:
+                    stats['error'] = 'forgotten'
+                    return stats
+                if (self.cursor(session_key) != cursor or self._fragment_state(session_key) != fragment):
+                    stats['error'] = 'stale_batch'
+                    return stats
+                stored = self._store_results(session_key, data, valid_ids, last_id, allowed_fact_ids,
+                                             source_ids=source_ids)
+                self.store.set_setting(f'mem.fragment:{session_key}', json.dumps(next_fragment))
+                self._note_success(session_key)
+            stats.update(stored)
             if is_priv and self.relationship is not None:
                 self.relationship.mark_impression_done(session_key)
             self._last_stats = dict(stats)
@@ -497,7 +630,14 @@ class MemoryCurator:
                 + body + '\n'), allowed
 
     def _store_results(self, session_key: str, data: dict, valid_ids: set[str],
-                       last_id: int, allowed_fact_ids: set | None = None) -> dict:
+                       last_id: int, allowed_fact_ids: set | None = None,
+                       source_ids: dict | None = None) -> dict:
+        validate_curator_data(data)
+        with self.store.transaction():
+            return self._apply_results(session_key, data, valid_ids, last_id, allowed_fact_ids, source_ids)
+
+    def _apply_results(self, session_key: str, data: dict, valid_ids: set[str], last_id: int,
+                       allowed_fact_ids: set | None, source_ids: dict | None) -> dict:
         stats = {'summary': 0, 'facts': 0, 'self': 0, 'skipped': 0, 'expired': 0, 'impressions': 0}
 
         # ---- L1 群级摘要（只有公共事件）----
@@ -505,14 +645,9 @@ class MemoryCurator:
         if 0 < len(summary) <= 500:
             self.store.add_group_summary(session_key, summary, covers_to=last_id)
             stats['summary'] = 1
-            # 写完就裁：这个函数以前定义了却没人调用，大群的摘要表涨到 1800+ 条
-            # （只有最近 3~6 条会被注入，留着全是死重）。裁剪失败不影响本次提炼。
-            try:
-                self.store.trim_group_summaries(
-                    session_key,
-                    keep=int(self.config.get('memory_summary_keep', 200) or 200))
-            except Exception:  # noqa: BLE001
-                logger.debug('裁剪旧群摘要失败（%s）', session_key[-14:], exc_info=True)
+            # 裁剪也属于本批事务，失败时连同新摘要回滚。
+            self.store.trim_group_summaries(
+                session_key, keep=int(self.config.get('memory_summary_keep', 200) or 200))
         elif summary:
             logger.warning('群摘要过长已丢弃（%d 字）', len(summary))
 
@@ -526,11 +661,8 @@ class MemoryCurator:
             if allowed_fact_ids is not None and fid_int not in allowed_fact_ids:
                 logger.info('忽略模型给的过期事实 ID=%s（不在本批已知事实里）', fid_int)
                 continue
-            try:
-                self.store.expire_user_fact(fid_int)
-                stats['expired'] += 1
-            except Exception:  # noqa: BLE001 - 单条失败不该中断整批
-                logger.exception('标记事实失效失败（ID=%s）', fid_int)
+            self.store.expire_user_fact(fid_int)
+            stats['expired'] += 1
 
         is_priv = _is_private_session(session_key)
         cur_scope = 'private' if is_priv else 'group'
@@ -543,6 +675,9 @@ class MemoryCurator:
             imp_summary = str(imp.get('summary') or '').strip()
             # 太短的（"无明显特质""是个群友"）不覆盖已有卡片：宁可留旧的，别把写好的写没了
             if len(imp_summary) < 6:
+                continue
+            if (source_ids is not None and source_ids.get(uid, 0) <=
+                    self.store.forget_watermark('impression', uid)):
                 continue
             if uid in valid_ids and imp_summary and len(imp_summary) <= 200:
                 # set_user_impression 自己会挡住"一字未改"的写入，并按需追加历史
@@ -569,6 +704,10 @@ class MemoryCurator:
             else:
                 scope = str(item.get('scope') or 'group').strip().lower()
                 target_session = 'global' if (scope == 'global' and self.config.get('memory_cross_group_enabled', True)) else session_key
+            if (source_ids is not None and source_ids.get(uid, 0) <=
+                    self.store.forget_watermark(target_session, uid)):
+                stats['skipped'] += 1
+                continue
             fuzzy_thresh = float(self.config.get('memory_fuzzy_dedup_threshold', 0.60))
 
             existing = self.store.find_similar_user_fact(target_session, uid, fact, threshold=fuzzy_thresh)

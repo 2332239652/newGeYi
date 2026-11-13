@@ -38,6 +38,12 @@ logger = logging.getLogger('newGeYi.renderer')
 SEND_AT = '[CQ:at,qq=%s]'
 SEND_IMAGE = '[CQ:image,file=%s]'
 
+
+def escape_message_text(text: str, *, parameter: bool = False) -> str:
+    """按 CQ/OP 文本规则编码；只让程序生成的白名单动作保留语法。"""
+    text = str(text).replace('&', '&amp;').replace('[', '&#91;').replace(']', '&#93;')
+    return text.replace(',', '&#44;') if parameter else text
+
 # 立绘表：名称 -> {'file': 文件名, 'desc': 什么时候用}
 #
 # 为什么放在数据文件里而不是写死在代码里（2026-09 改）：
@@ -114,7 +120,7 @@ AT_TAG_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)[^\]]*\]')
 AT_CODE_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)((?:,[^\]]*)?)\]')
 # 输出侧：模型爱写 `【@123456】` / `【@某人】`，括号+数字对读者毫无意义
 AT_BRACKET_RE = re.compile(r'[\[【［]\s*@\s*([^\]】］\s]{1,40})\s*[\]】］]')
-# 输出侧：没括号的光杆 @数字（`@2309394954 我错了`）
+# 输出侧：没括号的光杆 @数字（`@123456789 你好`）
 AT_BARE_NUMBER_RE = re.compile(r'(?<![\w@])@(\d{5,12})(?!\d)')
 FENCE_RE = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
@@ -248,14 +254,12 @@ def sanitize_religion(text: str) -> tuple[str, int]:
     return text, hits
 
 
-# ===== 「把写稿备忘当台词发出去」检测（2026-11-01 线上实测）=====
-# 小群 957309761，一条 B 站愚人节剧情视频触发的**主动搭话**，模型把写给自己的提纲整段发了出去：
-#
-#     （或者顺着刚才聊的边狱话题发出来的），作为歌伊，可以结合愚人节剧情被创飞的梗、
-#     或者画风突变女仆卡戎/马娘那些离谱镜像世界来吐槽或搭话。
-#     - 风格：口语、30~70字以内，自然，不换行，可带一个动作或[EMOTE]。
-#     - 注意情绪立绘：惊讶/死鱼眼/晕乎乎等。选“惊讶”或“死鱼眼”都很贴切。
-#     - 构思：这个愚人节剧情简直精神污染啊，看完感觉整个人都要被卡戎的车来回碾两遍了
+# ===== 写稿备忘检测 =====
+# 合成样本：模型误把写作指导发成回复。
+#     作为歌伊，可以结合测试话题回复。
+#     - 风格：口语、30~70字以内，自然，不换行。
+#     - 注意情绪立绘：惊讶或死鱼眼。
+#     - 构思：用简短语句回应测试话题。
 #
 # 现有的三道清洗都拦不住它：不是 `【…】` 方括号（`_strip_thinking_process` ②），
 # 不是 `<think>`，也不是「条列提纲 + 短标题」那种（`_strip_outline_draft` 要求有
@@ -301,11 +305,11 @@ INNER_MONOLOGUE_RE = re.compile(
 
 
 # ===== 英文推理前言 =====
-# 线上实测（2026-10-28，Gemini 系走中转站）：模型会把「先写一段英文计划、再给中文台词」
+# 合成回归场景：模型会把「先写一段英文计划、再给中文台词」
 # 整段吐出来，形如
 #
 #     **My Response**
-#     Okay, so the user thinks I and 伊尔达 are cute... I need to sound cute.
+#     Okay, so the user thinks I and 角色甲 are cute... I need to sound cute.
 #     （叉腰气鼓鼓）才不是什么外国歌伊啦！
 #
 # 它既不是 <think> 标签，也不是【…】方括号，原来的规则一条都拦不住。
@@ -314,7 +318,7 @@ _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff]')
 _BOLD_LINE_RE = re.compile(r'^\*\*[^*\n]{2,80}\*\*$')
 _LATIN_RE = re.compile(r'[A-Za-z]')
 # 判「这一行是英文写的」：字母够多，且中文字数远少于字母数
-# （不能要求纯 ASCII——“I and 伊尔达”这种夹了人名的英文句也得认出来）
+# （不能要求纯 ASCII——“I and 角色甲”这种夹了人名的英文句也得认出来）
 _REASON_OPENERS_RE = re.compile(
     r'^\s*(?:Okay|Ok|Alright|So|The user|User |They|He |She |I need|I should|I must'
     r'|I\'ll|Let me|Now|Given|Since|This is|We |Looking)', re.I)
@@ -348,7 +352,7 @@ def strip_english_preamble(text: str) -> str:
     lines = text.split('\n')
     first_reply = None
     for index, line in enumerate(lines):
-        # 「有中文」还不够——英文前言里常夹着人名（"I and 伊尔达 are cute"），
+        # 「有中文」还不够——英文前言里常夹着人名（"I and 角色甲 are cute"），
         # 所以要求这一行有中文**且不像英文**才算回复本体。
         if _CJK_RE.search(line) and not looks_english_line(line):
             first_reply = index
@@ -381,8 +385,8 @@ def strip_english_preamble(text: str) -> str:
 # 模型偶尔会把心里那份计划原样吐出来，而不是直接说话。方括号版草稿（【拟定回复】…）
 # 有专门规则拦，但纯文本提纲以前一条都拦不住：
 #
-#     赛博刀子：
-#     - 夸歌伊厉害，但安抚熠暗"你们的赛道暂时不相交"
+#     测试用户：
+#     - 说明合成测试话题，准备简短回复
 #     歌伊的反应：
 #     - 长度约 40-60 字。一条一段。
 #     - 是否发立绘？…
@@ -397,9 +401,9 @@ _OUTLINE_META_RE = re.compile(
 )
 _OUTLINE_HEADER_RE = re.compile(r'^[^\s：:]{1,16}[：:]\s*$')
 _OUTLINE_BULLET_RE = re.compile(r'^[-*•·]\s+\S')
-# 同一行里「英文前言 + 中文台词」。两种真实形态都出现过：
-#   ① `I should be straightforward. 诶？今天是万圣节吗？`（句号收尾）
-#   ② `Here's what I'll say: "哼哼，这种事情不用搜也是…"`（**冒号 + 引号**收尾，2026-10-30 大群事故）
+# 同一行里「英文前言 + 中文台词」。两种合成示例：
+#   ① `I should be straightforward. 你好，今天一起练习吗？`（句号收尾）
+#   ② `Here's what I'll say: "你好，我准备好了。"`（**冒号 + 引号**收尾，合成冒号样例）
 # 以前按行判断（strip_english_preamble）抓不到——英文和中文在同一行里。
 _LEAD_EN_CHUNK_RE = re.compile(r'^\s*([^\u4e00-\u9fff【]{1,240})')
 _LEAD_EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")
@@ -489,7 +493,7 @@ def op_codes_to_plain(text: str, names: dict | None = None) -> str:
     """把收到的码转成模型能看懂的标记（入参前清洗，OP 为主、兼容 CQ）。
 
     `@` 一律折成 **`@名字`**：一开始这里写的是 `【@<id>】`，等于把一串数字喂给模型，
-    模型照猫画虎，自己回复里也开始 `【@2309394954】`（2026-11-04 线上原话）。
+    模型可能仿写为 `【@123456789】`；此处使用合成格式示例。
     QQ 的 `[OP:at,id=…,name=…]` 本来就带昵称，没理由丢掉；
     实在没有昵称（少数协议端不上报）才退成 `@某用户`，绝不再吐数字。
     """
@@ -663,7 +667,7 @@ class Renderer:
                     return ''
                 self._last_emote[session] = key
             self._note_emote(session, now)
-        return SEND_IMAGE % f'file:///{path.resolve()}'
+        return SEND_IMAGE % escape_message_text(f'file:///{path.resolve()}', parameter=True)
 
     def setup_emotes(self, source_dir: str) -> int:
         """从指定目录（含子目录）复制立绘进来，返回成功张数。
@@ -744,7 +748,7 @@ class Renderer:
             logger.warning('回复像是「写稿备忘」而不是台词，整条不发（%s）：%r',
                            plan_leak, text.strip()[:160])
             fallback_text = str(self.config.get('reply_audit_fallback', '') or '').strip()
-            return RenderedReply(text=fallback_text) if fallback_text else None
+            return RenderedReply(text=escape_message_text(fallback_text)) if fallback_text else None
         # 去掉代码围栏
         text = FENCE_RE.sub('', text).strip()
         # 思考过程/思维链/草稿：剥除混入的思考过程，防止模型思维链漏出到群里
@@ -800,31 +804,41 @@ class Renderer:
                 logger.warning('回复被审计拦截（%s）：%r', hit, text[:120])
                 fallback = str(self.config.get('reply_audit_fallback', '') or '').strip()
                 if fallback or rest_hit:
-                    return RenderedReply(text=fallback, rest_reason=rest_reason)
+                    return RenderedReply(text=escape_message_text(fallback), rest_reason=rest_reason)
                 return None
-        # 先归一化 @：仅允许 @ 当前发送者，且最多一次
-        allowed_at = SEND_AT % msg.sender_id
-        text = AT_TAG_RE.sub(
-            lambda m: allowed_at if m.group(1) == msg.sender_id else '【@某用户】',
-            text,
-        )
-        at_ops = re.findall(r'\[CQ:at,qq=[^,\]]+\]', text)
-        if len(at_ops) > 1:
-            first = at_ops[0]
-            idx = text.index(first) + len(first)
-            after = re.sub(r'\[CQ:at,qq=[^,\]]+\]', '', text[idx:])
-            text = text[:idx] + after
-        # 再剥离模型自带的其余所有码（OP 与 CQ 都剥，防止模型注入图片/路径）。
-        # 必须**交替剥到稳定**：模型写 `[O[CQ:x]P:at,id=all]` 时，先剥 OP 再剥 CQ，
-        # 内层被拿掉后会重新拼出一个合法 OP 码，一遍过就漏了（2026-11-03 审查发现）。
-        for _ in range(3):
-            before = text
-            text = OP_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
-            text = CQ_TAG_RE.sub(lambda m: m.group(0) if m.group(0) == allowed_at else '', text)
-            if text == before:
-                break
+        # 动作暂存为不可由输入伪造的标记；直到全部文本处理完才编码文本并还原动作。
+        # 昵称、模型正文、审计回退都属于文本，只有程序构造的当前用户 at / 立绘图是动作。
+        marker = '\ue000GEYI_ACTION'
+        untrusted = text + str(msg.sender_name or '') + ''.join(map(str, self.emote_table))
+        while marker in untrusted:
+            marker += '_'
+        actions: dict[str, str] = {}
+
+        def _action(code: str) -> str:
+            token = f'{marker}{len(actions)}\ue001'
+            actions[token] = code
+            return token
+
+        at_used = False
+
+        def _at_action(match: re.Match) -> str:
+            nonlocal at_used
+            sender_id = str(msg.sender_id)
+            # all、分隔符或嵌套语法绝不成为目标参数。
+            valid_id = sender_id not in ('', 'all') and not re.search(r'[\s,\[\]&]', sender_id)
+            if match.group(1) != sender_id or not valid_id:
+                return '【@某用户】'
+            if at_used:
+                return ''
+            at_used = True
+            return _action(SEND_AT % escape_message_text(sender_id, parameter=True))
+
+        text = AT_TAG_RE.sub(_at_action, text)
+        # 删除完整的模型码时保留边界空格，避免删除内层后重组出外层新码。
+        text = OP_TAG_RE.sub(' ', text)
+        text = CQ_TAG_RE.sub(' ', text)
         # 模型会把「@某人」写成【@数字】——她是照着上下文里 `【@<id>】` 的旧格式学的
-        # （2026-11-04 线上原话：`【@2309394954】我刚才明明讲了流血电弧…`）。
+        # 合成格式示例：`【@123456789】你好`。
         # 数字对群里读者没有意义，所以这里统一收口：
         #   @到当前发言人 → 他的昵称；不认识的人 → @某用户；括号一律去掉。
         source = text
@@ -833,7 +847,8 @@ class Renderer:
             token = (match.group(1) or '').strip()
             if token.isdigit():
                 if token == str(msg.sender_id) and msg.sender_name:
-                    shown = '@' + msg.sender_name
+                    # 昵称先冻结成文本片段，避免其中的 EMOTE 等标记再次触发动作解析。
+                    shown = _action(escape_message_text('@' + msg.sender_name))
                 else:
                     shown = '@某用户'
             else:
@@ -846,11 +861,11 @@ class Renderer:
 
         text = AT_BRACKET_RE.sub(_at_text, text)
         text = AT_BARE_NUMBER_RE.sub(
-            lambda m: '@' + msg.sender_name if (m.group(1) == str(msg.sender_id)
-                                                and msg.sender_name) else '@某用户',
+            lambda m: _action(escape_message_text('@' + msg.sender_name))
+            if (m.group(1) == str(msg.sender_id) and msg.sender_name) else '@某用户',
             text,
         )
-        # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(1000000001)" -> "某人"）
+        # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(123456789)" -> "某人"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张
         session = msg.session.as_text()
@@ -871,7 +886,7 @@ class Renderer:
             op = self.emote_message(match.group(1), session=session)
             if op:
                 state['used'] = True
-            return op
+            return _action(op) if op else ''
 
         text = EMOTE_RE.sub(_emote, text)
         # 彻底清除模型输出的任何裸【图片】/【表情】/（图片）及【发送了表情包:...】占位文字，杜绝将占位符发进群聊
@@ -883,10 +898,20 @@ class Renderer:
         # 长度上限
         max_len = int(self.config.get('max_reply_chars', 1200))
         if len(text) > max_len:
+            # 截断落进动作/昵称标记时退回片段起点，避免发出半个内部标记。
+            for token in actions:
+                start = text.find(token)
+                if start >= 0 and start < max_len < start + len(token):
+                    max_len = start
+                    break
             text = text[:max_len].rstrip() + '…'
         text = text.strip()
         if not text:
             return _drop()
+        # 终局文本编码发生在昵称回填、删除、整理和截断之后；深层嵌套即使重组也只显示文字。
+        # 按标记切片输出，替换出来的动作不再参与后续文本变换。
+        parts = re.split('(' + re.escape(marker) + r'\d+\ue001)', text)
+        text = ''.join(actions[part] if part in actions else escape_message_text(part) for part in parts)
         return RenderedReply(text=text, voice_payload=voice_payload,
                              rest_reason=rest_reason)
 

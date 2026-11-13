@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import os
 import random
+import socket
 import tempfile
 import time
 import unittest
@@ -38,6 +39,18 @@ class FakeResp:
         self.content = content
         self.headers = {'Content-Type': ctype}
         self.text = text
+        self.closed = False
+
+    def iter_content(self, chunk_size):
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start:start + chunk_size]
+
+    def close(self):
+        self.closed = True
+
+
+def public_dns(host, port, family=0, kind=socket.SOCK_STREAM):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', port))]
 
 
 class FakeHTTP:
@@ -45,7 +58,8 @@ class FakeHTTP:
         self.mapping = mapping
         self.calls = []
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, *, stream=True, allow_redirects=False):
+        assert stream is True and allow_redirects is False
         self.calls.append(url)
         return self.mapping.get(url, FakeResp(404, b'', text='{"retmsg":"nf"}'))
 
@@ -53,7 +67,7 @@ class FakeHTTP:
         return sum(1 for item in self.calls if item == url)
 
 
-def make_msg(raw_text: str, text: str = '【图片】', sender='9000000001', name='歌靡'):
+def make_msg(raw_text: str, text: str = '【图片】', sender='2332239652', name='歌靡'):
     return IncomingMessage(
         session=SESSION, message_id='1', sender_id=sender, sender_name=name,
         text=text, raw_text=raw_text, is_group=True, mentioned_bot=False,
@@ -82,7 +96,7 @@ def make_ctx(mapping, **overrides):
     cfg.update({'image_enabled': True, 'image_cache_seconds': 1800})
     cfg.update(overrides)
     http = FakeHTTP(mapping)
-    return ImageContext(cfg, http=http), http
+    return ImageContext(cfg, http=http, resolver=public_dns), http
 
 
 def wait_for(predicate, timeout=5.0):
@@ -127,13 +141,13 @@ class PrefetchTest(unittest.TestCase):
         blob = png_bytes(32, 32)
 
         class SlowHTTP(FakeHTTP):
-            def get(self, url, timeout=None):
+            def get(self, url, timeout=None, *, stream=True, allow_redirects=False):
                 time.sleep(0.6)
-                return super().get(url, timeout)
+                return super().get(url, timeout, stream=stream, allow_redirects=allow_redirects)
 
         cfg = dict(DEFAULT_CONFIG)
         cfg.update({'image_enabled': True})
-        ctx = ImageContext(cfg, http=SlowHTTP({URL: FakeResp(content=blob)}))
+        ctx = ImageContext(cfg, http=SlowHTTP({URL: FakeResp(content=blob)}), resolver=public_dns)
         started = time.time()
         ctx.remember(make_msg('[OP:image,file=a.jpg,url=%s]' % URL))
         cost = time.time() - started

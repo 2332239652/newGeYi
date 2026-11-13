@@ -31,7 +31,7 @@ from newGeYi.models import IncomingMessage, ModelResult, SessionKey  # noqa: E40
 GROUP = SessionKey(bot_hash='h', platform='qq', sdk='onebot',
                    session_type='group', host_id='-', target_id='10001')
 PRIVATE = SessionKey(bot_hash='h', platform='qq', sdk='onebot',
-                     session_type='private', host_id='', target_id='9000000001')
+                     session_type='private', host_id='', target_id='2332239652')
 
 
 def make_msg(session, text='你好呀', seq=1):
@@ -43,7 +43,7 @@ def make_msg(session, text='你好呀', seq=1):
 
     event = types.SimpleNamespace(send=send)
     msg = IncomingMessage(
-        session=session, message_id=str(seq), sender_id='9000000001', sender_name='歌靡',
+        session=session, message_id=str(seq), sender_id='2332239652', sender_name='歌靡',
         text=text, raw_text=text, is_group=session.session_type == 'group',
         mentioned_bot=True, event=event, proc=None, arrival_seq=seq, sender_is_bot=False,
     )
@@ -291,8 +291,27 @@ class VoiceRecordTest(_RuntimeCase):
         content = self._run_with_voice(False)
         self.assertNotIn('[VOICE:', content, '语音没发出去却写进了历史')
 
-    def test_voice_fact_when_really_queued(self):
-        self.assertIn('[VOICE:', self._run_with_voice(True))
+    def test_queue_acceptance_alone_is_not_a_voice_fact(self):
+        self.assertNotIn('[VOICE:', self._run_with_voice(True))
+
+    def test_voice_fact_only_after_success_callback(self):
+        callbacks = []
+        rendered = types.SimpleNamespace(
+            text='好的呀', rest_reason='', voice_payload=('happy', 'よし'),
+            emote='', mention_current_user=False)
+        self.rt.renderer.render = lambda text, msg: rendered
+        def dispatch(*args, **kwargs):
+            callbacks.append(kwargs['on_success'])
+            return True
+        self.rt.voice_manager.dispatch_voice = dispatch
+        msg, _sent = make_msg(self.group, '说句话嘛')
+        self.rt.process_job(msg, 'passive')
+        before = self.rt.store.recent_turns(self.group.as_text(), limit=10)
+        self.assertEqual([t['content'] for t in before if t['role'] == 'assistant'], ['好的呀'])
+        callbacks[0](self.group.as_text(), 'happy', 'よし')
+        after = self.rt.store.recent_turns(self.group.as_text(), limit=10)
+        self.assertEqual([t['content'] for t in after if t['role'] == 'assistant'],
+                         ['好的呀', '[VOICE:happy|よし]'])
 
 
 class MemoryTrackingTest(_RuntimeCase):
@@ -357,22 +376,22 @@ class CuratorGuardTest(unittest.TestCase):
         self.assertEqual(extract_json('```json\n{"a": 1}\n```'), {'a': 1})
 
     def test_expired_ids_outside_known_set_are_ignored(self):
-        fact_id = self.store.add_user_fact('g1', '9000000001', '喜欢猫')
+        fact_id = self.store.add_user_fact('g1', '2332239652', '喜欢猫')
         self.curator._store_results('g1', {'expired_fact_ids': [fact_id]},
-                                    valid_ids={'9000000001'}, last_id=1,
+                                    valid_ids={'2332239652'}, last_id=1,
                                     allowed_fact_ids=set())
-        self.assertEqual(len(self.store.list_user_facts('g1', '9000000001', limit=5)), 1,
+        self.assertEqual(len(self.store.list_user_facts('g1', '2332239652', limit=5)), 1,
                          '模型幻觉的 ID 把真实事实标成失效了')
 
         self.curator._store_results('g1', {'expired_fact_ids': [fact_id]},
-                                    valid_ids={'9000000001'}, last_id=1,
+                                    valid_ids={'2332239652'}, last_id=1,
                                     allowed_fact_ids={fact_id})
-        self.assertEqual(self.store.list_user_facts('g1', '9000000001', limit=5), [])
+        self.assertEqual(self.store.list_user_facts('g1', '2332239652', limit=5), [])
 
     def test_private_session_curates_independently(self):
         """私聊会话独立触发提炼，不受互通开关状态阻断。"""
-        key = 'h:qq:onebot:private:-:9000000001'
-        self.store.buffer_append(key, 'user', '私聊的内容', sender_id='9000000001')
+        key = 'h:qq:onebot:private:-:2332239652'
+        self.store.buffer_append(key, 'user', '私聊的内容', sender_id='2332239652')
         self.curator.config['memory_private_enabled'] = False
         self.assertTrue(self.curator.should_run(key))
 

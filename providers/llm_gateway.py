@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import copy
+from contextlib import nullcontext
 import json
 import logging
 import os
@@ -57,7 +59,7 @@ def is_provider_fault(error_code: str) -> bool:
     code = str(error_code or '')
     if not code:
         return True
-    if code == 'empty_content':
+    if code in ('empty_content', 'budget_exhausted', 'superseded'):
         return False
     if code in ('no_api_key', 'no_provider'):
         return True
@@ -204,6 +206,7 @@ _KEY_ANCHOR = 'gw.anchor'
 # 直到有人手动「切换渠道 X」。和 anchor 分开存，因为 anchor 的语义是
 # 「不许越过它往上爬」，而这里是「**只准用它**」，用它表达不了。
 _KEY_HOLD = 'gw.hold'
+_KEY_PENDING = 'gw.pending_retry'
 
 
 def _env_key_for(name: str) -> str:
@@ -374,6 +377,8 @@ class LLMGateway:
         # 手动切换的代数：后台重试跑到一半时骰主手动切了渠道，就靠它作废这次重试，
         # 否则「我刚切到官方，13 秒后它又把我锁回中转站」（2026-11-12 现场）
         self._manual_epoch = 0
+        self._config_epoch = 0
+        self._pending_retry_running = False
 
         # 上一轮被冷却跳过的渠道名单：只在名单发生变化时打一行日志，免得每条消息都刷
         self._cooling_note = ''
@@ -392,10 +397,11 @@ class LLMGateway:
         注意：运行中重载**不**回读持久化的不可用标记 —— 内存里的健康状态更新，
         否则「刚恢复但尚未写回」的渠道会被旧数据再次标成不可用。
         """
-        self.config = config
         with self._lock:
+            self._config_epoch += 1
+            self.config = copy.deepcopy(config)
             old_states = {p.name: st for p, st in self._pairs}
-            providers = build_providers(config)
+            providers = build_providers(self.config)
             self._pairs = [(p, old_states.get(p.name) or ProviderState(p.name)) for p in providers]
             names = [p.name for p, _ in self._pairs]
             if self._current_name not in names:
@@ -403,6 +409,29 @@ class LLMGateway:
             # 注意：这里刻意不写盘 —— __init__ 时写盘会覆盖上次保存的状态，
             # 而运行中的状态变化都会由 _mark_* / _switch_locked / probe 负责持久化。
         logger.info('网关渠道已加载：%s', ', '.join(names) or '（无）')
+
+    def invalidate_config(self) -> None:
+        """配置 writer 在原字典热更新前调用；随后必须 reload 完整配置。
+
+        调用方需用自己的配置 RLock 串行化 mutation → reload，gateway 不读取
+        配置锁，也不反向获取它。epoch 使旧网络结果在字典 identity 不变时仍作废。
+        """
+        with self._lock:
+            self._config_epoch += 1
+
+    def _operation_token_locked(self) -> tuple:
+        # 内容快照补捉未走 hook 的同字典修改；正式 writer 仍必须使用 hook，
+        # 因为单凭内容相等看不出 A → B → A，也看不出更新中的短暂状态。
+        snapshot = json.dumps(self.config, sort_keys=True, default=str)
+        return (self._manual_epoch, self._config_epoch, self._anchor_name,
+                self._hold_name, self._pending_hold_at, snapshot)
+
+    def _operation_valid_locked(self, token: tuple) -> bool:
+        return token == self._operation_token_locked()
+
+    @staticmethod
+    def _health_exempt(kind: str, error_code: str) -> bool:
+        return kind in BACKGROUND_KINDS and error_code in ('timeout', 'connection_error')
 
     @property
     def _failover_cfg(self) -> dict:
@@ -742,18 +771,19 @@ class LLMGateway:
 
     # ==================== 调用 ====================
     def chat(self, req: ModelRequest, kind: str = 'chat', session_key: str = '') -> ModelResult:
-        # 按 kind 选渠道：提炼可以走和聊天不同的供应商（成本结构相反，见 Provider.kinds）
-        candidates = self._ordered_pairs(kind)
+        start = time.monotonic()
+        with self._lock:
+            token = self._operation_token_locked()
+            budget = float(self._failover_cfg.get('total_timeout_seconds', 60) or 0)
+            deadline = start + budget if budget > 0 else 0.0
+            candidates = self._ordered_pairs(kind)
         if not candidates:
             return ModelResult(ok=False, error_code='no_provider',
                                error_message='未配置任何模型渠道')
-        start = time.time()
         last_error = 'unknown'
         last_message = ''
         # 总时长预算：5 个候选 × 2 轮 × (重试) × 单渠道超时，最坏能到 8 分钟，
         # 而调度器的看门狗是 300 秒 —— 会先把这次任务当成"卡死"再踢掉。
-        budget = float(self._failover_cfg.get('total_timeout_seconds', 60) or 0)
-        deadline = (start + budget) if budget > 0 else 0.0
         # 骰主口径（2026-11-01）：「第 5 个挂了就重回第一个开始连接」——
         # 一轮走到底不算完，要整轮重来一次（failover_full_cycles，默认 2 轮）。
         # 只有一个候选时不做第二轮：_call_provider 内部已经重试过了，纯浪费延迟。
@@ -761,18 +791,22 @@ class LLMGateway:
         if len(candidates) < 2:
             cycles = 1
         empty_retry_used = False
+        health_exempt_seen = False
         for cycle in range(cycles):
             for provider, state in candidates:
-                if deadline and time.time() > deadline:
-                    last_error = last_error if last_error != 'unknown' else 'deadline'
-                    logger.warning('模型调用总时长超过 %.0fs（%s），停止本次故障转移',
-                                   budget, last_error)
+                with self._lock:
+                    if not self._operation_valid_locked(token):
+                        return ModelResult(ok=False, model=req.model, error_code='superseded')
+                if deadline and time.monotonic() >= deadline:
+                    last_error = 'budget_exhausted'
+                    last_message = '模型调用总预算耗尽'
                     break
                 # 第二轮跳过「key 无效」这类不会自己好的渠道：重试一次只是白等。
                 # 超时 / 5xx / 空回复仍然照骰主的意思再撞一次（可能是瞬时抖动）。
                 if cycle and state.last_error in ('http_401', 'http_403', 'no_api_key'):
                     continue
-                result = self._call_provider(provider, state, req, kind, session_key)
+                result = self._call_provider(provider, state, req, kind, session_key,
+                                             deadline=deadline, token=token)
                 if result.ok:
                     if cycle:
                         logger.info('第 %d 轮才连通：%s（前一轮全军覆没后才接上）',
@@ -780,6 +814,7 @@ class LLMGateway:
                     return result
                 last_error = result.error_code or last_error
                 last_message = result.error_message or last_message
+                health_exempt_seen |= self._health_exempt(kind, last_error)
                 if not is_provider_fault(last_error):
                     # 空回复（思考链吃光预算）**不是渠道故障**，换一个模型再试一次还有救；
                     # 4xx 是这一次请求本身有问题，换渠道问同一件事还是同样的错，立刻收手。
@@ -793,37 +828,42 @@ class LLMGateway:
                                    last_error, provider.name)
                     return ModelResult(
                         ok=False, model=req.model,
-                        latency_ms=int((time.time() - start) * 1000),
+                        latency_ms=int((time.monotonic() - start) * 1000),
                         error_code=last_error, error_message=last_message,
                     )
             if cycle + 1 < cycles:
                 logger.warning('第 %d 轮 %d 个渠道全失败（%s），回到第一个渠道再来一轮',
                                cycle + 1, len(candidates), last_error)
-            if deadline and time.time() > deadline:
+            if deadline and time.monotonic() >= deadline:
+                last_error = 'budget_exhausted'
+                last_message = '模型调用总预算耗尽'
                 break
-        if not is_provider_fault(last_error):
+        if not is_provider_fault(last_error) or health_exempt_seen:
             # 兜底：到这一步说明是请求/内容问题，不该触发「全挂」流程
             return ModelResult(
                 ok=False, model=req.model,
-                latency_ms=int((time.time() - start) * 1000),
+                latency_ms=int((time.monotonic() - start) * 1000),
                 error_code=last_error, error_message=last_message,
             )
         # 两轮都没活口
-        if self._hold_name:
-            # 已经锁在兜底渠道上还失败：按冷却通知，不做二次降级
-            self._notify_all_down(last_error)
-        else:
-            self._handle_all_down(last_error)
+        notifications = []
+        with self._lock:
+            if self._operation_valid_locked(token):
+                if self._hold_name:
+                    self._notify_all_down(last_error, deferred=notifications)
+                else:
+                    self._handle_all_down(last_error, deferred=notifications)
+        self._deliver_notifications(notifications)
         return ModelResult(
             ok=False,
             model=req.model,
-            latency_ms=int((time.time() - start) * 1000),
+            latency_ms=int((time.monotonic() - start) * 1000),
             error_code=last_error,
             error_message=last_message,
         )
 
     # ==================== 全挂：先软降级，再决定要不要锁 ====================
-    def _handle_all_down(self, error_code: str) -> None:
+    def _handle_all_down(self, error_code: str, deferred: list | None = None) -> None:
         """候选全挂后的第一反应：**先不锁定**。
 
         2026-11-12 骰主口径：中转/反代渠道本来就爱抖，一次「两轮全挂」常常是十几秒的
@@ -844,7 +884,7 @@ class LLMGateway:
         except (TypeError, ValueError):
             wait = 300.0
         if wait <= 0:
-            self._escalate_to_last_resort(error_code)
+            self._escalate_to_last_resort(error_code, deferred=deferred)
             return
         now = time.time()
         with self._lock:
@@ -914,51 +954,55 @@ class LLMGateway:
     def retry_pending_once(self) -> str:
         """执行一次「全挂后的重试」。返回 'recovered' / 'held' / 'cancelled' / ''。"""
         with self._lock:
-            if not self._pending_hold_at:
+            if not self._pending_hold_at or self._pending_retry_running:
                 return ''
-            epoch = self._manual_epoch
-            self._pending_hold_at = 0.0
+            token = self._operation_token_locked()
+            pending_at = self._pending_hold_at
+            self._pending_retry_running = True
             error = self._pending_error or 'retry'
-            self._pending_error = ''
-        targets = self._anchor_retry_targets()
-        logger.warning('全挂重试：从锚点开始试 %d 个渠道（%s）',
-                       len(targets), '、'.join(p.name for p, _ in targets) or '（无）')
-        for provider, state in targets:
+        notifications = []
+        try:
+            targets = self._anchor_retry_targets()
+            for provider, state in targets:
+                with self._lock:
+                    if (not self._operation_valid_locked(token)
+                            or self._pending_hold_at != pending_at):
+                        return 'cancelled'
+                ok = self._probe_provider(provider)
+                with self._lock:
+                    if (not self._operation_valid_locked(token)
+                            or self._pending_hold_at != pending_at):
+                        return 'cancelled'
+                    if not ok:
+                        continue
+                    state.healthy = True
+                    state.fail_count = 0
+                    state.last_error = ''
+                    state.cooldown_until = 0.0
+                    old = self._current_name
+                    self._current_name = provider.name
+                    self._pending_hold_at = 0.0
+                    self._pending_error = ''
+                    self._pending_from = ''
+                    self._append_history_locked(old, provider.name, 'retry_recover', '全挂重试成功')
+                    self._persist_locked()
+                    return 'recovered'
             with self._lock:
-                if self._manual_epoch != epoch:
-                    # 骰主在这轮探测期间手动切了渠道：他的话比后台判断优先，
-                    # 这次重试作废——**不锁定、不通知**，按新渠道继续跑
-                    logger.info('全挂重试期间骰主手动切换了渠道，放弃本次重试（不锁定、不通知）')
+                if (not self._operation_valid_locked(token)
+                        or self._pending_hold_at != pending_at):
                     return 'cancelled'
-            if not self._probe_provider(provider):
-                continue
+                self._escalate_to_last_resort(error, deferred=notifications)
+            self._deliver_notifications(notifications)
+            return 'held'
+        finally:
             with self._lock:
-                if self._manual_epoch != epoch:
-                    logger.info('探测刚通过时骰主手动切换了渠道，按手动选择为准')
-                    return 'cancelled'
-                state.healthy = True
-                state.fail_count = 0
-                state.last_error = ''
-                old = self._current_name
-                self._current_name = provider.name
-                self._pending_from = ''
-                self._append_history_locked(old, provider.name, 'retry_recover',
-                                            '全挂重试成功')
-                self._persist_locked()
-            logger.info('全挂重试成功：已切回 %s（未锁定、未通知骰主）', provider.name)
-            return 'recovered'
-        with self._lock:
-            if self._manual_epoch != epoch:
-                logger.info('全挂重试期间骰主手动切换了渠道，放弃本次重试（不锁定、不通知）')
-                return 'cancelled'
-        logger.warning('全挂重试仍然失败（%s），开始通知骰主并锁定兜底渠道', error)
-        self._escalate_to_last_resort(error)
-        return 'held'
+                self._pending_retry_running = False
 
-    def _escalate_to_last_resort(self, error_code: str) -> None:
+    def _escalate_to_last_resort(self, error_code: str, deferred: list | None = None) -> None:
         """候选渠道全挂 → 通知骰主 + 切到兜底渠道并锁定（等人手动切回）。
 
-        全挂重试失败后通知并切到兜底渠道，等待操作者手动选择恢复目标。
+        骰主原话：「五个全测了一轮都挂了就给骰主发一条通知然后切换官方 Deepseek 为锚点
+        不再尝试，直到我手动切回那五个中的一个为锚点」。
 
         实现要点：
         - **锁定**（`gw.hold`）而不是普通锚点：官方 DeepSeek 排在最后，普通锚点的
@@ -968,16 +1012,16 @@ class LLMGateway:
         """
         name = self._last_resort_name()
         if not name:
-            self._notify_all_down(error_code)
+            self._notify_all_down(error_code, deferred=deferred)
             return
         with self._lock:
             target = next((p for p, _ in self._pairs if p.name == name), None)
             if target is None:
                 # 没配兜底渠道：退回老行为（只发通知）
-                self._notify_all_down(error_code)
+                self._notify_all_down(error_code, deferred=deferred)
                 return
             if self._hold_name == name and self._current_name == name:
-                self._notify_all_down(error_code)
+                self._notify_all_down(error_code, deferred=deferred)
                 return
             old = self._current_name
             self._current_name = name
@@ -1005,103 +1049,155 @@ class LLMGateway:
             error_code,
             detail=(f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
                     f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。'),
-            tried=tried,
+            tried=tried, deferred=deferred,
         )
 
     def _call_provider(self, provider: Provider, state: ProviderState,
-                       req: ModelRequest, kind: str, session_key: str) -> ModelResult:
-        cfg = self.config
-        start = time.time()
-        if not provider.api_key:
-            code = 'no_api_key'
-            result = ModelResult(ok=False, model=provider.model, error_code=code,
-                                 error_message=f'渠道 {provider.name} 未配置 API Key')
-            self._record(session_key, kind, result)
-            self._mark_failure(provider, state, code, kind)
+                       req: ModelRequest, kind: str, session_key: str,
+                       deadline: float = 0.0, token: tuple | None = None) -> ModelResult:
+        start = time.monotonic()
+        with self._lock:
+            token = token if token is not None else self._operation_token_locked()
+            retries = max(0, int(self.config.get('max_retries', 1)))
+        budget_result = lambda: ModelResult(
+            ok=False, model=provider.model, error_code='budget_exhausted',
+            error_message='模型调用总预算耗尽',
+            latency_ms=int((time.monotonic() - start) * 1000))
+
+        def finish(result):
+            # 期满路径跳过同步 SQLite 指标：busy_timeout 会让过期调用额外等 20 秒。
+            # 用有界既存日志记录；迟到 worker 也不补写，以免新增无界记录线程。
+            if result.error_code == 'budget_exhausted':
+                logger.info('模型调用预算耗尽（跳过同步指标）：%s/%s', provider.name, kind)
+                return result
+            # worker 只做 I/O；健康、路由、调用记录均由等待者在 epoch 内提交。
+            with self._lock:
+                if not self._operation_valid_locked(token):
+                    return ModelResult(ok=False, model=provider.model,
+                                       error_code='superseded', latency_ms=result.latency_ms)
+                self._record(session_key, kind, result)
+                if result.ok:
+                    self._mark_success(provider, state)
+                else:
+                    self._mark_failure(provider, state, result.error_code, kind)
             return result
 
+        if deadline and time.monotonic() >= deadline:
+            return finish(budget_result())
+        if not provider.api_key:
+            return finish(ModelResult(ok=False, model=provider.model, error_code='no_api_key',
+                                      error_message=f'渠道 {provider.name} 未配置 API Key'))
         url, body = self._build_request_body(provider, req)
+        remaining = deadline - time.monotonic() if deadline else None
+        semaphore = self._semaphore
+        acquired = (semaphore.acquire(timeout=max(0.0, remaining))
+                    if remaining is not None else semaphore.acquire())
+        if not acquired:
+            return finish(budget_result())
+        done = threading.Event()
+        output = []
 
-        retries = int(cfg.get('max_retries', 1))
-        last_error = ''
-        with self._semaphore:
-            session = self._get_session()
-            for attempt in range(retries + 1):
+        def run():
+            try:
+                output.append(self._request_provider(provider, url, body, retries, deadline, start))
+            except Exception as exc:  # 网关线程异常也交给等待者分类
+                output.append(ModelResult(ok=False, model=provider.model,
+                                          error_code=type(exc).__name__, error_message=str(exc)))
+            finally:
+                # daemon worker 的 thread-local Session 不跨调用复用，退出时关闭。
+                # deadline=0 的同步兼容路径继续沿用调用线程的连接池。
                 try:
-                    resp = session.post(
-                        url,
-                        headers=self._headers(provider),
-                        json=body,
-                        timeout=provider.timeout,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        ok, content, input_tokens, output_tokens, cached_tokens, err_msg = self._parse_response(provider, data)
-                        # 「有没有缓存字段」和「缓存命中多少」是两件事：前者为零时说明渠道没透传，
-                        # 界面要能说清，不然优化提示词前缀会变成对着空气使劲。
-                        cache_reported = usage_reports_cache(response_usage(data))
-                        if not ok:
-                            last_error = 'empty_content'
-                            result = ModelResult(
-                                ok=False, model=provider.model,
-                                input_tokens=input_tokens,
-                                output_tokens=output_tokens,
-                                cached_tokens=cached_tokens,
-                                cache_reported=cache_reported,
-                                latency_ms=int((time.time() - start) * 1000),
-                                error_code=last_error, error_message=err_msg or '模型没有输出内容',
-                            )
-                            self._record(session_key, kind, result)
-                            self._mark_failure(provider, state, last_error, kind)
-                            return result
-                        result = ModelResult(
-                            ok=True,
-                            text=content,
-                            model=provider.model,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            cached_tokens=cached_tokens,
-                            cache_reported=cache_reported,
-                            latency_ms=int((time.time() - start) * 1000),
-                        )
-                        self._record(session_key, kind, result)
-                        self._mark_success(provider, state)
-                        return result
-                    if resp.status_code in AUTH_STATUS:
-                        last_error = f'http_{resp.status_code}'
-                        break  # key 无效，重试无意义
-                    if resp.status_code in RETRYABLE_STATUS and attempt < retries:
-                        last_error = f'http_{resp.status_code}'
-                        time.sleep(min(2 ** attempt, 4) + 0.1 * attempt)
-                        continue
-                    last_error = f'http_{resp.status_code}'
-                    break
-                except requests.Timeout:
-                    last_error = 'timeout'
-                    if attempt < retries:
-                        time.sleep(0.5 + 0.5 * attempt)
-                        continue
-                    break
-                except requests.ConnectionError:
-                    last_error = 'connection_error'
-                    if attempt < retries:
-                        time.sleep(0.5 + 0.5 * attempt)
-                        continue
-                    break
-                except Exception as exc:  # noqa: BLE001 - 网关层吞掉所有网络异常
-                    last_error = type(exc).__name__
-                    break
+                    owned = getattr(self._local, 'session', None) if deadline else None
+                    if owned is not None:
+                        owned.close()
+                        self._local.session = None
+                finally:
+                    # requests 未真正退出前绝不归还槽；迟到结果不提交健康/路由。
+                    semaphore.release()
+                    done.set()
 
-        result = ModelResult(
-            ok=False,
-            model=provider.model,
-            latency_ms=int((time.time() - start) * 1000),
-            error_code=last_error or 'unknown',
-            error_message=last_error,
-        )
-        self._record(session_key, kind, result)
-        self._mark_failure(provider, state, result.error_code, kind)
-        return result
+        if not deadline:
+            run()
+        else:
+            if time.monotonic() >= deadline:
+                semaphore.release()
+                return finish(budget_result())
+            try:
+                threading.Thread(target=run, name='geyi-http', daemon=True).start()
+            except Exception:
+                semaphore.release()
+                raise
+            done.wait(max(0.0, deadline - time.monotonic()))
+        if not done.is_set() or (deadline and time.monotonic() >= deadline):
+            return finish(budget_result())
+        return finish(output[0])
+
+    def _request_provider(self, provider: Provider, url: str, body: dict, retries: int,
+                          deadline: float, start: float) -> ModelResult:
+        """纯 I/O。timeout 限制 connect/read 间隔，Event 等待限制调用者总等待。"""
+        last_error = 'unknown'
+        session = self._get_session()
+        for attempt in range(retries + 1):
+            remaining = deadline - time.monotonic() if deadline else None
+            if remaining is not None and remaining <= 0:
+                last_error = 'budget_exhausted'
+                break
+            # requests 的 scalar 分别用于 connect/read，不能把它当总时间。
+            # 为两个阶段分配剩余预算；DNS、多 IP、慢流仍可能越过墙钟期限。
+            timeout = provider.timeout
+            if remaining is not None:
+                phase = min(provider.timeout, remaining / 2.0)
+                timeout = (phase, phase)
+            delay = 0.0
+            resp = None
+            try:
+                resp = session.post(url, headers=self._headers(provider), json=body, timeout=timeout)
+                if deadline and time.monotonic() >= deadline:
+                    last_error = 'budget_exhausted'
+                    break
+                if resp.status_code == 200:
+                    data = resp.json()
+                    ok, content, ins, outs, cached, message = self._parse_response(provider, data)
+                    if deadline and time.monotonic() >= deadline:
+                        last_error = 'budget_exhausted'
+                        break
+                    return ModelResult(
+                        ok=ok, text=content if ok else '', model=provider.model,
+                        input_tokens=ins, output_tokens=outs, cached_tokens=cached,
+                        cache_reported=usage_reports_cache(response_usage(data)),
+                        latency_ms=int((time.monotonic() - start) * 1000),
+                        error_code='' if ok else 'empty_content', error_message=message)
+                last_error = f'http_{resp.status_code}'
+                if resp.status_code not in RETRYABLE_STATUS or attempt >= retries:
+                    break
+                delay = min(2 ** attempt, 4) + 0.1 * attempt
+            except requests.Timeout:
+                last_error = 'timeout'
+                delay = 0.5 + 0.5 * attempt
+            except requests.ConnectionError:
+                last_error = 'connection_error'
+                delay = 0.5 + 0.5 * attempt
+            except Exception as exc:  # noqa: BLE001
+                last_error = type(exc).__name__
+                break
+            finally:
+                if resp is not None:
+                    close = getattr(resp, 'close', None)
+                    if close is not None:
+                        close()
+            if deadline and time.monotonic() >= deadline:
+                last_error = 'budget_exhausted'
+                break
+            if attempt >= retries:
+                break
+            if deadline:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            time.sleep(delay)
+        if deadline and time.monotonic() >= deadline:
+            last_error = 'budget_exhausted'
+        return ModelResult(ok=False, model=provider.model,
+                           latency_ms=int((time.monotonic() - start) * 1000),
+                           error_code=last_error, error_message=last_error)
 
     def _resolve_url(self, provider: Provider) -> str:
         url = provider.endpoint.strip()
@@ -1431,26 +1527,38 @@ class LLMGateway:
         if len(self._history) > limit:
             self._history = self._history[-limit:]
 
-    def _notify_all_down(self, error_code: str, detail: str = '', tried: str = '') -> None:
-        cfg = self._failover_cfg
-        if not cfg.get('notify_owner', True) or self._notify_cb is None:
-            return
-        cooldown = int(cfg.get('notify_cooldown_seconds', 600) or 0)
-        now = time.time()
+    def _notify_all_down(self, error_code: str, detail: str = '', tried: str = '',
+                         deferred: list | None = None) -> None:
         with self._lock:
+            cfg = self._failover_cfg
+            if not cfg.get('notify_owner', True) or self._notify_cb is None:
+                return
+            cooldown = int(cfg.get('notify_cooldown_seconds', 600) or 0)
+            now = time.time()
             if now - self._last_down_notify < cooldown:
-                logger.info('全挂通知在冷却期内（%ds），跳过', int(cooldown - (now - self._last_down_notify)))
                 return
             self._last_down_notify = now
-        names = tried or ('、'.join(p.name for p, _ in self._pairs) or '（无）')
-        try:
-            self._notify_cb(
-                f'🚨 所有模型渠道都连不上了（最后一次错误：{error_code}）\n'
-                f'渠道：{names}\n'
-                + (detail or '歌伊暂时无法回复，恢复后会自动继续。可用「渠道状态」查看详情。')
-            )
-        except Exception:  # noqa: BLE001 - 通知失败不影响主流程
-            logger.exception('通知骰主失败')
+            names = tried or ('、'.join(p.name for p, _ in self._pairs) or '（无）')
+            text = (f'🚨 所有模型渠道都连不上了（最后一次错误：{error_code}）\n'
+                    f'渠道：{names}\n'
+                    + (detail or '歌伊暂时无法回复，恢复后会自动继续。可用「渠道状态」查看详情。'))
+            notification = (self._operation_token_locked(), self._notify_cb, text)
+        if deferred is not None:
+            deferred.append(notification)
+        else:
+            self._deliver_notifications([notification])
+
+    def _deliver_notifications(self, notifications: list) -> None:
+        for token, callback, text in notifications:
+            with self._lock:
+                if not self._operation_valid_locked(token):
+                    continue
+            # 网络发送和宿主插件回调放在锁外；仅通知存在检查后切换的短窗口，
+            # 路由和健康写回仍在 epoch 检查的同一临界区内。
+            try:
+                callback(text)
+            except Exception:
+                logger.exception('通知骰主失败')
 
     # ==================== 恢复探测 ====================
     def start_probe(self) -> None:
@@ -1480,8 +1588,10 @@ class LLMGateway:
 
     def _probe_loop(self) -> None:
         interval = max(30, int(self._failover_cfg.get('probe_interval_seconds', 900) or 900))
-        # 启动后先短等一次，好让「重启前就挂着」的渠道尽快被验证
-        wait_for = min(interval, 60)
+        # 已持久化的恢复期限优先；过期任务启动后尽快执行。
+        pending = self.pending_retry_at()
+        wait_for = (min(interval, max(0.0, pending - time.time()))
+                    if pending else min(interval, 60))
         while not self._probe_stop.wait(wait_for):
             wait_for = interval
             try:
@@ -1520,11 +1630,13 @@ class LLMGateway:
         cfg = self._failover_cfg
         need = max(1, int(cfg.get('probe_success_needed', 1) or 1))
         with self._lock:
-            if self._hold_name:
+            token = self._operation_token_locked()
+            if self._hold_name or self._pending_hold_at:
                 # 锁定兜底渠道期间不探测、不爬回：这是骰主明说的「不再尝试」
                 return []
             pairs = list(self._pairs)
             current = self._current_name
+            expected_current = current
             anchor = self._anchor_name
             current_p = next((p for p, _ in pairs if p.name == current), None)
             current_rank = current_p.priority if current_p is not None else 10 ** 6
@@ -1552,8 +1664,12 @@ class LLMGateway:
             # 已经健康、只是当前站在它下面的渠道：直接切回，不用再花钱探测
             if not provider.manual_only and state.healthy:
                 with self._lock:
+                    if (not self._operation_valid_locked(token)
+                            or self._current_name != expected_current):
+                        return recovered
                     old = self._current_name
                     self._current_name = provider.name
+                    expected_current = provider.name
                     self._append_history_locked(old, provider.name, 'priority_recover')
                     self._persist_locked()
                     recovered.append(provider.name)
@@ -1562,6 +1678,9 @@ class LLMGateway:
             ok = self._probe_provider(provider)
             switched = False
             with self._lock:
+                if (not self._operation_valid_locked(token)
+                            or self._current_name != expected_current):
+                    return recovered
                 state.last_probe_at = time.time()
                 if ok:
                     state.probe_ok_streak += 1
@@ -1574,6 +1693,7 @@ class LLMGateway:
                     state.last_error = ''
                     old = self._current_name
                     self._current_name = provider.name
+                    expected_current = provider.name
                     self._append_history_locked(old, provider.name, 'probe_recover')
                     self._persist_locked()
                     recovered.append(provider.name)
@@ -1583,7 +1703,10 @@ class LLMGateway:
             if switched:
                 break
         if recovered:
-            self._persist_locked()
+            with self._lock:
+                if (self._operation_valid_locked(token)
+                        and self._current_name == expected_current):
+                    self._persist_locked()
         if failed_probes:
             # 以前探测失败**一条日志都没有**：看不出「它在跑」还是「它早死了」。
             # 只在这一轮真的发过请求且没通过时打一行，频率很低（每轮最多一次）。
@@ -1597,6 +1720,9 @@ class LLMGateway:
         limit = max(0, int(cfg.get('probe_repair_per_round', 2) or 0))
         if limit:
             with self._lock:
+                if (not self._operation_valid_locked(token)
+                            or self._current_name != expected_current):
+                    return recovered
                 cur_name = self._current_name
                 cur_p2 = next((p for p, _ in pairs if p.name == cur_name), None)
                 cur_rank2 = cur_p2.priority if cur_p2 is not None else 10 ** 6
@@ -1610,6 +1736,9 @@ class LLMGateway:
             for provider, state in stale[:limit]:
                 ok = self._probe_provider(provider)
                 with self._lock:
+                    if (not self._operation_valid_locked(token)
+                            or self._current_name != expected_current):
+                        return recovered
                     state.last_probe_at = time.time()
                     if ok:
                         state.healthy = True
@@ -1648,6 +1777,7 @@ class LLMGateway:
         except (TypeError, ValueError):
             retries = 1
         for attempt in range(retries + 1):
+            resp = None
             try:
                 resp = self._get_session().post(
                     url,
@@ -1660,6 +1790,11 @@ class LLMGateway:
                     time.sleep(min(2.0, 0.5 * (attempt + 1)))
                     continue
                 return False
+            finally:
+                if resp is not None:
+                    close = getattr(resp, 'close', None)
+                    if close is not None:
+                        close()
             if resp.status_code in ok_statuses:
                 return True
             # 4xx（key 错、模型名错）重试没用；5xx 留给下一轮探测
@@ -1669,12 +1804,19 @@ class LLMGateway:
     # ==================== 持久化 ====================
     def _persist_locked(self) -> None:
         try:
-            self.store.set_setting(_KEY_CURRENT, self._current_name)
-            self.store.set_setting(_KEY_ANCHOR, self._anchor_name)
-            self.store.set_setting(_KEY_HOLD, self._hold_name)
-            unhealthy = [p.name for p, st in self._pairs if not st.healthy]
-            self.store.set_setting(_KEY_UNHEALTHY, json.dumps(unhealthy, ensure_ascii=False))
-            self.store.set_setting(_KEY_HISTORY, json.dumps(self._history, ensure_ascii=False))
+            transaction = getattr(self.store, 'transaction', None)
+            with transaction() if transaction is not None else nullcontext():
+                self.store.set_setting(_KEY_CURRENT, self._current_name)
+                self.store.set_setting(_KEY_ANCHOR, self._anchor_name)
+                self.store.set_setting(_KEY_HOLD, self._hold_name)
+                pending = ({'reason': 'all_down_soft', 'retry_at': self._pending_hold_at,
+                            'error': self._pending_error, 'from': self._pending_from,
+                            'anchor': self._anchor_name, 'current': self._current_name}
+                           if self._pending_hold_at and not self._hold_name else {})
+                self.store.set_setting(_KEY_PENDING, json.dumps(pending, ensure_ascii=False))
+                unhealthy = [p.name for p, st in self._pairs if not st.healthy]
+                self.store.set_setting(_KEY_UNHEALTHY, json.dumps(unhealthy, ensure_ascii=False))
+                self.store.set_setting(_KEY_HISTORY, json.dumps(self._history, ensure_ascii=False))
         except Exception:  # noqa: BLE001 - 持久化失败不影响主流程
             logger.exception('渠道状态持久化失败')
 
@@ -1691,6 +1833,8 @@ class LLMGateway:
             return
         if isinstance(history, list):
             self._history = [item for item in history if isinstance(item, dict)]
+        if anchor and anchor in names:
+            self._anchor_name = anchor
         if hold and hold in names:
             # 锁定状态优先于其它一切：只认它一个
             self._hold_name = hold
@@ -1709,6 +1853,19 @@ class LLMGateway:
                 if provider.name in unhealthy:
                     state.healthy = False
                     state.last_error = 'restored_unhealthy'
+        # 自动软降级明确落盘来源及到期时间；缺此记录的 manual_only 仍视为手选。
+        try:
+            pending = json.loads(self.store.get_setting(_KEY_PENDING) or '{}')
+            retry_at = float(pending.get('retry_at', 0)) if isinstance(pending, dict) else 0.0
+            if (retry_at > 0 and pending.get('reason') == 'all_down_soft'
+                    and pending.get('anchor', '') == self._anchor_name
+                    and pending.get('current') == self._current_name):
+                self._pending_hold_at = retry_at
+                self._pending_error = str(pending.get('error') or 'retry')
+                self._pending_from = str(pending.get('from') or '')
+                return  # 到期由 retry_pending_once 接管，不让 manual_only 守卫吃掉闹钟
+        except (ValueError, TypeError, AttributeError):
+            pass
         # 若当前渠道恰好是被标记不可用的，自动挪到第一个健康的
         cur = next((st for p, st in self._pairs if p.name == self._current_name), None)
         if cur is not None and not cur.healthy:

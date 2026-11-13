@@ -105,14 +105,14 @@ class NormalSaveTest(_TempState):
 
 class OwnerIdsTest(unittest.TestCase):
     def test_dirty_owner_ids_do_not_raise(self):
-        cases = [None, 9000000001, '9000000001', [], [None, 9000000001, 'abc'], {'a': 1}]
+        cases = [None, 2332239652, '2332239652', [], [None, 2332239652, 'abc'], {'a': 1}]
         for raw in cases:
             perms = Permissions({'owner_ids': raw}, owner_ids_env='')
             ids = perms._owner_set()             # 以前这里会 TypeError
             self.assertTrue(all(str(x).isdigit() for x in ids))
-        self.assertEqual(Permissions({'owner_ids': 9000000001}, '')._owner_set(), {'9000000001'})
-        self.assertEqual(Permissions({'owner_ids': ['9000000001', 'abc']}, '')._owner_set(),
-                         {'9000000001'})
+        self.assertEqual(Permissions({'owner_ids': 2332239652}, '')._owner_set(), {'2332239652'})
+        self.assertEqual(Permissions({'owner_ids': ['2332239652', 'abc']}, '')._owner_set(),
+                         {'2332239652'})
 
     def test_env_owners_are_merged(self):
         perms = Permissions({'owner_ids': None}, owner_ids_env='111，222')
@@ -143,10 +143,13 @@ class ExampleConfigTest(unittest.TestCase):
 
 
 class UnittestIsolationTest(unittest.TestCase):
-    """直接 `python -m unittest` 时，包导入阶段也必须隔离状态目录。
+    """直接 `python -m unittest` 时，包导入本身也不能碰线上状态目录。
 
-    Python 会先导入父包并初始化运行时，再执行测试模块中的环境变量设置；
-    因此 config 层在 unittest 进程中提供临时目录兜底。
+    2026-11-09 的教训：`python -m unittest newGeYi.tests.test_cache_usage` 会**先**导入
+    父包 `newGeYi` → `__init__` → `main` → `Runtime()`，而各测试模块顶上"先设
+    GEYI_DATA_DIR 再导入"要等包导入之后才执行 —— 于是 `Runtime()` 打开了线上状态目录，
+    顺手对生产库跑了一次 `ALTER TABLE api_calls ADD COLUMN`（只加列、没丢数据，
+    但这种事不该有第二次）。现在 config 层在 unittest 进程里兜底到临时目录。
     """
 
     def test_import_time_state_dir_is_isolated(self):

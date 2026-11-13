@@ -194,9 +194,11 @@ class Panel:
     def _disk(self, path: Path) -> bytes:
         return path.read_bytes() if path.is_file() else b''
 
+    @plugin_config.config_locked
     def _config_revision(self) -> str:
         return _hash(self._disk(self._config_path) + b'\x00' + _json(self.runtime.config))
 
+    @plugin_config.config_locked
     def config_get(self) -> dict:
         self._refresh_secrets()
         sensitive = [key for key in EDITABLE_KEYS if key in self.runtime.config
@@ -219,6 +221,7 @@ class Panel:
         if params.get('confirm') is not True:
             raise PanelError('写操作必须显式 confirm=true', 'confirmation_required')
 
+    @plugin_config.config_locked
     def _config_save(self, params):
         self._confirmed(params)
         if params.get('revision') != self._config_revision():
@@ -228,37 +231,24 @@ class Panel:
         candidate = validate_patch(params.get('patch'), snapshot)
         if any(self._redactor.scrub(snapshot.get(key)) != snapshot.get(key) for key in params['patch']):
             raise PanelError('该配置字段含脱敏内容，先在本机移除凭据后再编辑', 'sensitive_config_field')
-        # 先写成功，再原地更新共享 dict；原函数保留损坏配置保护与滚动备份。
         plugin_config.save_config(candidate)
-        current.clear()
-        current.update(candidate)
         try:
-            self.runtime.apply_config()
-            if 'request_timeout_seconds' in params['patch']:
-                self.runtime.gateway.reload(current)
+            self.runtime.commit_config(candidate, persist=False)
         except Exception:
-            # 磁盘已提交，保留一致的配置；明确回包而不冒充未执行。
+            # Persistence completed; report component application separately.
             result = self.config_get()
             result['warnings'] = ['配置已保存；部分组件应用失败，请检查日志并重新加载']
             return result
         return self.config_get()
 
+    @plugin_config.config_locked
     def _config_reload(self, params):
         self._confirmed(params)
         if params.get('revision') != self._config_revision():
             raise PanelError('配置已改变，请重新读取后重载', 'revision_conflict')
-        snapshot = copy.deepcopy(self.runtime.config)
-        try:
-            error = self.runtime.reload_config()
-            if error:
-                raise PanelError(str(error), 'config_load_error')
-            self.runtime.gateway.reload(self.runtime.config)
-        except Exception:
-            self.runtime.config.clear()
-            self.runtime.config.update(snapshot)
-            self.runtime.apply_config()
-            self.runtime.gateway.reload(self.runtime.config)
-            raise
+        error = self.runtime.reload_config()
+        if error:
+            raise PanelError(str(error), 'config_load_error')
         return self.config_get()
 
     def _prompt_save(self, params):

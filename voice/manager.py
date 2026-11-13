@@ -61,6 +61,7 @@ class VoiceManager:
 
         # 频控状态维护
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._group_last_voice: dict[str, float] = {}  # target_id -> timestamp
         self._session_consecutive: dict[str, bool] = {}  # session_key -> 上一轮是否刚发过语音
 
@@ -68,12 +69,30 @@ class VoiceManager:
         self._healthy_seen: bool | None = None
         self._probe_inflight: bool = False
 
-        # 异步合成线程池（极轻量，最大 2 个并发线程）
+        # 运行中与排队中共用容量，主动索要只豁免频控，不豁免容量。
+        self.max_pending = max(1, int(cfg.get('voice_max_pending', 8)))
+        self.max_pending_per_session = max(1, int(cfg.get('voice_max_pending_per_session', 1)))
+        self.queue_ttl = max(0.0, float(cfg.get('voice_queue_ttl', 30.0)))
+        self._pending: dict[object, str] = {}
+        self._aux_pending = 0
+        self._epoch = 0
+        self._closed = False
+        self._clock = time.monotonic
+        self._config_signature = self._signature()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="GeYiVoice")
 
+    def _signature(self) -> tuple:
+        return (self.enabled, self.gateway_url, self.health_url, self.auth_token, self.timeout,
+                self.group_cooldown, self.poke_rate, self.speed, self.onebot_http_url,
+                self.onebot_access_token, self.max_pending, self.max_pending_per_session, self.queue_ttl)
+
+    def _new_client(self):
+        return VoiceClient(gateway_url=self.gateway_url, health_url=self.health_url,
+                           auth_token=self.auth_token, timeout=self.timeout, speed=self.speed)
+
     def reload(self, config: dict[str, Any]) -> None:
-        """重载语音配置。"""
-        with self._lock:
+        """重载语音配置；已开始发送完成后再切换配置，未发送任务按 epoch 作废。"""
+        with self._send_lock, self._lock:
             self.enabled = bool(config.get("voice_enabled", True))
             self.gateway_url = str(config.get("voice_gateway_url", self.gateway_url))
             self.health_url = str(config.get("voice_health_url", self.health_url))
@@ -86,13 +105,15 @@ class VoiceManager:
             self.onebot_access_token = str(
                 config.get("voice_onebot_access_token", self.onebot_access_token) or "")
 
-            self.client.update_config(
-                gateway_url=self.gateway_url,
-                health_url=self.health_url,
-                auth_token=self.auth_token,
-                timeout=self.timeout,
-                speed=self.speed,
-            )
+            self.max_pending = max(1, int(config.get('voice_max_pending', 8)))
+            self.max_pending_per_session = max(1, int(config.get('voice_max_pending_per_session', 1)))
+            self.queue_ttl = max(0.0, float(config.get('voice_queue_ttl', 30.0)))
+            signature = self._signature()
+            if signature != self._config_signature:
+                # 不修改在途请求持有的 client；仅语音设置变化使旧任务失效。
+                self._epoch += 1
+                self.client = self._new_client()
+                self._config_signature = signature
         logger.info("语音子系统配置已重载: enabled=%s, url=%s", self.enabled, self.gateway_url)
 
     # ---------------- 熔断状态 ----------------
@@ -136,9 +157,7 @@ class VoiceManager:
                 with self._lock:
                     self._probe_inflight = False
 
-        try:
-            self._executor.submit(_job)
-        except RuntimeError:  # 线程池已关闭（插件正在卸载）
+        if not self._submit_aux(_job):
             with self._lock:
                 self._probe_inflight = False
 
@@ -183,24 +202,57 @@ class VoiceManager:
         if is_active_request:
             return True, "用户主动触发，豁免冷却"
 
-        now = time.time()
         with self._lock:
-            # 连续性检查：上一轮刚发过语音则当前轮自觉间隔
-            if self._session_consecutive.get(session_key, False):
-                return False, "连发间隔保护（上一轮刚发过语音）"
+            return self._frequency_allowed(session_key, target_id, is_active_request)
 
-            # 群冷却检查
-            last_t = self._group_last_voice.get(target_id, 0.0)
-            passed = now - last_t
-            if passed < self.group_cooldown:
-                remain = int(self.group_cooldown - passed)
-                return False, f"群冷却中（剩余 {remain} 秒）"
+    def _frequency_allowed(self, session_key: str, target_id: str, active: bool) -> tuple[bool, str]:
+        """调用方持锁；入队、执行、合成后共用同一频控判定。"""
+        if self._closed or not self.enabled:
+            return False, '语音功能已关闭'
+        if active:
+            return True, '用户主动触发，豁免冷却'
+        if self._session_consecutive.get(session_key, False):
+            return False, '连发间隔保护'
+        last = self._group_last_voice.get(target_id)
+        if last is not None and self._clock() - last < self.group_cooldown:
+            return False, '群冷却中'
+        return True, '可以发送'
 
-        return True, "可以发送"
+    def _job_valid(self, token, epoch, deadline, session_key, target_id, active) -> bool:
+        with self._lock:
+            return (token in self._pending and epoch == self._epoch and self._clock() < deadline
+                    and self._frequency_allowed(session_key, target_id, active)[0])
+
+    def _submit_aux(self, fn) -> bool:
+        # 健康探测、遥测也占总容量，避免共享 executor 的旁路队列无界。
+        with self._lock:
+            if self._closed or len(self._pending) + self._aux_pending >= self.max_pending:
+                return False
+            self._aux_pending += 1
+        def worker():
+            try:
+                fn()
+            finally:
+                with self._lock:
+                    self._aux_pending -= 1
+        try:
+            self._executor.submit(worker)
+            return True
+        except RuntimeError:
+            with self._lock:
+                self._aux_pending -= 1
+            return False
+
+    def shutdown(self) -> None:
+        with self._send_lock, self._lock:
+            self._closed = True
+            self._epoch += 1
+        # 已排队任务快速经过校验并在 finally 释放预占；运行中的网络请求受 timeout 限制。
+        self._executor.shutdown(wait=False)
 
     def mark_voice_sent(self, session_key: str, target_id: str) -> None:
         """记录已发送语音，更新冷却与连发状态。"""
-        now = time.time()
+        now = self._clock()
         with self._lock:
             self._group_last_voice[target_id] = now
             self._session_consecutive[session_key] = True
@@ -222,7 +274,8 @@ class VoiceManager:
             url += ('&' if '?' in url else '?') + 'access_token=' + token
         return url
 
-    def send_voice_message(self, session_type: str, target_id: str | int, base64_audio: str, event: Any = None) -> bool:
+    def send_voice_message(self, session_type: str, target_id: str | int, base64_audio: str,
+                           event: Any = None, *, send_url: str | None = None) -> bool:
         """投递 Base64 语音：优先走本地 OneBot HTTP 接口（彻底杜绝 OlivOS OP 码 url='None' 导致的未知文件路径报错），若失败则退回 event.send。"""
         tid = str(target_id).strip()
         b64 = (base64_audio or "").strip()
@@ -235,10 +288,10 @@ class VoiceManager:
             return False
 
         # 方式 1: 直接通过 OneBot 11 HTTP API 投递标准 JSON（彻底杜绝 url="None" 异常与 [程心自定义] 标签）
-        url = self._onebot_send_url()
+        url = self._onebot_send_url() if send_url is None else send_url
         if url:
+            resp = None
             try:
-                import json
                 import requests
                 target_key = "group_id" if session_type == "group" else "user_id"
                 payload = {
@@ -256,24 +309,34 @@ class VoiceManager:
                 resp = requests.post(url, json=payload, timeout=5.0)
                 if resp.status_code == 200:
                     data = resp.json()
-                    if data.get("retcode") == 0 or data.get("status") == "ok":
+                    accepted = (data.get('retcode') == 0 if 'retcode' in data
+                                else data.get('status') == 'ok')
+                    if accepted and data.get('status') != 'failed' and data.get('active') is not False:
                         logger.info("OneBot HTTP 语音直发成功 -> %s(%s)", session_type, tid)
                         return True
                     else:
                         logger.warning("OneBot HTTP 语音接口返回错误: %s", data)
             except Exception as e:
                 logger.debug("OneBot HTTP 语音投递异常，尝试退回平台接口: %s", e)
+            finally:
+                if resp is not None:
+                    resp.close()
 
         # 方式 2: 退回平台 event 接口
         cq_code = f"[CQ:record,file=base64://{b64_clean}]"
         if event is not None:
             try:
                 if hasattr(event, "send"):
-                    event.send(session_type, int(tid), cq_code)
-                    return True
+                    response = event.send(session_type, int(tid), cq_code)
                 elif hasattr(event, "reply"):
-                    event.reply(cq_code)
-                    return True
+                    response = event.reply(cq_code)
+                else:
+                    return False
+                # None 仅代表平台 API 正常返回；显式错误不记为已发。
+                if isinstance(response, dict):
+                    return not (response.get('active') is False or response.get('status') == 'failed'
+                                or ('retcode' in response and response['retcode'] != 0))
+                return response is not False
             except Exception as ex:
                 logger.warning("平台接口发送语音异常: %s", ex)
 
@@ -295,9 +358,8 @@ class VoiceManager:
     ) -> bool:
         """在后台线程异步请求本地 TTS 并发送语音消息。
 
-        返回 **是否真的排上了**（False = 关闭 / 熔断 / 冷却 / 连发保护）。
-        调用方据此决定要不要把「发过语音」写进上下文——以前无论如何都写，
-        网关离线时她会「记得」自己发过一条根本不存在的语音。
+        返回是否排入有界队列；已发事实只能在 on_success 中提交。
+        普通平台适配器只保证发送 API 正常返回，不代表终端收听或平台确认。
 
         参数:
             event: OlivOS 事件对象 (具有 send(session_type, target_id, payload) 方法)
@@ -318,10 +380,30 @@ class VoiceManager:
             return False
 
         norm_emotion = normalize_emotion(emotion)
+        target_id = str(target_id)
+        token = object()
+        with self._lock:
+            if not self._frequency_allowed(session_key, target_id, is_active_request)[0]:
+                return False
+            if len(self._pending) + self._aux_pending >= self.max_pending:
+                return False
+            if sum(key == session_key for key in self._pending.values()) >= self.max_pending_per_session:
+                return False
+            self._pending[token] = session_key
+            epoch, client = self._epoch, self.client
+            deadline = self._clock() + self.queue_ttl
+            send_url = self._onebot_send_url()
+
+        def valid():
+            if not self._job_valid(token, epoch, deadline, session_key, target_id, is_active_request):
+                return False
+            return is_active_request or client.health_cached()[0]
 
         def _worker():
             try:
-                cq_code, info = self.client.synthesize(
+                if not valid():
+                    return
+                cq_code, info = client.synthesize(
                     japanese_text,
                     norm_emotion,
                     group_id=group_id,
@@ -338,20 +420,21 @@ class VoiceManager:
 
                 if not b64:
                     # 合成失败：如果是「网关连不上」，顺手把降级通知发出去（按跃变 + 冷却，不刷屏）
-                    if not self.client.health_cached()[0]:
+                    if not client.health_cached()[0]:
                         self._note_health(False, str(info.get("error") or "合成失败"))
                     logger.debug("语音合成未产出有效音频数据: %s", info.get("error", "未知"))
                     return
                 self._note_health(True)
 
-                # 调用平台底层接口发送 Base64 语音气泡
-                sent = self.send_voice_message(session_type, target_id, b64, event=event)
-                if not sent:
-                    logger.warning("所有语音投递渠道均失败 -> %s(%s)", session_type, target_id)
-                    return
-
-                # 记录冷却
-                self.mark_voice_sent(session_key, str(target_id))
+                # 串行化最终校验与发送/记冷却，跨会话同一目标也不会同时穿过冷却。
+                with self._send_lock:
+                    if not valid():
+                        return
+                    sent = self.send_voice_message(session_type, target_id, b64, event=event, send_url=send_url)
+                    if not sent:
+                        logger.warning("所有语音投递渠道均失败 -> %s(%s)", session_type, target_id)
+                        return
+                    self.mark_voice_sent(session_key, target_id)
                 logger.info(
                     "成功发送原声语音 [%s|%s]: %s (耗时: %sms)",
                     norm_emotion,
@@ -369,15 +452,23 @@ class VoiceManager:
 
             except Exception as e:
                 logger.warning("异步发送语音异常: %s", e)
+            finally:
+                with self._lock:
+                    self._pending.pop(token, None)
 
-        self._executor.submit(_worker)
-        return True
+        try:
+            self._executor.submit(_worker)
+            return True
+        except RuntimeError:
+            with self._lock:
+                self._pending.pop(token, None)
+            return False
 
     def report_reply_telemetry(self) -> None:
         """在后台线程异步上报文本回复事件，点亮本地控制台的语音触发率指标。"""
         if not self.enabled:
             return
-        self._executor.submit(self.client.report_reply_telemetry)
+        self._submit_aux(self.client.report_reply_telemetry)
 
     # ---------------- 戳一戳互动彩蛋 ----------------
 
@@ -403,7 +494,7 @@ class VoiceManager:
             return False
 
         emotion, phrase = get_random_poke_voice()
-        self.dispatch_voice(
+        return self.dispatch_voice(
             event=event,
             session_type=session_type,
             target_id=target_id,
@@ -415,7 +506,6 @@ class VoiceManager:
             sender_name="戳一戳互动",
             on_success=on_success,
         )
-        return True
 
     # ---------------- 运维状态汇报 ----------------
 

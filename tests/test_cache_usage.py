@@ -203,7 +203,7 @@ class StoreCacheReportedTest(unittest.TestCase):
         self.assertEqual(self.store.today_stats()['cache_reported_calls'], 0)
 
     def test_old_database_gets_the_column_added(self):
-        """旧版 SQLite 数据库缺少该列时，升级必须补列且保留已有记录。"""
+        """生产库是"还没有这一列"的老库，升级时必须自动补列且不丢旧行。"""
         import sqlite3
 
         path = os.path.join(self.dir, 'old.sqlite3')

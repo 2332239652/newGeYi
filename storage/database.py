@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -111,7 +112,17 @@ def text_similarity(text1: str, text2: str) -> float:
     jaccard = inter / len(all1 | all2)
     return 0.5 * overlap + 0.5 * jaccard
 
+logger = logging.getLogger('newGeYi.database')
+
 _SCHEMA = """
+-- 遗忘水位只存标识与版本，不保存已删除的正文；旧模型任务提交前必须校验。
+CREATE TABLE IF NOT EXISTS forget_state(
+    scope TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    buffer_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(scope, user_id)
+);
 CREATE TABLE IF NOT EXISTS turns(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_key TEXT NOT NULL,
@@ -334,6 +345,33 @@ def is_private_session_key(session_key: str) -> bool:
     return ':private:' in key or '|private|' in key or key.endswith('|private')
 
 
+class _StoreTransaction:
+    def __init__(self, conn):
+        self.conn = conn
+        self.nested = False
+
+    def __enter__(self):
+        self.nested = self.conn.in_transaction
+        self.conn.execute('SAVEPOINT forget_nested' if self.nested else 'BEGIN IMMEDIATE')
+        return self.conn
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.nested:
+            if exc_type is not None:
+                self.conn.execute('ROLLBACK TO forget_nested')
+            self.conn.execute('RELEASE forget_nested')
+        else:
+            try:
+                self.conn.execute('ROLLBACK' if exc_type is not None else 'COMMIT')
+            except Exception:
+                # COMMIT本身也可能失败（锁/磁盘/约束等）；释放活动事务，
+                # 防止下一轮误把未提交的半批当作嵌套事务继续写。
+                if self.conn.in_transaction:
+                    self.conn.execute('ROLLBACK')
+                raise
+        return False
+
+
 class SQLiteStore:
     """线程安全（thread-local 连接）的 SQLite 存储。"""
 
@@ -351,6 +389,38 @@ class SQLiteStore:
             conn.execute('PRAGMA synchronous=NORMAL')
             self._local.conn = conn
         return conn
+
+    def transaction(self):
+        """短写事务，可嵌套；只用于本地快照/提交，禁止把模型调用放进来。"""
+        return _StoreTransaction(self._conn())
+
+    def forget_epoch(self) -> int:
+        return int(self.get_setting('memory.forget_epoch', '0') or 0)
+
+    def forget_generation(self, scope: str, user_id: str) -> int:
+        row = self._conn().execute(
+            'SELECT generation FROM forget_state WHERE scope=? AND user_id=?',
+            (str(scope), str(user_id))).fetchone()
+        return int(row[0]) if row else 0
+
+    def forget_watermark(self, scope: str, user_id: str) -> int:
+        row = self._conn().execute(
+            'SELECT buffer_id FROM forget_state WHERE scope=? AND user_id=?',
+            (str(scope), str(user_id))).fetchone()
+        return int(row[0]) if row else 0
+
+    def _advance_forget(self, scope: str, user_id: str, buffer_id: int) -> None:
+        self._conn().execute(
+            'INSERT INTO forget_state(scope,user_id,generation,buffer_id) VALUES(?,?,1,?) '
+            'ON CONFLICT(scope,user_id) DO UPDATE SET generation=generation+1, '
+            'buffer_id=MAX(buffer_id,excluded.buffer_id)',
+            (str(scope), str(user_id), int(buffer_id)))
+
+    def _buffer_high_watermark(self) -> int:
+        # AUTOINCREMENT 序列在删光所有行后仍单调，水位在重启后继续有效。
+        row = self._conn().execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='memory_buffer'").fetchone()
+        return int(row[0]) if row else 0
 
     def close(self) -> None:
         """关掉本线程的连接（测试/退出用）。
@@ -714,33 +784,32 @@ class SQLiteStore:
         return int(row[0])
 
     def buffer_trim(self, session_key: str, keep: int = 300, retention_seconds: int = 0) -> None:
-        """清掉**过期**的旧缓冲，并给总量留一个上限。
+        """只清理已消费且过保留期的行；keep 是单会话积压告警软上限。
 
-        `retention_seconds > 0` 时，游标以下的行不再立刻删除，而是留一段时间：
-        工作记忆的状态纸条要读「刚刚过去、但还没进长期记忆」的那一段，行一删就没得读
-        （2026-11-10 实测：纸条线程永远看到 0 条）。默认 0 = 旧行为，运行时传
-        `memory_buffer_retention_seconds`（默认 2 小时）。
+        全表自增 ID 的差值不代表本会话条数。未消费行（包括正在分片的行）和
+        保留窗口内的原文优先保留，超量会明确告警，供调用方监控/背压。
+        retention_seconds=0 仍表示消费后立即可删。
         """
-        conn = self._conn()
-        try:
-            cursor = int(self.get_setting(f'mem.cursor:{session_key}') or 0)
-        except (TypeError, ValueError):
-            cursor = 0
-        if cursor > 0:
-            if retention_seconds > 0:
-                stale_before = int(time.time()) - int(retention_seconds)
-                conn.execute(
-                    'DELETE FROM memory_buffer WHERE session_key=? AND id<=? AND created_at<?',
-                    (session_key, cursor, stale_before))
-            else:
-                conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND id<=?',
-                             (session_key, cursor))
-        row = conn.execute(
-            'SELECT COALESCE(MAX(id), 0) FROM memory_buffer WHERE session_key=?', (session_key,)
-        ).fetchone()
-        cutoff = int(row[0]) - int(keep)
-        if cutoff > 0:
-            conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND id<=?', (session_key, cutoff))
+        with self.transaction() as conn:
+            try:
+                cursor = int(self.get_setting(f'mem.cursor:{session_key}') or 0)
+            except (TypeError, ValueError):
+                cursor = 0
+            if cursor > 0:
+                if retention_seconds > 0:
+                    stale_before = int(time.time()) - int(retention_seconds)
+                    conn.execute(
+                        'DELETE FROM memory_buffer WHERE session_key=? AND id<=? AND created_at<?',
+                        (session_key, cursor, stale_before))
+                else:
+                    conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND id<=?',
+                                 (session_key, cursor))
+            count = conn.execute(
+                'SELECT COUNT(*) FROM memory_buffer WHERE session_key=?', (session_key,)
+            ).fetchone()[0]
+            if count > max(0, int(keep)):
+                logger.warning('记忆缓冲超过单会话软上限，保留未消费/保留期内原文 | %s rows=%d keep=%d',
+                               session_key, count, max(0, int(keep)))
 
     def buffer_last_at(self, session_key: str, after_id: int = 0) -> int:
         """未消费缓冲里最后一条的写入时间（判断「空闲多久了」用）。"""
@@ -919,12 +988,14 @@ class SQLiteStore:
         把真正切题的那条挤出候选池。关键词只该来自模型给的同义词——
         老数据留空即可，它们靠 `fact` 原文匹配（`facts_matching` 里同时 LIKE fact）。
         """
-        conn = self._conn()
-        cur = conn.execute("UPDATE user_facts SET keywords='' WHERE COALESCE(keywords,'')<>''")
-        # 两个标记都置上：`keywords_cleanup` 是 _init 判重用的，旧名字留着免得老库回头又"回填"一次
-        self.set_setting('facts.keywords_cleanup', '1')
-        self.set_setting('facts.keywords_backfilled', '1')
-        return int(cur.rowcount or 0)
+        with self.transaction() as conn:
+            # 锁内重查：多个初始化者也只清理一次，标记与正文同提交。
+            if self.get_setting('facts.keywords_cleanup') is not None:
+                return 0
+            cur = conn.execute("UPDATE user_facts SET keywords='' WHERE COALESCE(keywords,'')<>''")
+            self.set_setting('facts.keywords_cleanup', '1')
+            self.set_setting('facts.keywords_backfilled', '1')
+            return int(cur.rowcount or 0)
 
     def get_user_impression(self, user_id: str, scope: str = 'group') -> Optional[dict]:
         """获取用户高维印象卡片（支持 scope='group' 与 'private'，隔离提炼）。"""
@@ -939,6 +1010,10 @@ class SQLiteStore:
 
     def set_user_impression(self, user_id: str, summary: str, scope: str = 'group') -> bool:
         """更新用户高维印象卡片（按 scope 隔离群聊与私聊）；**每次真实改动都追加一条历史**。返回是否真的改了。"""
+        with self.transaction():
+            return self._set_user_impression(user_id, summary, scope)
+
+    def _set_user_impression(self, user_id: str, summary: str, scope: str) -> bool:
         text = str(summary or '').strip()
         if not text:
             return False
@@ -957,13 +1032,10 @@ class SQLiteStore:
             'ON CONFLICT(user_id, scope) DO UPDATE SET summary=excluded.summary, updated_at=excluded.updated_at',
             (uid, sc, text, now),
         )
-        try:
-            conn.execute(
-                'INSERT INTO user_impressions_history(user_id, scope, summary, created_at, reason) '
-                'VALUES(?,?,?,?,?)', (uid, sc, text, now, 'create' if not row else 'update'),
-            )
-        except sqlite3.Error:                 # 历史写失败不能拖累主表
-            pass
+        conn.execute(
+            'INSERT INTO user_impressions_history(user_id, scope, summary, created_at, reason) '
+            'VALUES(?,?,?,?,?)', (uid, sc, text, now, 'create' if not row else 'update'),
+        )
         return True
 
     def impression_history(self, user_id: str, scope: Optional[str] = 'group', limit: int = 20) -> list[dict]:
@@ -996,13 +1068,27 @@ class SQLiteStore:
             (int(when or time.time()), int(fact_id)),
         )
 
-    def delete_user_fact_by_id(self, fact_id: int, user_id: str) -> bool:
-        """精确物理删除一条用户事实（带 user_id 校验防越权）。"""
-        cur = self._conn().execute(
-            'DELETE FROM user_facts WHERE id=? AND user_id=?',
-            (int(fact_id), str(user_id)),
-        )
-        return bool(cur.rowcount > 0)
+    def delete_user_fact_by_id(self, fact_id: int, user_id: str,
+                               source_session: str = '') -> bool:
+        """精确删除；旧原文与在途提炼也须失效，其他事实保持原样。"""
+        uid = str(user_id)
+        with self.transaction() as conn:
+            row = conn.execute('SELECT session_key FROM user_facts WHERE id=? AND user_id=?',
+                               (int(fact_id), uid)).fetchone()
+            if not row:
+                return False
+            scope = str(row[0])
+            high = self._buffer_high_watermark()
+            self._advance_forget(scope, uid, high)
+            self.set_setting('memory.forget_epoch', self.forget_epoch() + 1)
+            conn.execute('DELETE FROM user_facts WHERE id=? AND user_id=?', (int(fact_id), uid))
+            conn.execute('DELETE FROM user_facts_archive WHERE fact_id=? AND user_id=?', (int(fact_id), uid))
+            sessions = {scope, str(source_session or scope)} - {'global'}
+            for session in sessions:
+                self._advance_forget(session, uid, high)
+                conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND sender_id=? AND id<=?',
+                             (session, uid, high))
+            return True
 
     def count_user_facts(self, session_key: str, user_id: Optional[str] = None) -> int:
         sql = 'SELECT COUNT(*) FROM user_facts WHERE session_key=? AND valid_to=0'
@@ -1024,24 +1110,35 @@ class SQLiteStore:
         「忘了我」以前只删当前群的，而跨群偏好存在 global 里，于是她换个群还记得你
         （2026-11-03 审查发现）。
         """
-        conn = self._conn()
-        sessions = [session_key]
+        uid = str(user_id)
+        sessions = [str(session_key)]
         if include_global and session_key != 'global':
             sessions.append('global')
         placeholders = ','.join('?' for _ in sessions)
-        row = conn.execute(
-            'SELECT COUNT(*) FROM user_facts WHERE session_key IN (%s) AND user_id=? '
-            'AND valid_to=0' % placeholders,
-            tuple(sessions) + (str(user_id),),
-        ).fetchone()
-        conn.execute(
-            'DELETE FROM user_facts WHERE session_key IN (%s) AND user_id=?' % placeholders,
-            tuple(sessions) + (str(user_id),),
-        )
-        conn.execute('DELETE FROM user_impressions WHERE user_id=?', (str(user_id),))
-        # 「忘了我」要连历史一起清：历史里存的是同一批私人信息，留着等于没忘
-        conn.execute('DELETE FROM user_impressions_history WHERE user_id=?', (str(user_id),))
-        return int(row[0])
+        args = tuple(sessions) + (uid,)
+        with self.transaction() as conn:
+            high = self._buffer_high_watermark()
+            for scope in sessions:
+                self._advance_forget(scope, uid, high)
+            # 印象/关系是用户级共享档案：分别持久化自己的代际。
+            self._advance_forget('impression', uid, high)
+            self._advance_forget('relationship', uid, high)
+            self.set_setting('memory.forget_epoch', self.forget_epoch() + 1)
+            row = conn.execute(
+                'SELECT COUNT(*) FROM user_facts WHERE session_key IN (%s) AND user_id=? '
+                'AND valid_to=0' % placeholders, args).fetchone()
+            conn.execute('DELETE FROM user_facts WHERE session_key IN (%s) AND user_id=?' % placeholders, args)
+            conn.execute('DELETE FROM user_facts_archive WHERE session_key IN (%s) AND user_id=?' % placeholders, args)
+            conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND sender_id=? AND id<=?',
+                         (str(session_key), uid, high))
+            for scope in sessions:
+                conn.execute('DELETE FROM memories WHERE user_key=?', (f'{scope}|u|{uid}',))
+            conn.execute('DELETE FROM user_impressions WHERE user_id=?', (uid,))
+            conn.execute('DELETE FROM user_impressions_history WHERE user_id=?', (uid,))
+            conn.execute('DELETE FROM user_relationship WHERE user_id=?', (uid,))
+            conn.execute('DELETE FROM relationship_log WHERE user_id=?', (uid,))
+            conn.execute('DELETE FROM settings WHERE key=?', ('rel_mild:' + str(session_key),))
+            return int(row[0])
 
     def migrate_legacy_memories(self) -> int:
         """把旧 memories 表（user_key = session|u|uid）迁进 user_facts，只做一次。"""
@@ -1259,7 +1356,7 @@ class SQLiteStore:
         而提炼按**消息量**算（每 `memory_curate_messages` 条一次）。
         小群一天几十次提炼，配额瞬间见底。
 
-        线上实测（群 957309761，19 人，配额 40）：
+        合成配额示例（19 人，配额 40）：
 
             09-17   提炼 39 + 被动 6 + 主动 21 = 66   ★ 超配额
             09-18   提炼 33 + 被动 0 + 主动 10 = 43   ★ 超配额
@@ -1366,8 +1463,8 @@ class SQLiteStore:
             return 0
         doomed = sorted(killed)
         if doomed:
-            # 先留档再删：淘汰是「从记忆里拿掉」，不是「历史里抹掉」
-            try:
+            # 留档与删除同提交；归档失败须传播到提炼事务，原事实也保留。
+            with self.transaction():
                 now = int(time.time())
                 conn.executemany(
                     'INSERT INTO user_facts_archive(fact_id, session_key, user_id, fact, category, '
@@ -1376,9 +1473,7 @@ class SQLiteStore:
                     'valid_from, hit_count, ?, ? FROM user_facts WHERE id=?',
                     [(now, 'capacity', i) for i in doomed],
                 )
-            except sqlite3.Error:
-                pass                        # 留档失败不能挡住淘汰（否则容量会一直涨）
-            conn.executemany('DELETE FROM user_facts WHERE id=?', [(i,) for i in doomed])
+                conn.executemany('DELETE FROM user_facts WHERE id=?', [(i,) for i in doomed])
         return len(doomed)
 
     def archived_facts(self, session_key: str, user_id: str = '', limit: int = 50) -> list[dict]:

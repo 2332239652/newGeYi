@@ -467,7 +467,7 @@ class ToleranceTest(unittest.TestCase):
 
 
 class ManualPriorityTest(unittest.TestCase):
-    """手动切换优先于已启动的后台探测，避免过期结果覆盖操作者选择。
+    """手动切换永远优先（2026-11-12 现场：骰主切到官方 13 秒后，被后台重试锁回中转站）。
 
     根因三条，都在这里钉住：
     1. 重试已经开跑后骰主又手动切了渠道 → 这次重试必须作废（不锁定、不通知）；

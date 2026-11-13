@@ -31,10 +31,10 @@ from newGeYi.runtime.sleep import (  # noqa: E402
     parse_window,
 )
 
-BOT = '53da3460cc454e12667452872284f47d'
-OWNER = '9000000001'
+BOT = 'bot-test'
+OWNER = '2332239652'
 STRANGER = '1000000002'
-GROUP = '9000000002'
+GROUP = '123456789'
 
 
 def ts_at(hour: int, minute: int, day_offset: int = 0) -> float:

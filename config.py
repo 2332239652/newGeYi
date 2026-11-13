@@ -11,6 +11,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+from functools import wraps
 import time
 from pathlib import Path
 
@@ -26,7 +28,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.9.18'
+PLUGIN_VERSION = '2.9.20'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -112,7 +114,7 @@ DEFAULT_CONFIG = {
     #      "model": "deepseek-flash", "api_key": "sk-...",
     #      "extra_body": {"thinking": {"type": "disabled"}}},
     #     {"name": "relay", "kinds": ["memory_curate"], "priority": 1,
-    #      "endpoint": "https://api.example.invalid/v1/chat/completions",
+    #      "endpoint": "https://api.ginka.cloud/v1/chat/completions",
     #      "model": "deepseek-v4.1-flash", "api_key": "sk-...",
     #      "extra_body": {"reasoning_effort": "low"}}
     #   ]
@@ -264,7 +266,7 @@ DEFAULT_CONFIG = {
     'galgame_shadow': True,
     # 主人豁免：不评分、不注入关系块，世界书按最高阶段放行。
     'galgame_owner_exempt': True,
-    # 额外豁免名单（role_prompt 里写死的主人 QQ；owner_ids 里的人也自动豁免）
+    # 额外豁免名单（默认为空；owner_ids 中的账号自动豁免）
     'galgame_exempt_ids': [],
     # 评审用的模型（留空沿用 fast_model）；它走 kind='affection'，可用 affection_provider 指到便宜渠道
     'galgame_judge_model': '',
@@ -348,7 +350,7 @@ DEFAULT_CONFIG = {
     'memory_fuzzy_dedup_threshold': 0.60, # 写入端模糊判重阈值（超过此值视为重复事实，转为刷新已有条目）
     # ===== 工作记忆：状态纸条（2026-11-10）=====
     # 把「超出原文窗口、但还没进长期记忆」的那一段压成 5 行注入：
-    # 场景 / 进行中 / 她答应过 / 未解决。
+    # 场景 / 进行中 / 她答应过 / 未解决。设计见 docs/WORKING_MEMORY_PLAN.md。
     # 成本靠 scene_provider 分流到便宜渠道；失败只退避，不会影响正常回复。
     'scene_enabled': True,
     'scene_update_messages': 24,        # 新增这么多条就更新一次
@@ -380,6 +382,7 @@ DEFAULT_CONFIG = {
     # 下载硬上限与重定向上限：以前没有体积上限、也不拦内网地址，
     # 一个异常/恶意链接就能吃满内存，或者借她的进程去访问本机服务（2026-11-03 审查发现）。
     'image_download_max_bytes': 12 * 1024 * 1024,
+    'image_local_allowed_roots': [],
     'image_download_max_redirects': 3,
     'image_window_seconds': 0,
     'image_fresh_seconds': 120,
@@ -407,6 +410,9 @@ DEFAULT_CONFIG = {
     # 本机 OneBot HTTP 的 access_token —— 打包成 OPK 就等于把凭据一起发出去。
     'voice_auth_token': '',
     'voice_timeout': 10.0,
+    'voice_max_pending': 8,
+    'voice_max_pending_per_session': 1,
+    'voice_queue_ttl': 30.0,
     'voice_group_cooldown': 45,       # 单群语音常规冷却秒数（防刷屏）
     'voice_poke_rate': 0.25,          # 戳一戳触发语音的概率（与表情包联动）
     'voice_speed': 1.0,
@@ -566,8 +572,12 @@ _UNITTEST_STATE = ''
 def _unittest_state_dir() -> str:
     """unittest 进程里兜底用的隔离状态目录（进程内只建一次，且**不写环境变量**）。
 
-    为什么需要：`python -m unittest newGeYi.tests.xxx` 会先导入父包并初始化运行时，
-    此时测试模块尚未设置自己的状态目录，因此隔离必须在包导入期间完成。
+    为什么需要：`python -m unittest newGeYi.tests.xxx` 会**先**导入父包 `newGeYi`
+    → `__init__` → `main` → `Runtime()`，而各测试模块顶上那句"先设 GEYI_DATA_DIR 再导入"
+    要等**包导入之后**才执行 —— 直接调 unittest 时那条防护根本不成立，于是
+    `Runtime()` 会打开**线上**状态目录并跑迁移。
+    2026-11-09 就这么对生产库执行了一次 `ALTER TABLE api_calls ADD COLUMN cache_reported`
+    （只加列、行数与 token 合计不变，但这种事不该发生第二次）。
 
     刻意不写环境变量：测试模块自己的 `setdefault('GEYI_DATA_DIR', ...)` 还要能生效，
     这里只保护"包被导入的那一瞬间"。OlivOS 本体不会 import unittest，所以对线上无影响。
@@ -661,8 +671,16 @@ def get_data_dir() -> Path:
 
 
 # ===== 资源目录自愈 =====
-# 插件宿主可能只创建资源目录而未完成文件复制。同步插件包内缺少或更新的资源，
-# 保持角色提示词和世界书等运行时资源可用。
+# OlivOS 0.11.81 在这台机器上的 pluginAPI.run_plugin_data_release_by_name 每次加载都会失败：
+# 它先把 ./plugin/data/<ns>/data 建好，再用 shutil.copytree 往这个**已经存在**的目录上复制，
+# 于是抛 FileExistsError(WinError 183) 被上层 except 吞掉——
+# 结果是 data/ 被 rmtree 清空之后**再也没被填回来**（2026-10-30 日志实测：目录里 0 个文件）。
+#
+# 插件一直是「资源目录优先、插件包兜底」，所以功能没哑；但带来了两个坑：
+#   1) 启动日志打印的「角色设定: …/data/role_prompt.txt」指向一个不存在的文件，
+#      照着它去改会白改一场；
+#   2) 想在服务器上热改 role_prompt / 世界书的人，改了没反应也没提示。
+# 这里补上自愈：把插件包 data/ 里缺的（或比目标更新的）文件补进资源目录。
 _MIRROR_SKIP_SUFFIXES = ('.bak', '.pyc', '.tmp', '.log', '.swp')
 _MIRROR_SKIP_DIRS = {'__pycache__', '.git'}
 _MIRROR_MIN_INTERVAL = 60.0   # 懒同步节流：同一进程内 60 秒最多扫一次
@@ -799,6 +817,18 @@ def _migrate_legacy_keys(loaded: dict, merged: dict) -> dict:
     return merged
 
 
+# One writer order for disk, panel revisions and shared runtime configuration.
+CONFIG_LOCK = threading.RLock()
+
+
+def config_locked(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with CONFIG_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
 class ConfigWriteBlocked(RuntimeError):
     """配置文件不可写（磁盘上那份解析不了 / 之前解析失败过）。
 
@@ -844,6 +874,7 @@ def _quarantine_config(path: Path, reason: str) -> None:
                      '不会覆盖磁盘上的配置', reason)
 
 
+@config_locked
 def load_config() -> dict:
     path = get_config_path()
     value = copy.deepcopy(DEFAULT_CONFIG)
@@ -884,6 +915,7 @@ def load_config() -> dict:
     return value
 
 
+@config_locked
 def save_config(value: dict, force: bool = False) -> None:
     """原子写入配置。
 
@@ -907,6 +939,15 @@ def save_config(value: dict, force: bool = False) -> None:
             shutil.copy2(str(path), str(path.with_name(path.name + '.bak-auto')))
         except OSError:
             logger.warning('配置滚动备份失败（不影响本次写入）')
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temp, path)
+    # Unique sibling temporary file: even independent processes never share a .tmp.
+    body = json.dumps(copy.deepcopy(value), ensure_ascii=False, indent=2)
+    fd, name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=str(path.parent))
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
