@@ -53,7 +53,7 @@ class FakeHTTP:
         return sum(1 for item in self.calls if item == url)
 
 
-def make_msg(raw_text: str, text: str = '【图片】', sender='2332239652', name='歌靡'):
+def make_msg(raw_text: str, text: str = '【图片】', sender='9000000001', name='歌靡'):
     return IncomingMessage(
         session=SESSION, message_id='1', sender_id=sender, sender_name=name,
         text=text, raw_text=raw_text, is_group=True, mentioned_bot=False,

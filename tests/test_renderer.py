@@ -74,7 +74,7 @@ class OutlineDraftTest(unittest.TestCase):
         self.assertFalse(out.startswith('I should'), out)
         self.assertIn('诶？今天是万圣节吗？', out)
 
-        # ② 冒号 + 引号收尾（2026-10-30 大群 1013491196，原文照抄）
+        # ② 冒号 + 引号收尾（2026-10-30 大群 9000000002，原文照抄）
         raw2 = ('Here\'s what I\'ll say: "哼哼，这种事情不用搜也是刻在直觉里的嘛！'
                 '而且歌靡难道不觉得现在的我才是最棒的吗～"')
         out2 = self.renderer._strip_thinking_process(raw2)

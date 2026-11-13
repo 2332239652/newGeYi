@@ -40,6 +40,27 @@ class MessageRouter:
             self.r.private_gate = gate
         return gate
 
+    def _quota_hint(self, msg: IncomingMessage, why: str) -> str:
+        """额度用尽时提示一次（每会话每天最多一次），免得用户以为她坏了。
+
+        为什么不每次都提示：被限额挡住的消息可能连着来，逐条回等于绕过限额。
+        每天只提示一次，既解释清楚，又不至于变成刷屏。
+        """
+        key = 'priv.quota_hint:' + msg.session.as_text()
+        day = time.strftime('%Y%m%d')
+        try:
+            if str(self.r.store.get_setting(key) or '') == day:
+                return ''
+            self.r.store.set_setting(key, day)
+        except Exception:  # noqa: BLE001 - 记账失败就少说一句，别打断路由
+            return ''
+        if why == 'quota_global':
+            return ('今天来找我的人有点多，主人那边的额度快见底啦……\n'
+                    '我先省着点，明天 0 点恢复；发「今日额度」可以看自己的次数。')
+        return ('唔……今天和我聊的次数用完啦。\n'
+                '每一句都要花掉主人不少 token，我想帮他省着点，\n'
+                '明天 0 点就恢复啦～发「今日额度」可以看到剩下的次数。')
+
     # 注：这里曾经还有一个 `_group_active_on()`，跟 attention.py 里
     # `store.get_setting(f'group_active:{session_key}') == '0'` 是同一件事的两份实现，
     # 而且零调用（真正的判断一直在闸门里）。2026-10-30 删除，避免两份实现走样。
@@ -137,6 +158,9 @@ class MessageRouter:
                         if why.startswith('quota'):
                             logger.info('私聊额度用尽（%s），本条不回 | %s',
                                         why, msg.session.as_text()[-12:])
+                            hint = self._quota_hint(msg, why)
+                            if hint:
+                                self.r.reply(msg, hint)
                         else:
                             logger.debug('私聊闸门拦住（%s）| %s', why,
                                          msg.session.as_text()[-12:])

@@ -12,7 +12,10 @@ import time
 
 from .. import config as plugin_config
 from ..config import SKIP_ACTIVE
+from ..context import aliases
 from ..memory.exporter import export_memory
+from ..memory.repository import SHARE_OVERRIDE_PREFIX
+from ..memory.worldbook import is_story_mode, list_story_mode_users, set_story_mode
 from ..models import IncomingMessage
 from ..presentation.renderer import load_emote_table  # noqa: F401  （保留导出）
 from ..runtime import sponsors
@@ -50,9 +53,43 @@ def fmt_tokens(value) -> str:
         return str(value)
 
 
+def cache_rate_text(cached: int, prompt_total: int) -> str:
+    """缓存命中率的展示文字。
+
+    以前是 `cached * 100 // prompt_total` 的**整数地板除法**：真实 0.28% 显示成 0%、
+    1.2% 显示成 1%。于是「命中几乎总是 0」这个印象有一半是显示纪律造成的，不是渠道。
+    现在：低于 10% 保一位小数，低于 0.1% 说「<0.1%」，10% 以上取整（向下，
+    免得 99.9% 显示成 100%），并且上限锁 100%——命中 token 不可能超过总输入。
+    """
+    if prompt_total <= 0:
+        return '0%'
+    rate = min(100.0, max(0.0, float(cached) * 100.0 / float(prompt_total)))
+    if rate <= 0:
+        return '0%'
+    if rate < 0.1:
+        return '<0.1%'
+    if rate < 10:
+        return '%.1f%%' % rate
+    return '%d%%' % int(rate)
+
+
+def cache_report_hint(today: dict) -> str:
+    """「缓存命中 0」到底是没命中，还是渠道没上报。空串 = 不需要解释。"""
+    inp = int(today.get('input_tokens') or 0)
+    cached = int(today.get('cached_tokens') or 0)
+    if not inp or cached:
+        return ''
+    if int(today.get('cache_reported_calls') or 0) > 0:
+        return ''            # 有调用报了缓存字段，只是没命中——那是真 0，不用解释
+    return '｜该渠道未上报缓存字段'
+
+
 class CommandRouter:
+    FORGET_CONFIRM_WINDOW = 60.0
+
     def __init__(self, runtime):
         self.r = runtime
+        self._pending_forget: dict[str, float] = {}
 
     # ------------- 公共 -------------
     def _save_and_reload(self, changes: dict | None = None) -> None:
@@ -80,6 +117,35 @@ class CommandRouter:
                 logger.warning('配置热更新有问题：%s', error)
 
     def _cmd_menu(self, msg: IncomingMessage) -> str:
+        """公开菜单：**只放普通用户用得上的指令**。
+
+        2026-11-12 拆分：以前一张菜单把骰主/群管的 20 多条指令和用户指令混在一起，
+        普通用户在群里发一次「歌伊菜单」会刷掉半屏，还是别人的开关说明。
+        现在管理指令整体挪到「歌伊管理菜单」（`_cmd_admin_menu`），这里只留一句指路。
+        """
+        lines = [
+            f'--- 歌伊菜单 v{plugin_config.PLUGIN_VERSION} ---',
+            '',
+            '[状态] 歌伊状态 | 今日用量',
+            '[对话] 我的记忆 / 查看记忆 | 删除记忆 <序号> | 忘了我',
+            '[称呼] 叫我 <名字> | 我的称呼',
+            '[私聊] 关系（看看她现在怎么看你） | 今日额度 | 群聊记忆开/关（私聊里要不要带上群里的事）',
+            '[世界书] 世界书状态 | 剧情模式 | 剧情模式开/关（探索歌伊的世界与故事）',
+            '',
+            '群管和骰主的指令：发「歌伊管理菜单」',
+        ]
+        # 2026-11-11 骰主反转了 11-08 的「菜单里不放赞助内容」：
+        # 爱发电页面上已经公开承诺「一档的歌伊菜单末尾鸣谢里有你的名字」，
+        # 承诺写在用户看得到的地方，就不能只在后台生效。
+        # 收敛在两条线以内：**只出现名字，不出现档位、人数、额度**——
+        # 「凭什么他有 100 我只有 60」这个副作用依然要挡住。
+        thanks = self._sponsor_thanks_line()
+        if thanks:
+            lines.extend(['', thanks])
+        return '\n'.join(lines)
+
+    def _cmd_admin_menu(self, msg: IncomingMessage) -> str:
+        """管理菜单：群管能用「本群」那几条，其余需要骰主/主人。"""
         cfg = self.r.config
         wb_state = '开' if cfg.get('worldbook_enabled') else '关'
         active_state = '开' if cfg.get('active_enabled') else '关'
@@ -89,43 +155,49 @@ class CommandRouter:
         gateway = getattr(self.r, 'gateway', None)
         channel = gateway.current_summary() if gateway is not None else '未配置'
         lines = [
-            f'--- 歌伊菜单 v{plugin_config.PLUGIN_VERSION} ---',
+            f'--- 歌伊管理菜单 v{plugin_config.PLUGIN_VERSION} ---',
+            '（「本群」几条群管就能用，其余需要骰主/主人）',
             '',
-            '[状态] 歌伊状态 | 今日用量',
-            '[对话] 我的记忆 / 查看记忆 | 忘了我',
-            '[世界书] 世界书状态',
-            '[私聊] 关系（看看她现在怎么看你）',
-            '',
-            '[骰主/主人] 渠道状态 | 切换渠道 <名称/序号> | 切换渠道 自动',
-            '[骰主/主人] 解除静默 [号码]（私聊退场是无限期，只能手动放） | 静默列表',
-            '[骰主/主人] 面板地址（本机网页调试台，核心无 OlivOS WebUI 时用这个）',
-            '[骰主/主人] 测试通知',
-            '[骰主/主人] 记忆状态 | 导出记忆',
-            '[骰主/主人] 全局被动开/关 | 开启/关闭私聊',
-            '[骰主/主人] 主动搭话开/关（全局） | 搭话观察 | 搭话影子开/关',
-            '[骰主/主人] 设置key <API Key> | 重置上下文 | 重载设定',
-            '[骰主/主人] 添加/删除触发词 <词> | 查看触发词',
-            '[骰主/主人] 世界书开/关 | 世界书重载',
-            '[骰主/主人] 好感度开/关 | 好感度影子开/关 | 关系详情 <QQ> | 关系设置 <QQ> <0-5> | 关系重置 <QQ>',
-            '[骰主/主人] 私聊用量（今日额度与触发词模式） | 私聊触发词开/关',
-            '[骰主/主人] 赞助名单 | 赞助加 <QQ> [1/2] | 赞助删 <QQ>',
-            '[骰主/主人] 休眠状态 | 休眠开/关 | 休眠时间 <HH:MM-HH:MM> | 休眠重置',
-            '[骰主/主人] 图片理解开/关',
-            '[骰主/主人] 表情包状态 | 开启/关闭表情包 | 加载表情包 <路径> | 表情包重载',
-            '[骰主/主人] 语音状态 | 测试语音 [情绪] [日文] | 开启/关闭语音 | 语音重载',
-            '',
-            '[群管/主人] 本群被动开/关 | 本群主动开/关',
-            '[群管/主人] 设置群背景 <文本> | 查看群背景',
+            '[本群] 本群被动开/关 | 本群主动开/关 | 查看群背景 | 设置群背景 <文本>',
+            '[私聊] 开启/关闭私聊 | 私聊用量（额度与触发词模式） | 私聊触发词开/关',
+            '[记忆] 记忆状态 | 导出记忆 | 群聊记忆列表 | 群聊记忆重置 <QQ/全部>',
+            '[称呼] 称呼列表 | 称呼重置 <QQ>',
+            '[世界书] 世界书开/关 | 世界书重载 | 剧情模式列表 | 剧情模式重置 <QQ/全部>',
+            '[渠道] 渠道状态 | 切换渠道 <名称/序号> | 切换渠道 自动',
+            '[全局] 全局被动开/关 | 主动搭话开/关 | 搭话观察 | 搭话影子开/关',
+            '[全局] 重置上下文 | 重载设定 | 设置key <API Key>（仅私聊）',
+            '[关系] 好感度开/关 | 好感度影子开/关 | 关系详情 <QQ> | 关系设置 <QQ> <0-5> | 关系重置 <QQ>',
+            '[维护] 静默列表 | 解除静默 [号码]（私聊退场是无限期，只能手动放）',
+            '[维护] 测试通知 | 面板地址 | 图片理解开/关 | 添加/删除触发词 <词> | 查看触发词',
+            '[表情] 表情包状态 | 开启/关闭表情包 | 加载表情包 <路径> | 表情包重载',
+            '[语音] 语音状态 | 测试语音 [情绪] [日文] | 开启/关闭语音 | 语音重载',
+            '[作息] 休眠状态 | 休眠开/关 | 休眠时间 <HH:MM-HH:MM> | 休眠重置',
+            '[赞助] 赞助名单 | 赞助加 <QQ> [1/2] | 赞助删 <QQ>',
             '',
             f'当前渠道: {channel}',
             f'世界书: {wb_state} | 主动搭话: {active_state} | 自动记忆: {memory_state}',
             f'图片理解: {"开" if cfg.get("image_enabled", True) else "关"} | 伴生语音: {"开" if cfg.get("voice_enabled", True) else "关"}',
         ]
-        # 菜单里**不放任何赞助内容**（2026-11-08 骰主定）：赞助相关一律收进「赞助名单」，
-        # 这里只保留「赞助名单」这条指令本身（在上面的主人指令列表里）。
-        # 公开命令里一旦出现档位、人数、额度或鸣谢，效果都只有两个：
-        # 看起来像在卖服务，以及招来「凭什么他有 100 我只有 60」。
         return '\n'.join(lines)
+
+    # 菜单里最多列几个名字：再多人就折成「等 N 位支持者」，
+    # 否则赞助者一多，菜单末尾会变成一个比正文还长的名单。
+    THANKS_MENU_LIMIT = 8
+
+    def _sponsor_thanks_line(self) -> str:
+        """菜单末尾那行鸣谢：有「叫我」称呼用称呼，没有就用脱敏号码。"""
+        ids = sponsors.thanks_ids(self.r.config)
+        if not ids:
+            return ''
+        store = getattr(self.r, 'store', None)
+        names = []
+        for uid in ids:
+            name = aliases.get(store, uid) if store is not None else ''
+            names.append(name or sponsors.mask_id(uid))
+        text = '鸣谢：' + '、'.join(names[:self.THANKS_MENU_LIMIT])
+        if len(names) > self.THANKS_MENU_LIMIT:
+            text += ' 等 %d 位支持者' % len(names)
+        return text
 
     def _cmd_status(self, msg: IncomingMessage) -> str:
         cfg = self.r.config
@@ -218,17 +290,18 @@ class CommandRouter:
         """状态里那一行总 token。
 
         骰主要的是「今天一共消耗多少 token」这一个数，所以**合计放最前面**，
-        输入/输出/缓存命中作为解释跟在后面。缓存命中率是省钱改造的尺子：
-        渠道不透传 usage 时它就是 0%，看到 0% 该怀疑渠道而不是插件。
+        输入/输出/缓存命中作为解释跟在后面。缓存命中率是省钱改造的尺子，但要看懂它得
+        先分清两件事：渠道**没上报**缓存字段，和渠道报了但**没命中**。两者在旧版里
+        都显示 0%，于是「几乎总是 0」既可能是真没命中、也可能是白白怀疑自己。
         """
         total = int(today.get('total_tokens') or 0)
         inp = int(today.get('input_tokens') or 0)
         out = int(today.get('output_tokens') or 0)
         cached = int(today.get('cached_tokens') or 0)
-        rate = (cached * 100 // inp) if inp else 0
-        return ('今日 token: %s（输入 %s + 输出 %s｜缓存命中 %s，%d%%）'
+        return ('今日 token: %s（输入 %s + 输出 %s｜缓存命中 %s，%s%s）'
                 % (fmt_tokens(total), fmt_tokens(inp), fmt_tokens(out),
-                   fmt_tokens(cached), rate))
+                   fmt_tokens(cached), cache_rate_text(cached, inp),
+                   cache_report_hint(today)))
 
     def _cmd_test_notify(self, msg: IncomingMessage) -> str:
         """骰主自查：私聊通道到底通不通（退场通知、渠道全挂通知都走这条路）。"""
@@ -385,7 +458,6 @@ class CommandRouter:
         output_tokens = int(today.get('output_tokens') or 0)
         total_tokens = int(today.get('total_tokens') or 0)
         cached = int(today.get('cached_tokens') or 0)
-        rate = (cached * 100 // input_tokens) if input_tokens else 0
         lines = [
             '今日合计 %s tokens（输入 %s + 输出 %s）' % (
                 fmt_tokens(total_tokens), fmt_tokens(input_tokens), fmt_tokens(output_tokens)),
@@ -393,8 +465,11 @@ class CommandRouter:
                 fmt_tokens(today['calls']), fmt_tokens(budget),
                 fmt_tokens(today.get('ok_calls')), fmt_tokens(today.get('failed_calls')),
                 fmt_tokens(output_tokens), fmt_tokens(out_budget)),
-            # 缓存命中率是省钱改造的尺子：渠道不透传就是 0%，别以为是插件没做
-            '输入里缓存命中 %s（%d%%）' % (fmt_tokens(cached), rate),
+            # 缓存命中率是省钱改造的尺子。分母是**含缓存的全部输入**（网关已归一），
+            # 0% 时补一句"未上报"，否则分不清是渠道没透传还是真没命中。
+            '输入里缓存命中 %s（%s）%s' % (
+                fmt_tokens(cached), cache_rate_text(cached, input_tokens),
+                cache_report_hint(today)),
             '其中主动搭话触发 %s 次' % fmt_tokens(today['active_calls']),
         ]
         # 按会话拆账：同样一个「被动回复」，群里接话和私聊长聊的成本差着几倍，
@@ -545,7 +620,14 @@ class CommandRouter:
         is_group = bool(getattr(msg, 'is_group', True))
         # 和记忆注入用同一套方向判断：单向共享时，群聊里不该翻出私聊的印象
         from ..memory.repository import cross_scope_enabled, relative_time
-        cross_enabled = cross_scope_enabled(self.r.config, is_group)
+        override = None
+        if not is_group:
+            # 和记忆注入用同一个覆盖：否则「我的记忆」显示的跟实际注入的不一致
+            try:
+                override = self.r.memory.share_override(session_key)
+            except Exception:  # noqa: BLE001 - 记忆模块异常不该挡住这条命令
+                override = None
+        cross_enabled = cross_scope_enabled(self.r.config, is_group, override=override)
         primary_scope = 'group' if is_group else 'private'
 
         if self.r.config.get('memory_impression_enabled', True):
@@ -578,7 +660,7 @@ class CommandRouter:
                 pass
 
         # 2. 查找事实（包含当前会话事实与跨群全局偏好，按互通开关召回）
-        facts: list[str] = []
+        fact_items: list[tuple[int, str]] = []
         try:
             include_global = self.r.config.get('memory_cross_group_enabled', True)
             rows = self.r.store.list_user_facts(
@@ -590,36 +672,315 @@ class CommandRouter:
                 f = str(r.get('fact') or '').strip()
                 if f and f not in seen:
                     seen.add(f)
-                    facts.append(f)
+                    fact_items.append((int(r['id']), f))
         except Exception:
             pass
 
-        if not impression_text and not facts:
+        if not impression_text and not fact_items:
             return '唔……歌伊的小本本上关于你还是一片空白呢～\n平时多和我聊聊天，我就会自然记住你的习惯和爱好啦！（眨眼）'
 
         lines = ['【歌伊的小本本 · 记忆档案】']
         if impression_text:
             lines.append(impression_text)
-        if facts:
-            lines.append(f'📝 记住的事（共 {len(facts)} 条）：')
-            for f in facts:
-                lines.append(f'  · {f}')
-        lines.append('💡 提示：发送「忘了我」可以随时清空关于你的这些记录哦～')
+        if fact_items:
+            lines.append(f'📝 记住的事（共 {len(fact_items)} 条）：')
+            for idx, (_, f) in enumerate(fact_items, 1):
+                lines.append(f'  {idx}. {f}')
+        lines.append('💡 提示：发送「删除记忆 <序号>」可删除单条；发送「忘了我」清空全部～')
         return '\n'.join(lines)
 
-    def _cmd_forget_me(self, msg: IncomingMessage) -> str:
+    def _cmd_delete_memory(self, msg: IncomingMessage, arg: str) -> str:
+        raw_idx = str(arg or '').strip().lstrip('#').lstrip('：').lstrip(':').strip()
+        if not raw_idx.isdigit():
+            return '提示：请发送「删除记忆 <序号>」，例如「删除记忆 1」。（序号可在「我的记忆」中查看）'
+        idx = int(raw_idx)
+        session_key = msg.session.as_text()
+        uid = str(msg.sender_id)
+        is_group = bool(getattr(msg, 'is_group', True))
+        from ..memory.repository import cross_scope_enabled
+        override = None
+        if not is_group:
+            try:
+                override = self.r.memory.share_override(session_key)
+            except Exception:
+                override = None
+        cross_enabled = cross_scope_enabled(self.r.config, is_group, override=override)
+
+        fact_items: list[tuple[int, str]] = []
+        try:
+            include_global = self.r.config.get('memory_cross_group_enabled', True)
+            rows = self.r.store.list_user_facts(
+                session_key, uid, limit=20, include_global=include_global,
+                cross_scope=cross_enabled,
+            )
+            seen = set()
+            for r in rows:
+                f = str(r.get('fact') or '').strip()
+                if f and f not in seen:
+                    seen.add(f)
+                    fact_items.append((int(r['id']), f))
+        except Exception:
+            pass
+
+        if not fact_items:
+            return '歌伊的小本本上现在没有关于你的记忆哦～'
+        if idx < 1 or idx > len(fact_items):
+            return f'找不到序号为 {idx} 的记忆呢。请发送「我的记忆」确认序号（目前共有 1~{len(fact_items)} 条）～'
+
+        fact_id, fact_text = fact_items[idx - 1]
+        deleted = self.r.store.delete_user_fact_by_id(fact_id, uid)
+        if deleted:
+            return f'✅ 已为你删除第 {idx} 条记忆：「{fact_text}」'
+        return '删除失败，该条记忆可能已被删除。请发送「我的记忆」刷新查看～'
+
+    def _cmd_forget_me(self, msg: IncomingMessage, force_confirm: bool = False) -> str:
+        uid = str(msg.sender_id)
+        session_key = msg.session.as_text()
+        now = time.time()
+        confirm_key = f'{session_key}:{uid}'
+        last_req = self._pending_forget.get(confirm_key, 0.0)
+
+        # 处于二次确认状态：发了“确认忘了我”或 60s 内连发两次“忘了我”
+        if force_confirm or (now - last_req <= self.FORGET_CONFIRM_WINDOW):
+            self._pending_forget.pop(confirm_key, None)
+            return self._execute_forget_me(msg)
+
+        # 首次触发：记录待确认状态，返回警告与确认指导
+        self._pending_forget[confirm_key] = now
+        return (
+            '⚠️ 【重要确认】确定要让我彻底忘记你吗？\n'
+            '这将会彻底清空关于你的：\n'
+            '  · 记住的全部爱好与习惯（含跨群偏好）\n'
+            '  · 自定义称呼（改回 QQ 昵称）\n'
+            '  · 私聊好感度与关系阶段（全部重置为陌生）\n\n'
+            '👉 若确认彻底清空，请在 60 秒内发送：确认忘了我（或再发一次 忘了我）\n'
+            '💡 如果只想删除某条具体的习惯，可以发送「我的记忆」，然后发送「删除记忆 <序号>」哦～'
+        )
+
+    def _execute_forget_me(self, msg: IncomingMessage) -> str:
         # 连**全局范围**的事实一起清（跨群偏好存在 session_key='global' 里），
         # 否则换个群她还记得你（2026-11-03 审查发现）。
         count = self.r.memory.clear_user(msg)
         relationship = getattr(self.r, 'relationship', None)
         if relationship is not None:
             relationship.forget(msg.sender_id)        # 关系数据和流水一起清
-        return f'✅ 已忘记关于你的 {count} 条记忆（含跨群偏好）'
+        had_alias = aliases.get(self.r.store, msg.sender_id)
+        aliases.set_alias(self.r.store, msg.sender_id, None)   # 称呼也是个人数据，一起清
+        text = (f'✅ 已彻底重置关于你的全部档案：\n'
+                f'  · 忘记了关于你的 {count} 条记忆（含跨群偏好）\n'
+                f'  · 私聊好感度与关系阶段已重置为「陌生」')
+        if had_alias:
+            text += '\n  · 自定义称呼已重置（改回 QQ 昵称）'
+        # 私聊里说「忘了我」只清得掉这个私聊（+ 跨群偏好）；群里那一份仍会被召回。
+        # 既然这个私聊可能还开着「群聊记忆」，就把它说清楚，别让人以为没生效。
+        if not msg.is_group:
+            try:
+                info = self.r.memory.share_status(msg.session.as_text())
+            except Exception:  # noqa: BLE001 - 状态读不到就不多这句
+                info = None
+            if info and info['enabled']:
+                text += ('\n（这个私聊还开着「群聊记忆」，群里说过的事我仍会想起来；'
+                         '发「群聊记忆关」可以关掉）')
+        return text
+
+    # ------------- 自定义称呼（歌伊怎么叫你）-------------
+    def _cmd_alias_show(self, msg: IncomingMessage) -> str:
+        alias = aliases.get(self.r.store, msg.sender_id)
+        if alias:
+            return ('我现在叫你「%s」。\n换一个：发「叫我 新名字」（中间空一格）；'
+                    '想改回 QQ 昵称：发「称呼重置」。' % alias)
+        return ('我现在按 QQ 昵称叫你「%s」。\n想让我换个叫法：发「叫我 小明」（中间空一格）。'
+                % (msg.sender_name or '你'))
+
+    def _cmd_alias_set(self, msg: IncomingMessage, raw: str) -> str:
+        alias, error = aliases.sanitize(raw)
+        if error:
+            return '唔……' + error
+        aliases.set_alias(self.r.store, msg.sender_id, alias)
+        return '✅ 好呀，以后就叫你「%s」啦。\n（想改回 QQ 昵称：发「称呼重置」）' % alias
+
+    def _cmd_alias_reset(self, msg: IncomingMessage) -> str:
+        current = aliases.get(self.r.store, msg.sender_id)
+        if not current:
+            return '你现在就是按 QQ 昵称叫的呀，不用重置。'
+        aliases.set_alias(self.r.store, msg.sender_id, None)
+        return '✅ 已经改回按 QQ 昵称叫你啦（下一条消息起生效）。'
+
+    def _cmd_alias_list(self, msg: IncomingMessage) -> str:
+        items = aliases.listing(self.r.store)
+        if not items:
+            return '还没有人设过自定义称呼（大家都按 QQ 昵称叫）。'
+        lines = ['【自定义称呼 · 共 %d 个】' % len(items)]
+        for uid, alias in items[:40]:
+            lines.append(f'  · {uid} → {alias}')
+        if len(items) > 40:
+            lines.append(f'  ……还有 {len(items) - 40} 个')
+        return '\n'.join(lines)
+
+    def _cmd_alias_admin_reset(self, msg: IncomingMessage, arg: str) -> str:
+        target = str(arg or '').strip()
+        if not target.isdigit():
+            return '格式：称呼重置 <QQ号>'
+        current = aliases.get(self.r.store, target)
+        if not current:
+            return f'QQ {target} 本来就没有自定义称呼。'
+        aliases.set_alias(self.r.store, target, None)
+        return f'✅ 已清除 QQ {target} 的称呼「{current}」（回到 QQ 昵称）'
+
+    # ------------- 私聊：群聊记忆共享（会话级）-------------
+    _SHARE_GROUP_HINT = '这个要私聊里单独设置哦～（在群里说，会把大家的事混在一起）'
+
+    def _cmd_share_status(self, msg: IncomingMessage) -> str:
+        """「群聊记忆」：这个私聊到底会不会把群里的事带进来。"""
+        if msg.is_group:
+            return self._SHARE_GROUP_HINT
+        relation = None
+        try:
+            relation = self.r.relationship.memory_policy(msg)
+        except Exception:  # noqa: BLE001 - 关系模块没开/没初始化都不该挡住这条命令
+            relation = None
+        info = self.r.memory.share_status(msg.session.as_text(), relation)
+        where = '你设的' if info['source'] == 'user' else '默认'
+        if info['enabled']:
+            head = '【群聊记忆】开启（%s）' % where
+            body = '私聊里我会记得你在群里说过的事，也接得上群里的话题。'
+        else:
+            head = '【群聊记忆】关闭（%s）' % where
+            body = '私聊里我只记得我们俩聊过的事，群里的记忆不会带进来。'
+        lines = [head, body]
+        if info['stage_blocked']:
+            lines.append('（不过我们还不算熟，群里的事我只隐约记得一点；多聊聊就会放开。）')
+        lines.append('发「群聊记忆开」/「群聊记忆关」切换；「群聊记忆默认」恢复默认设置。')
+        return '\n'.join(lines)
+
+    def _cmd_share_toggle(self, msg: IncomingMessage, enabled: bool) -> str:
+        if msg.is_group:
+            return self._SHARE_GROUP_HINT
+        self.r.memory.set_share_override(msg.session.as_text(), enabled)
+        if enabled:
+            return ('✅ 已开启「群聊记忆」：私聊里我会接着群里的话题。\n'
+                    '（群聊和私聊的记忆仍然分开保存，只是我私聊时会想起来。）')
+        return ('✅ 已关闭「群聊记忆」：私聊里我只记得我们俩聊过的事，'
+                '群里的事不会带进来。\n想恢复默认：发「群聊记忆默认」。')
+
+    def _cmd_share_default(self, msg: IncomingMessage) -> str:
+        if msg.is_group:
+            return self._SHARE_GROUP_HINT
+        self.r.memory.set_share_override(msg.session.as_text(), None)
+        default = bool(self.r.config.get('memory_private_enabled', False))
+        return '✅ 已清除本私聊的单独设置（重新跟随默认：%s）' % ('开启' if default else '关闭')
+
+    def _share_overrides(self) -> list[tuple[str, str]]:
+        """[(session_key, '开'/'关')]；清除过的键会留一行空串，这里跳过。"""
+        items: list[tuple[str, str]] = []
+        for key, value in self.r.store.settings_with_prefix(SHARE_OVERRIDE_PREFIX):
+            session = key[len(SHARE_OVERRIDE_PREFIX):]
+            text = str(value or '').strip()
+            if not session or not text:
+                continue
+            items.append((session, '开' if text in ('1', 'on', 'true', 'True') else '关'))
+        return items
+
+    def _cmd_share_list(self, msg: IncomingMessage) -> str:
+        default = '开启' if self.r.config.get('memory_private_enabled', False) else '关闭'
+        items = self._share_overrides()
+        if not items:
+            return '还没有谁单独设置过「群聊记忆」（全部跟随默认：%s）' % default
+        lines = ['【群聊记忆 · 已单独设置的私聊】']
+        for session, label in items[:40]:
+            _, target = self._rest_target_parts(session)
+            lines.append(f'  · 私聊 {target}：{label}')
+        if len(items) > 40:
+            lines.append(f'  ……还有 {len(items) - 40} 个')
+        lines.append('（没列出的跟随默认：%s）' % default)
+        return '\n'.join(lines)
+
+    def _cmd_share_reset(self, msg: IncomingMessage, arg: str) -> str:
+        target = str(arg or '').strip()
+        items = self._share_overrides()
+        if target in ('', '全部', 'all', 'ALL'):
+            for session, _ in items:
+                self.r.memory.set_share_override(session, None)
+            return '✅ 已清除全部 %d 个私聊的单独设置（都回到默认）' % len(items)
+        if not target.isdigit():
+            return '格式：群聊记忆重置 <QQ号>，或「群聊记忆重置 全部」'
+        hit = [session for session, _ in items if session.rsplit(':', 1)[-1] == target]
+        for session in hit:
+            self.r.memory.set_share_override(session, None)
+        if not hit:
+            return f'没找到 QQ {target} 的单独设置（本来就在跟随默认）。'
+        return f'✅ 已清除 QQ {target} 的单独设置（重新跟随默认）'
 
     def _cmd_worldbook_status(self, msg: IncomingMessage) -> str:
         on = self.r.config.get('worldbook_enabled', False)
         count = len(self.r.worldbook.entries)
-        return f'世界书: {"开" if on else "关"} | 已加载条目: {count} | 命中关键词才注入，未命中零成本'
+        normal_n = int(self.r.config.get('worldbook_max_entries', 3))
+        story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
+        story_on = is_story_mode(self.r.store, msg.session.as_text(), msg.sender_id)
+        mode_str = f'剧情探索模式（单轮最多 {story_n} 条）' if story_on else f'日常模式（单轮最多 {normal_n} 条）'
+        return (f'世界书: {"开" if on else "关"} | 已加载条目: {count} | 当前你的模式: {mode_str}\n'
+                f'（发「剧情模式开」可深入探索歌伊的世界与故事；未命中零成本）')
+
+    def _cmd_story_mode_status(self, msg: IncomingMessage) -> str:
+        story_on = is_story_mode(self.r.store, msg.session.as_text(), msg.sender_id)
+        normal_n = int(self.r.config.get('worldbook_max_entries', 3))
+        story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
+        state_text = '开启' if story_on else '关闭（日常模式）'
+        lines = [
+            f'【剧情探索模式】当前状态：{state_text}',
+            f'· 效果：与歌伊对话时，世界书设定注入上限由 {normal_n} 条提升至 {story_n} 条，'
+            '自动展开关联设定簇，她也会多聊一些细节与见闻。',
+            '· 可试着聊起的话题线索：',
+            '  1. 清泉镇风物：清泉镇、教会日常、麦穗面包坊、圣职学院、丰收祭典',
+            '  2. 身边的人：好朋友月白、老猎人格伦、同屋修女米娅、莱妮院长、橘猫「面包屑」',
+            '  3. 异世界与本职：治愈粒子与净化术、猎人公会与等级、冒险家协会、外派小队任务',
+            '  4. 历史与传说：天灾、拟灾、渊海、玄门之战（崇）、公会历史、化人与主和派',
+            '  （私聊里随着关系一步步变亲近，还能慢慢解锁她不轻易对外人提起的身世与心愿）',
+            '· 指令：发「剧情模式开」开启，「剧情模式关」切回日常模式。',
+        ]
+        return '\n'.join(lines)
+
+    def _cmd_story_mode_toggle(self, msg: IncomingMessage, enabled: bool) -> str:
+        set_story_mode(self.r.store, msg.session.as_text(), msg.sender_id, enabled)
+        story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
+        normal_n = int(self.r.config.get('worldbook_max_entries', 3))
+        if enabled:
+            return (
+                f'📖 已为你开启「剧情探索模式」（单轮世界书注入上限提升至 {story_n} 条，开启关联设定展开）！\n'
+                '现在你可以向歌伊打听「清泉镇」「教会日常」「麦穗面包坊」「猎人公会」「治愈粒子」「天灾传说」或她身边的朋友啦～\n'
+                '（发「剧情模式」可查看话题线索，发「剧情模式关」随时退回日常模式）'
+            )
+        return f'✅ 已切回日常聊天模式（世界书按默认最多 {normal_n} 条精简注入）。'
+
+    def _cmd_story_mode_list(self, msg: IncomingMessage) -> str:
+        users = list_story_mode_users(self.r.store)
+        if not users:
+            return '目前没有人开启「剧情探索模式」（全部处于默认日常模式）。'
+        lines = [f'【剧情探索模式 · 已开启用户（共 {len(users)} 人）】']
+        for uid in users[:40]:
+            alias = aliases.get(self.r.store, uid)
+            suffix = f'（{alias}）' if alias else ''
+            lines.append(f'  · {uid}{suffix}')
+        if len(users) > 40:
+            lines.append(f'  ……还有 {len(users) - 40} 人')
+        return '\n'.join(lines)
+
+    def _cmd_story_mode_reset(self, msg: IncomingMessage, arg: str) -> str:
+        target = str(arg or '').strip()
+        users = list_story_mode_users(self.r.store)
+        if target in ('', '全部', 'all', 'ALL'):
+            for uid in users:
+                set_story_mode(self.r.store, '', uid, None)
+            for key, _ in self.r.store.settings_with_prefix('story_mode:'):
+                self.r.store.set_setting(key, '')
+            return f'✅ 已重置全部 {len(users)} 位用户的剧情模式（均回到日常模式）'
+        if not target.isdigit():
+            return '格式：剧情模式重置 <QQ号>，或「剧情模式重置 全部」'
+        set_story_mode(self.r.store, '', target, None)
+        for key, _ in self.r.store.settings_with_prefix('story_mode:'):
+            if key.rsplit(':', 1)[-1] == target:
+                self.r.store.set_setting(key, '')
+        return f'✅ 已重置 QQ {target} 的剧情模式（回到日常模式）'
 
     # ------------- 私聊关系（galgame）-------------
     def _cmd_relation(self, msg: IncomingMessage) -> str:
@@ -903,7 +1264,7 @@ class CommandRouter:
         '语音状态', '开启语音', '关闭语音', '语音重载', '测试语音',
         '.voice status', '.voice test',
         '渠道状态', '记忆状态', '导出记忆', '搭话观察',
-        '赞助名单',
+        '赞助名单', '群聊记忆列表', '称呼列表', '剧情模式列表',
         '解除静默', '解除本群静默', '静默列表', '测试通知', '通知测试',
         '面板地址', '歌伊面板', '调试台',
         '搭话影子开', '搭话影子关',
@@ -915,6 +1276,9 @@ class CommandRouter:
         '关系详情 ', '关系设置 ', '关系重置 ',
         '赞助加 ', '赞助删 ',
         '休眠时间 ',
+        '群聊记忆重置 ',
+        '称呼重置 ',
+        '剧情模式重置 ',
     )
 
     @classmethod
@@ -964,6 +1328,13 @@ class CommandRouter:
         if text == '歌伊菜单':
             self.r.reply(msg, self._cmd_menu(msg))
             return True
+        if text in ('歌伊管理菜单', '管理菜单', '管理员菜单', '群管菜单'):
+            # 群管或骰主才看得到；普通用户给一句明确的指路，不静默丢弃
+            if not (p.is_master(msg) or p.is_group_admin(msg)):
+                self.r.reply(msg, '这个菜单是群管和骰主用的哦～想看我能做什么，发「歌伊菜单」。')
+                return True
+            self.r.reply(msg, self._cmd_admin_menu(msg))
+            return True
         if text in ('歌伊状态', '查看状态'):
             self.r.reply(msg, self._cmd_status(msg))
             return True
@@ -976,14 +1347,68 @@ class CommandRouter:
         if text in ('我的记忆', '查看记忆', '歌伊看我'):
             self.r.reply(msg, self._cmd_view_my_memory(msg))
             return True
+        for prefix in ('删除记忆 ', '删除记忆：', '删除记忆:'):
+            if text.startswith(prefix):
+                self.r.reply(msg, self._cmd_delete_memory(msg, text[len(prefix):]))
+                return True
+        if text.startswith('删除记忆') and len(text) > 4 and text[4:].strip().isdigit():
+            self.r.reply(msg, self._cmd_delete_memory(msg, text[4:]))
+            return True
+        if text == '删除记忆':
+            self.r.reply(msg, '提示：请发送「删除记忆 <序号>」，例如「删除记忆 1」。（序号可在「我的记忆」中查看）')
+            return True
         if text == '忘了我':
-            self.r.reply(msg, self._cmd_forget_me(msg))
+            self.r.reply(msg, self._cmd_forget_me(msg, force_confirm=False))
+            return True
+        if text in ('确认忘了我', '确认忘记我'):
+            self.r.reply(msg, self._cmd_forget_me(msg, force_confirm=True))
+            return True
+        # 自定义称呼：改的是"歌伊怎么叫你"（全局一个，按 QQ 号存）
+        if text in ('我的称呼', '叫我'):
+            self.r.reply(msg, self._cmd_alias_show(msg))
+            return True
+        # 必须带分隔符才当指令：「叫我起床」这种是正常说话，不能吃掉
+        for prefix in ('叫我 ', '叫我：', '叫我:'):
+            if text.startswith(prefix):
+                self.r.reply(msg, self._cmd_alias_set(msg, text[len(prefix):]))
+                return True
+        if text == '称呼重置':
+            self.r.reply(msg, self._cmd_alias_reset(msg))
+            return True
+        # 私聊自己决定「要不要把群聊记忆带进来」（会话级，任何人可改自己的）
+        if text in ('群聊记忆', '群聊记忆状态'):
+            self.r.reply(msg, self._cmd_share_status(msg))
+            return True
+        if text in ('群聊记忆开', '群聊记忆关'):
+            self.r.reply(msg, self._cmd_share_toggle(msg, text == '群聊记忆开'))
+            return True
+        if text in ('群聊记忆默认', '群聊记忆跟随默认', '群聊记忆重置'):
+            self.r.reply(msg, self._cmd_share_default(msg))
             return True
         if text in ('关系', '好感度'):
             self.r.reply(msg, self._cmd_relation(msg))
             return True
+        # 今日私聊额度：以前只有骰主的「私聊用量」能看，用户被限额挡住时完全不知情
+        if text in ('今日额度', '我的额度', '私聊额度', '额度'):
+            gate = getattr(self.r, 'private_gate', None)
+            if gate is None:
+                self.r.reply(msg, '额度信息暂时读不到，等一会儿再试试～')
+            elif msg.is_group:
+                self.r.reply(msg, '私聊里才能看今日额度哦～想聊的话直接私信我吧。')
+            else:
+                self.r.reply(msg, gate.user_usage_text(msg.session.as_text()))
+            return True
         if text == '世界书状态':
             self.r.reply(msg, self._cmd_worldbook_status(msg))
+            return True
+        if text in ('剧情模式', '剧情模式状态', '探索模式', '故事模式'):
+            self.r.reply(msg, self._cmd_story_mode_status(msg))
+            return True
+        if text in ('剧情模式开', '开启剧情模式', '进入剧情模式', '探索模式开', '开启探索模式', '故事模式开'):
+            self.r.reply(msg, self._cmd_story_mode_toggle(msg, True))
+            return True
+        if text in ('剧情模式关', '关闭剧情模式', '退出剧情模式', '探索模式关', '关闭探索模式', '故事模式关'):
+            self.r.reply(msg, self._cmd_story_mode_toggle(msg, False))
             return True
         if text == '查看触发词':
             self.r.reply(msg, '触发词: ' + '、'.join(self.r.config.get('triggers', [])))
@@ -1097,6 +1522,24 @@ class CommandRouter:
             return True
         if text == '记忆状态':
             self.r.reply(msg, self._cmd_memory_status(msg))
+            return True
+        if text == '群聊记忆列表':
+            self.r.reply(msg, self._cmd_share_list(msg))
+            return True
+        if text.startswith('群聊记忆重置 '):
+            self.r.reply(msg, self._cmd_share_reset(msg, text[len('群聊记忆重置 '):]))
+            return True
+        if text == '称呼列表':
+            self.r.reply(msg, self._cmd_alias_list(msg))
+            return True
+        if text.startswith('称呼重置 '):
+            self.r.reply(msg, self._cmd_alias_admin_reset(msg, text[len('称呼重置 '):]))
+            return True
+        if text == '剧情模式列表':
+            self.r.reply(msg, self._cmd_story_mode_list(msg))
+            return True
+        if text.startswith('剧情模式重置 '):
+            self.r.reply(msg, self._cmd_story_mode_reset(msg, text[len('剧情模式重置 '):]))
             return True
         if text == '导出记忆':
             self.r.reply(msg, self._cmd_export_memory(msg))

@@ -1,35 +1,47 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
 
-# 本地真实配置（含 API Key / QQ 号），仓库里只放 config.example.json
-config.json
-config.json.local
-*.local
-.env
-.env.*
-
-# 运行时数据库、备份与导出
+# Data & database files
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 *.db
-*.bak
-*.tmp
-*.log
-导出/
-emote-cache/
+*.db-wal
+*.db-shm
 
-# IDE & Editor
-.vscode/
+# Log files
+*.log
+logs/
+
+# Backups & temporary files
+*.bak
+*.bak*
+*.tmp
+*.swp
+*~
+
+# Local configuration & secrets (MUST NOT COMMIT)
+config.json
+config.example.local.json
+.env
+*.local.json
+
+# Caches & export artifacts
+emote-cache/
+导出/
+.pytest_cache/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE / Editor settings
 .idea/
+.vscode/
 *.sublime-project
 *.sublime-workspace
-.DS_Store
-Thumbs.db

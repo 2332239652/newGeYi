@@ -21,7 +21,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from ..memory.worldbook import WorldbookService
+from ..memory.worldbook import WorldbookService, _STOP_BIGRAMS, tokenize
 from ..models import IncomingMessage, ModelRequest
 from ..runtime import sponsors
 from ..storage.database import SQLiteStore, text_similarity
@@ -53,6 +53,18 @@ MILD_REACTION = (
     '可以脸红、往后退半步、把话岔开，或者装作没听懂带过去。'
     '别生气、别说教、也别把「我们现在只是……」挂在嘴边——轻轻挡一下就好，不记账。'
 )
+
+
+def _topic_mentioned(topic_text: str, reply_text: str) -> bool:
+    """判断歌伊本轮的回复是否实际上提起了今日谈资（至少重合 2 个非虚词二元组）。"""
+    if not topic_text or not reply_text:
+        return False
+    ignore = _STOP_BIGRAMS | {'歌伊', '今天', '刚才', '现在', '有点', '一点', '觉得', '怀疑', '正在'}
+    t_tokens = {tok for tok in tokenize(topic_text) if len(tok) >= 2 and tok not in ignore}
+    if not t_tokens:
+        return False
+    r_tokens = set(tokenize(reply_text))
+    return len(t_tokens & r_tokens) >= 2
 
 
 class RelationshipService:
@@ -186,6 +198,23 @@ class RelationshipService:
             logger.exception('生成关系块失败')
             return ''
 
+    def preview_block_for(self, msg: IncomingMessage) -> str:
+        """只读预览版 block_for：供调试台预览使用，不产生任何数据库写入或状态变更。"""
+        if not self.active_for(msg):
+            return ''
+        try:
+            now = time.time()
+            with self._lock_for(msg.sender_id):
+                rel = self.load(msg.sender_id)
+                mood = rel.mood if rel.mood_until > now else ''
+                event = str(rel.flags.get('pending_event') or '')
+                topic, _ = self._topic_for(rel, now, readonly=True)
+            block = build_relation_block(rel.stage, mood, event, topic)
+            note = self._peek_mild_note(msg, now)
+            return (block + '\n' + note).strip() if note else block
+        except Exception:  # noqa: BLE001
+            return ''
+
     def _mark_mild_overstep(self, session_key: str, now: float) -> None:
         """记一笔「对方刚才那句比现在的关系更近一点」，下一轮让她有点小反应。
 
@@ -197,6 +226,18 @@ class RelationshipService:
             self.store.set_setting(_MILD_PREFIX + str(session_key), '%.0f' % now)
         except Exception:  # noqa: BLE001 - 记账失败不能影响评审结果
             logger.debug('记录轻微越界失败', exc_info=True)
+
+    def _peek_mild_note(self, msg: IncomingMessage, now: float) -> str:
+        """只读查看「轻微越界」标记，不清除。"""
+        key = _MILD_PREFIX + msg.session.as_text()
+        try:
+            raw = self.store.get_setting(key)
+            stamp = float(raw) if raw else 0.0
+        except Exception:  # noqa: BLE001
+            return ''
+        if stamp <= 0 or now - stamp > MILD_WINDOW_SECONDS:
+            return ''
+        return MILD_REACTION
 
     def _take_mild_note(self, msg: IncomingMessage, now: float) -> str:
         """取出并清除「轻微越界」标记；过期的直接丢掉（一次性）。"""
@@ -220,8 +261,12 @@ class RelationshipService:
             return ''
         return MILD_REACTION
 
-    def _topic_for(self, rel: Relation, now: float) -> tuple[str, bool]:
-        """今天的主动谈资：每天抽一条，最多放进前几轮 prompt。返回 (文本, 是否改了 rel)。"""
+    def _topic_for(self, rel: Relation, now: float, readonly: bool = False) -> tuple[str, bool]:
+        """今天的主动谈资：每天抽一条，最多放进前几轮 prompt。返回 (文本, 是否改了 rel)。
+
+        优化：抽中时只登记当日候选，等歌伊在回复里实际提起了该谈资，才计入 told_topics 并停止重复注入；
+        若当天前几轮都在聊别的正事没来得及提，不会白白把这条谈资永久消耗掉。
+        """
         if self.worldbook is None:
             return '', False
         day = day_key(now)
@@ -229,24 +274,37 @@ class RelationshipService:
         if rel.flags.get('topic_day') != day:
             pool = self.worldbook.topics(stage=rel.stage, scope='private')
             told = list(rel.flags.get('told_topics') or [])
-            fresh = [t for t in pool if t['id'] not in told] or pool
-            if fresh and not [t for t in pool if t['id'] not in told]:
+            fresh = [t for t in pool if t['id'] not in told]
+            if not fresh and pool:
                 told = []                                   # 全讲过了：重新开始轮转
+                fresh = list(pool)
+            last_unspoken = str(rel.flags.get('last_unspoken_topic') or '')
+            if last_unspoken and len(fresh) > 1:
+                alt = [t for t in fresh if t['id'] != last_unspoken]
+                if alt:
+                    fresh = alt
             pick = None
             if fresh:
                 pick = min(fresh, key=lambda t: hashlib.md5(
                     f'{rel.user_id}{day}{t["id"]}'.encode('utf-8')).hexdigest())
+            text_picked = pick['content'][:240] if pick else ''
+            if readonly:
+                return text_picked, False
             rel.flags['topic_day'] = day
             rel.flags['topic_n'] = 0
-            rel.flags['topic_text'] = pick['content'][:240] if pick else ''
-            if pick:
-                told.append(pick['id'])
-                rel.flags['told_topics'] = told[-TOPIC_TOLD_KEEP:]
+            rel.flags['topic_id'] = pick['id'] if pick else ''
+            rel.flags['topic_text'] = text_picked
+            rel.flags['topic_spoken'] = False
+            rel.flags['told_topics'] = told[-TOPIC_TOLD_KEEP:]
             changed = True
+        if rel.flags.get('topic_spoken'):
+            return '', changed
         text = str(rel.flags.get('topic_text') or '')
         if text and int(rel.flags.get('topic_n') or 0) < TOPIC_TURNS_PER_DAY:
-            rel.flags['topic_n'] = int(rel.flags.get('topic_n') or 0) + 1
-            return text, True
+            if not readonly:
+                rel.flags['topic_n'] = int(rel.flags.get('topic_n') or 0) + 1
+                changed = True
+            return text, changed
         return '', changed
 
     def memory_policy(self, msg: IncomingMessage) -> dict | None:
@@ -299,7 +357,10 @@ class RelationshipService:
         shadow = self.shadow()
         turns = self.store.recent_turns(session_key, limit=10)
         history = turns[:-2] if len(turns) >= 2 else []
-        recent_users = [t['content'] for t in history if t.get('role') == 'user']
+        # 带上时间戳：刷屏判定要有时间窗，否则低频私聊里"三天前说过的话"也会被判复读
+        # （2026-11-10 抽查：7 天 30 条 spam 里约 1/4 是跨小时的误判）。
+        recent_users = [(t['content'], t.get('created_at') or 0)
+                        for t in history if t.get('role') == 'user']
         recent_lines = [('对方：' if t.get('role') == 'user' else '歌伊：') + str(t.get('content'))[:120]
                         for t in history[-6:]]
 
@@ -307,7 +368,9 @@ class RelationshipService:
             rel = self.load(uid)
             stage_before, aff_before = rel.stage, rel.affection
             trivial = is_trivial(user_text, int(self.config.get('galgame_judge_min_chars', 4)))
-            spam = is_repeat(user_text, recent_users, text_similarity)
+            spam = is_repeat(user_text, recent_users, text_similarity,
+                             window_seconds=float(self.config.get('galgame_repeat_window_seconds', 1800) or 0),
+                             now=now)
             hijack = is_narration_hijack(user_text)
 
             pending = str(rel.flags.get('pending_event') or '')
@@ -336,7 +399,11 @@ class RelationshipService:
                             raw, tag = 0, 'overstep'
                             note = ('mild_overstep ' + note).strip()
                         else:
-                            raw = min(raw, -1)
+                            # 一次越界最多扣 1 分：以前评审给 -2 就照扣 -2，
+                            # 一个玩笑抵掉日上限的 1/6（2026-11-10 抽查）。
+                            # lie/rude 这类真恶劣不设上限，该罚就罚。
+                            harsh = str(tag) in ('lie', 'rude')
+                            raw = min(raw, -1) if harsh else -1
                             tag = 'flirt_early' if level >= 3 else 'pushy'
                             note = ('overstep ' + note).strip()
                         self._mark_mild_overstep(session_key, now)
@@ -344,13 +411,15 @@ class RelationshipService:
             total = Outcome(stage_before=stage_before, stage_after=stage_before)
             applied = 0.0
             if shadow:
-                if not (trivial or spam):
+                if not trivial:
                     out = apply_presence(rel, now, p) if day_key(now) != rel.last_day else None
                     if out is not None:
                         applied += out.applied
                         total.stage_after = rel.stage
             else:
-                if not (trivial or spam) and day_key(now) != rel.last_day:
+                # 刷屏不再吞掉「今日首次互动」的加成：以前 spam 会连 +1 一起跳过，
+                # 等于同一件事罚两次（2026-11-10 抽查：748048217 只说了 1 句就从 2.0 掉到 1.0）。
+                if not trivial and day_key(now) != rel.last_day:
                     applied += apply_presence(rel, now, p).applied
                 out = apply_delta(rel, raw, tag, now, p)
                 applied += out.applied
@@ -367,6 +436,22 @@ class RelationshipService:
                         applied += ev_out.applied
                         note = (note + f' event_{pending}_done').strip()
                 total.stage_after = rel.stage
+
+            # 主动谈资消耗判定：若本轮回复里已经实际提起了今日谈资，标记为已讲并停止后续轮次重复注入；
+            # 若当日注入次数已用尽仍未提起，记为 last_unspoken_topic，不污染 told_topics。
+            if rel.flags.get('topic_text') and not rel.flags.get('topic_spoken'):
+                t_text = str(rel.flags.get('topic_text') or '')
+                t_id = str(rel.flags.get('topic_id') or '')
+                if _topic_mentioned(t_text, reply_text):
+                    rel.flags['topic_spoken'] = True
+                    rel.flags['topic_n'] = TOPIC_TURNS_PER_DAY
+                    if t_id:
+                        told = list(rel.flags.get('told_topics') or [])
+                        if t_id not in told:
+                            told.append(t_id)
+                        rel.flags['told_topics'] = told[-TOPIC_TOLD_KEEP:]
+                elif int(rel.flags.get('topic_n') or 0) >= TOPIC_TURNS_PER_DAY and t_id:
+                    rel.flags['last_unspoken_topic'] = t_id
 
             self.save(rel)
             self._log(uid, delta_raw=raw, delta_applied=applied, tag=tag, level=level,
@@ -450,16 +535,32 @@ class RelationshipService:
     # ==================== 指令 / 运维 ====================
     def feeling(self, uid: str) -> str:
         rel = self.load(uid)
-        return f'「{STAGE_NAMES[rel.stage]}」——{FEELINGS[rel.stage]}'
+        p = self.params()
+        cap = float(p.daily_cap[rel.stage])
+        # gain_today 是"最后一次互动那一天"的累计，只有 touch_day 才会清零。
+        # 隔天但还没说话时它仍是昨天的数字 —— 直接显示会变成「今天 +12/12 已经满啦」，
+        # 用户会以为"没说话也涨好感 / 一早就满了"（2026-11-11 群友反馈）。
+        fresh = rel.last_day == time.strftime('%Y-%m-%d')
+        gain = float(rel.gain_today) if fresh else 0.0
+        if not fresh:
+            tail = '\n（今天还没聊呢，来说句话吧～）'
+        else:
+            tail = '\n（今天的好感度 +%d/%d' % (gain, cap)
+            if gain >= cap:
+                tail += '，已经满啦，明天再来吧'
+            tail += '）'
+        return f'「{STAGE_NAMES[rel.stage]}」——{FEELINGS[rel.stage]}' + tail
 
     def describe(self, uid: str) -> str:
         rel = self.load(uid)
         p = self.params()
         nxt = rel.stage + 1
+        # 同理：别把昨天的 gain_today 当成今天的（隔天还没说话时显示 +0）
+        gain = rel.gain_today if rel.last_day == time.strftime('%Y-%m-%d') else 0.0
         lines = [
             f'{uid}：{STAGE_NAMES[rel.stage]}（{rel.stage}）| 好感 {rel.affection:.1f}'
             f'{"/" + str(int(p.thresholds[nxt])) if nxt <= MAX_STAGE else ""} | 有效日 {rel.days_active}'
-            f'{"/" + str(p.min_days[nxt]) if nxt <= MAX_STAGE else ""} | 今日 +{rel.gain_today:.1f}',
+            f'{"/" + str(p.min_days[nxt]) if nxt <= MAX_STAGE else ""} | 今日 +{gain:.1f}',
         ]
         if rel.locked_until > time.time():
             lines.append('冷却中至 ' + time.strftime('%m-%d %H:%M', time.localtime(rel.locked_until)))

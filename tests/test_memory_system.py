@@ -522,5 +522,45 @@ class MemorySystemTest(unittest.TestCase):
         self.assertIn('私聊说讨厌胡萝卜', grp_two_way)
 
 
+class SummaryTrimTest(unittest.TestCase):
+    """L1 摘要表必须有上限。
+
+    2026-11-10：`SQLiteStore.trim_group_summaries()` 早就写好了，但**全仓库从没调用**
+    ——线上大群的 `group_summaries` 涨到 1800+ 条（实际只会注入最近 3~6 条）。
+    现在提炼器写完摘要顺手裁一次，这里钉住"确实裁了"和"默认上限够用"。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='geyi_summary_trim_')
+        self.store = SQLiteStore(os.path.join(self.tmp, 'trim.sqlite3'))
+        self.session = 'h:qq:onebot:group:-:123456'
+
+    def tearDown(self):
+        try:
+            self.store.close()
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _curator(self, keep):
+        return MemoryCurator({'assistant_name': '歌伊', 'memory_summary_keep': keep},
+                             self.store, None)
+
+    def test_keeps_only_configured_amount(self):
+        cur = self._curator(2)
+        for i in range(5):
+            cur._store_results(self.session, {'group_summary': '第 %d 件公共事件' % i},
+                               set(), i + 1)
+        rows = self.store.recent_group_summaries(self.session, limit=50)
+        self.assertEqual(len(rows), 2, '旧摘要没有被裁掉')
+        self.assertIn('第 4 件', rows[-1]['content'], '裁掉的应当是最旧的，保留最新的')
+
+    def test_default_keep_does_not_truncate_normal_volume(self):
+        cur = self._curator(200)
+        for i in range(3):
+            cur._store_results(self.session, {'group_summary': '小事 %d' % i}, set(), i + 1)
+        self.assertEqual(len(self.store.recent_group_summaries(self.session, limit=50)), 3)
+
+
 if __name__ == '__main__':
     unittest.main()

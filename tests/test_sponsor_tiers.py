@@ -180,6 +180,42 @@ class GateQuotaTest(unittest.TestCase):
         gate, _ = self.make_gate(sponsor_ids=['333'], private_daily_quota_sponsor=90)
         self.assertEqual(gate._effective_user_quota('333'), 90)
 
+    def test_sponsor_ignores_global_quota(self):
+        """全局限额打满时，普通用户被挡，两档赞助者仍然放行（2026-11-11）。"""
+        gate, store = self.make_gate(sponsor_tier1_ids=['111'], sponsor_tier2_ids=['222'],
+                                     private_daily_quota_sponsor_tier1=100,
+                                     private_daily_quota_sponsor_tier2=120)
+        store.set_setting('priv.gday', time_stamp(400))     # 全局 400 条已用满
+        self.assertTrue(gate.squeezed())
+        self.assertEqual(gate.allow(_PrivMsg('111')), (True, ''))
+        self.assertEqual(gate.allow(_PrivMsg('222')), (True, ''))
+        self.assertEqual(gate.allow(_PrivMsg('999')), (False, 'quota_global'))
+
+    def test_non_sponsor_still_blocked_by_user_quota(self):
+        """免全局 ≠ 免单人：赞助者自己的额度照样生效。"""
+        gate, store = self.make_gate(sponsor_tier1_ids=['111'],
+                                     private_daily_quota_sponsor_tier1=100)
+        store.set_setting('priv.use:h:qq:onebot:private:-:111', time_stamp(100))
+        self.assertEqual(gate.allow(_PrivMsg('111')), (False, 'quota_user'))
+
+
+class _PrivMsg:
+    """闸门用得到的最小私聊消息：会话键 / 发送者 / 正文。"""
+
+    def __init__(self, uid):
+        self.sender_id = uid
+        self.text = '歌伊在吗'
+        self.mentioned_bot = False
+        self.session = _Sess(uid)
+
+
+class _Sess:
+    def __init__(self, uid):
+        self._uid = uid
+
+    def as_text(self):
+        return 'h:qq:onebot:private:-:%s' % self._uid
+
 
 def time_stamp(used: int) -> str:
     import time
@@ -188,11 +224,12 @@ def time_stamp(used: int) -> str:
 
 
 class SponsorVisibilityTest(unittest.TestCase):
-    """赞助内容只许出现在「赞助名单」里，公开命令一个字都不能提（骰主 2026-11-08 定）。
+    """菜单里**只许出现名字**，不许出现档位、额度、人数。
 
-    为什么要锁死：这类泄漏不会报错，而且每次都是「顺手加一行显示」造成的。
-    公开命令里一旦出现档位、人数、额度或鸣谢，效果只有两个——看起来像在卖服务，
-    以及招来「凭什么他有 100 我只有 60」。
+    2026-11-11 骰主反转了 11-08 的「菜单里一个字都不放」：爱发电页面上已经公开承诺
+    「一档的歌伊菜单末尾鸣谢里有你的名字」，承诺写在用户看得到的地方，就得在菜单里兑现。
+    但反转只到名字为止——「凭什么他有 100 我只有 60」这个副作用依然要挡住，
+    所以额度、档位、人数一律留在「赞助名单」这个骰主命令里。
     """
 
     CONFIG = {
@@ -204,7 +241,7 @@ class SponsorVisibilityTest(unittest.TestCase):
         'sponsor_thanks_text': '感谢 阿P、小满 的支持',
     }
 
-    def _router(self):
+    def _router(self, config=None, aliases=None):
         import copy
         from newGeYi.routing.commands import CommandRouter
 
@@ -212,21 +249,48 @@ class SponsorVisibilityTest(unittest.TestCase):
             pass
 
         runtime = Stub()
-        runtime.config = copy.deepcopy(self.CONFIG)
+        runtime.config = copy.deepcopy(config or self.CONFIG)
         runtime.gateway = None
+        runtime.store = _AliasStore(aliases or {})
         return CommandRouter(runtime)
 
-    def test_menu_has_no_sponsor_content(self):
-        text = self._router()._cmd_menu(None)
-        for word in ('鸣谢', '一档', '二档', '额度 100', '额度 120', '阿P'):
-            self.assertNotIn(word, text, '菜单里不该出现赞助内容：%s' % word)
+    def test_menu_thanks_line_is_last(self):
+        text = self._router(aliases={'111': '阿P'})._cmd_menu(None)
+        last = text.strip().splitlines()[-1]
+        self.assertTrue(last.startswith('鸣谢：'), '菜单末尾应该是鸣谢行，实际：%s' % last)
+        self.assertIn('阿P', last)
 
-    def test_menu_still_lists_the_sponsor_command(self):
-        """菜单只保留「赞助名单」这条指令入口，让人知道有这个命令。"""
-        self.assertIn('赞助名单', self._router()._cmd_menu(None))
+    def test_menu_has_no_tier_or_quota(self):
+        """名字可以出现，档位/额度/人数不行。"""
+        text = self._router()._cmd_menu(None)
+        for word in ('一档', '二档', '额度 100', '额度 120', '赞助者', '内测'):
+            self.assertNotIn(word, text, '菜单里不该出现这些：%s' % word)
+
+    def test_menu_thanks_uses_alias_then_masked_id(self):
+        """有「叫我」称呼用称呼；没有就脱敏号码，绝不印完整 QQ 号。"""
+        config = dict(self.CONFIG)
+        config['sponsor_tier1_ids'] = ['9000000001']
+        config['sponsor_tier2_ids'] = ['3000011111']
+        text = self._router(config, aliases={'9000000001': '阿P'})._cmd_menu(None)
+        self.assertIn('阿P', text)
+        self.assertIn('3*****1111', text)          # 没设称呼 → 脱敏
+        self.assertNotIn('3000011111', text, '不该出现完整号码')
+
+    def test_menu_without_sponsors_has_no_thanks(self):
+        config = dict(self.CONFIG)
+        config['sponsor_tier1_ids'] = []
+        config['sponsor_tier2_ids'] = []
+        self.assertNotIn('鸣谢', self._router(config)._cmd_menu(None))
+
+    def test_menu_thanks_caps_long_lists(self):
+        config = dict(self.CONFIG)
+        config['sponsor_tier1_ids'] = [str(900000 + i) for i in range(12)]
+        config['sponsor_tier2_ids'] = []
+        text = self._router(config)._cmd_menu(None)
+        self.assertIn('等 12 位支持者', text)
 
     def test_status_has_no_sponsor_content(self):
-        """歌伊状态同样一个字都不能提（这也是公开命令）。"""
+        """歌伊状态仍然一个字都不提（它也是公开命令）。"""
         router = self._router()
         router.r.store = _FakeStatsStore()
 
@@ -247,6 +311,18 @@ class SponsorVisibilityTest(unittest.TestCase):
         text = self._router()._cmd_sponsor_list(None)
         for word in ('一档', '二档', '100', '120', '阿P'):
             self.assertIn(word, text, '赞助名单里应该有：%s' % word)
+
+
+class _AliasStore:
+    """只实现读 `alias:<QQ>` 的最小 store。"""
+
+    def __init__(self, aliases):
+        self.aliases = {str(k): str(v) for k, v in (aliases or {}).items()}
+
+    def get_setting(self, key, default=None):
+        if str(key).startswith('alias:'):
+            return self.aliases.get(str(key)[len('alias:'):], '')
+        return default
 
 
 class _FakeStatsStore:

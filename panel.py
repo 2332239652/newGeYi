@@ -15,6 +15,8 @@ from collections import OrderedDict, deque
 from pathlib import Path
 
 from . import config as plugin_config
+from .context import aliases
+from .context import scene as scene_brief
 from .context.prompt_builder import PromptBuilder
 from .memory.repository import MemoryRepository
 from .models import IncomingMessage, SessionKey
@@ -69,6 +71,24 @@ class _MemoryPreview(MemoryRepository):
     def _touch(self, data: dict) -> None:
         # 只读预览保留原召回/格式化，但不刷新命中次数与时间。
         pass
+
+
+class _RelationshipPreview:
+    """只读关系服务代理：供调试台预览私聊阶段与世界书解锁，不触发任何数据库写入。"""
+
+    def __init__(self, svc):
+        self.svc = svc
+
+    def stage_for(self, msg):
+        return self.svc.stage_for(msg) if self.svc is not None else None
+
+    def memory_policy(self, msg):
+        return self.svc.memory_policy(msg) if self.svc is not None else None
+
+    def block_for(self, msg):
+        if self.svc is None or not hasattr(self.svc, 'preview_block_for'):
+            return ''
+        return self.svc.preview_block_for(msg)
 
 
 class _HistoryPreview:
@@ -369,6 +389,18 @@ class Panel:
                 'rest_remaining_seconds': self.runtime.rest.remaining(key),
                 'memory_pending': store.buffer_pending(key, self.runtime.curator.cursor(key)),
                 'quota': self.runtime.group_profile.quota_for(key)}
+        # 工作记忆纸条（会话级，只读）：排查「她怎么知道几十分钟前的事」时看这个
+        brief = scene_brief.get_brief(store, key)
+        if brief:
+            updated = int(brief.get('updated_at') or 0)
+            info['scene'] = {
+                'text': str(brief.get('text') or ''),
+                'covered_to': int(brief.get('covered_to') or 0),
+                'updated_at': updated,
+                'age_seconds': max(0, int(time.time() - updated)) if updated else None,
+                'fresh': scene_brief.is_fresh(
+                    brief, float(self.runtime.config.get('scene_ttl_seconds', 7200) or 0)),
+            }
         # 私聊闸门的用量：排查「她为什么不回私聊」时，这几个数比翻日志直观
         try:
             session = self._session(key)
@@ -387,6 +419,13 @@ class Panel:
                     info['private_quota_global'] = int(
                         self.runtime.config.get('private_daily_quota_global', 400) or 0)
                     info['private_trigger_only'] = gate.trigger_only()
+                # 群聊记忆共享是**会话级**选择（None = 跟随默认）。排查「她怎么知道群里的事」时，
+                # 这个字段比翻 settings 表直观；写入仍只走 QQ 指令，面板不给改。
+                info['group_memory_share'] = self.runtime.memory.share_override(key)
+                info['group_memory_default'] = bool(
+                    self.runtime.config.get('memory_private_enabled', False))
+                # 自定义称呼（按 QQ 号，全局一个）：空串 = 还在用 QQ 昵称
+                info['alias'] = aliases.get(self.runtime.store, str(key).rsplit(':', 1)[-1])
         except Exception:  # noqa: BLE001 - 面板少一个字段不算错
             pass
         return info
@@ -530,6 +569,7 @@ class Panel:
         memory = _MemoryPreview(facade, cfg)
         builder = PromptBuilder(cfg, facade, memory, self.runtime.worldbook,
                                 _HistoryPreview(history), images=None, renderer=self.runtime.renderer)
+        builder.relationship = _RelationshipPreview(getattr(self.runtime, 'relationship', None))
         builder.set_role_prompt(self.runtime.prompt_builder.role_prompt)
         messages = builder.build(msg, is_active=active)
         directed = mentioned or any(word in text for word in (cfg['triggers'] or ['歌伊'])) or not is_group

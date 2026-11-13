@@ -505,6 +505,14 @@ class MemoryCurator:
         if 0 < len(summary) <= 500:
             self.store.add_group_summary(session_key, summary, covers_to=last_id)
             stats['summary'] = 1
+            # 写完就裁：这个函数以前定义了却没人调用，大群的摘要表涨到 1800+ 条
+            # （只有最近 3~6 条会被注入，留着全是死重）。裁剪失败不影响本次提炼。
+            try:
+                self.store.trim_group_summaries(
+                    session_key,
+                    keep=int(self.config.get('memory_summary_keep', 200) or 200))
+            except Exception:  # noqa: BLE001
+                logger.debug('裁剪旧群摘要失败（%s）', session_key[-14:], exc_info=True)
         elif summary:
             logger.warning('群摘要过长已丢弃（%d 字）', len(summary))
 
@@ -609,7 +617,13 @@ class MemoryCurator:
 
         # 这一批成功消费掉了
         self.set_cursor(session_key, last_id)
-        self.store.buffer_trim(session_key)
+        # 保留窗口：状态纸条要读「刚过去、还没进长期记忆」的那一段，所以游标以下
+        # 的行不立刻删，留 memory_buffer_retention_seconds（默认 2 小时）。
+        try:
+            retention = int(self.config.get('memory_buffer_retention_seconds', 7200) or 0)
+        except (TypeError, ValueError):
+            retention = 7200
+        self.store.buffer_trim(session_key, retention_seconds=retention)
         # 每群总容量兜底（每人的上限在写每条时已经查过）
         stats['trimmed'] = stats.get('trimmed', 0) + self.store.trim_user_facts(
             session_key, '',

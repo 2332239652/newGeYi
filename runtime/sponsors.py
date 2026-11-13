@@ -98,6 +98,35 @@ def all_sponsors(config: dict) -> set:
     return out
 
 
+def thanks_ids(config: dict) -> list:
+    """菜单末尾鸣谢的名单顺序：二档在前、一档在后（二档累计包含一档）。
+
+    去重后按号码排序，保证同一天两处输出**稳定**——菜单是会被人截图对比的，
+    每次顺序都不一样会显得像随机抽人。
+    """
+    out: list = []
+    for key in (_ID_KEYS[2], _ID_KEYS[1], _LEGACY_KEY):
+        for uid in sorted(id_set(config, key)):
+            if uid not in out:
+                out.append(uid)
+    return out
+
+
+def mask_id(uid: str) -> str:
+    """把 QQ 号脱敏成 `2*****3952`，供公开菜单里的鸣谢使用。
+
+    为什么菜单里不直接写号码：菜单是公开的（群里谁都能发），把支持者的 QQ 号
+    原样印出来等于替他们公开账号。留首尾是为了本人能认出自己。
+    """
+    text = str(uid or '').strip()
+    if not text:
+        return ''
+    if len(text) <= 5:
+        return '*' * len(text)
+    stars = max(2, len(text) - 5)
+    return text[0] + '*' * stars + text[-4:]
+
+
 def quota_for(config: dict, sender_id) -> float:
     """这个人的赞助额度（0 = 没设 / 不限）。
 

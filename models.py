@@ -57,6 +57,9 @@ class ModelResult:
     output_tokens: int = 0
     # 命中前缀缓存的输入 token（渠道不报就是 0）。只做观测，不参与任何逻辑。
     cached_tokens: int = 0
+    # 本次响应里**是否存在**缓存字段（显式 0 也算）。用来区分「没命中」和「渠道没上报」，
+    # 否则界面上两者都显示 0%，看不出该改提示词还是该换渠道。
+    cache_reported: bool = False
     latency_ms: int = 0
     error_code: str = ''
     error_message: str = ''

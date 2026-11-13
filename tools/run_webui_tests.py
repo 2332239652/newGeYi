@@ -4,11 +4,67 @@
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 
+def _ensure_offline_requests_stub() -> None:
+    """在未安装 requests 的裸 Python 解释器下提供离线单元测试桩。"""
+    try:
+        import requests  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    class RequestException(Exception):
+        pass
+
+    class Timeout(RequestException):
+        pass
+
+    class HTTPError(RequestException):
+        pass
+
+    class ConnectionError(RequestException):
+        pass
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.trust_env = True
+
+        def request(self, *args, **kwargs):
+            raise ConnectionError('offline test environment')
+
+        def get(self, *args, **kwargs):
+            return self.request('GET', *args, **kwargs)
+
+        def post(self, *args, **kwargs):
+            return self.request('POST', *args, **kwargs)
+
+    req = types.ModuleType('requests')
+    req.RequestException = RequestException
+    req.Timeout = Timeout
+    req.HTTPError = HTTPError
+    req.ConnectionError = ConnectionError
+    req.Session = Session
+    req.exceptions = types.SimpleNamespace(
+        RequestException=RequestException,
+        Timeout=Timeout,
+        HTTPError=HTTPError,
+        ConnectionError=ConnectionError,
+    )
+    req.sessions = types.SimpleNamespace(Session=Session)
+    req.get = lambda *a, **k: Session().get(*a, **k)
+    req.post = lambda *a, **k: Session().post(*a, **k)
+    sys.modules.setdefault('requests', req)
+    sys.modules.setdefault('requests.exceptions', req.exceptions)
+    sys.modules.setdefault('requests.sessions', req.sessions)
+
+
 def main():
+    _ensure_offline_requests_stub()
     root = Path(__file__).resolve().parents[1]
     scratch = Path(tempfile.mkdtemp(prefix='geyi_webui_tests_'))
     # 无条件覆盖；不要继承开发 shell 中可能指向生产数据的 GEYI_DATA_DIR。

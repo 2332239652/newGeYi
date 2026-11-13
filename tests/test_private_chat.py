@@ -8,7 +8,7 @@
 2. **私聊当成群聊**：她在私聊里说过「这里是群诶，大家都看见了」——因为当前消息既没有
    场景说明，记忆块标题还写着「这个群最近发生过什么」。
 3. **私聊没有发言人标签 → 主人判定失效**：`昵称(QQ号)：` 只有群聊才带，
-   于是【主人】那条「只有 2332239652 是主人」在私聊里完全无从判定。
+   于是【主人】那条「只有 9000000001 是主人」在私聊里完全无从判定。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from newGeYi.models import IncomingMessage, SessionKey  # noqa: E402
 from newGeYi.routing.message_router import MessageRouter  # noqa: E402
 
 BOT = '53da3460cc454e12667452872284f47d'
-OWNER = '2332239652'
+OWNER = '9000000001'
 STRANGER = '1000000002'
 
 
@@ -114,7 +114,7 @@ class PrivateDirectedTest(unittest.TestCase):
         """群聊的克制口径不能跟着改：没人叫她就不该抢话。"""
         rt = FakeRuntime(active_allow=False)
         router = MessageRouter(rt)
-        router.route(make_msg('今天好热啊', is_group=True, target='1013491196'))
+        router.route(make_msg('今天好热啊', is_group=True, target='9000000002'))
         self.assertEqual(rt.scheduler.kinds, [])
 
     def test_private_disabled_stays_silent(self):
@@ -142,11 +142,11 @@ class PrivatePromptTest(unittest.TestCase):
         self.assertIn('只有你们两个人', current)
 
     def test_group_current_message_has_no_private_note(self):
-        msg = make_msg('歌伊在吗', is_group=True, target='1013491196',
+        msg = make_msg('歌伊在吗', is_group=True, target='9000000002',
                        sender_id=OWNER, sender_name='歌靡')
         messages = self.rt.prompt_builder.build(msg)
         current = messages[-1]['content']
-        self.assertTrue(current.startswith('歌靡(2332239652)：'), current)
+        self.assertTrue(current.startswith('歌靡(9000000001)：'), current)
         self.assertNotIn('这是私聊', current)
 
     def test_private_memory_headers_avoid_group_wording(self):
@@ -161,7 +161,7 @@ class PrivatePromptTest(unittest.TestCase):
         }
         repo._touch = lambda data: None
         private_block = repo.build_block(make_msg('在吗', is_group=False, target=STRANGER))
-        group_block = repo.build_block(make_msg('在吗', is_group=True, target='1013491196'))
+        group_block = repo.build_block(make_msg('在吗', is_group=True, target='9000000002'))
         self.assertIn('你和对方最近聊过什么', private_block)
         self.assertNotIn('这个群最近发生过什么', private_block)
         self.assertIn('【对方的印象卡片', private_block)

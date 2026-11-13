@@ -143,6 +143,46 @@ class ActiveInstructionLevelTest(unittest.TestCase):
         passive = builder.build(make_msg('随便聊聊', seq=4), is_active=False)[0]['content']
         self.assertNotIn('很想开口', passive)
 
+    def test_anti_fabrication_clause_and_two_assistant_turns_in_recent_texts(self):
+        from newGeYi.memory.worldbook import set_story_mode
+
+        self.rt.config.update({'worldbook_enabled': True})
+        builder = self.rt.prompt_builder
+        uid = '888001'
+        priv_session = SessionKey(
+            bot_hash='hash', platform='qq', sdk='onebot',
+            session_type='private', host_id='-', target_id=uid,
+        )
+        session_key = priv_session.as_text()
+        self.rt.store.add_turn(session_key, 'user', '你好呀', uid, 'Tester')
+        self.rt.store.add_turn(session_key, 'assistant', '今天刚和月白一起喝了麦茶～')
+        self.rt.store.add_turn(session_key, 'user', '哦？真的吗', uid, 'Tester')
+        self.rt.store.add_turn(session_key, 'assistant', '嗯嗯，还在镇口聊了会儿呢！')
+        priv_msg = IncomingMessage(
+            session=priv_session,
+            message_id='10',
+            sender_id=uid,
+            sender_name='Tester',
+            text='她平时喜欢做什么呀？',
+            raw_text='她平时喜欢做什么呀？',
+            is_group=False,
+            mentioned_bot=True,
+            event=None,
+            proc=None,
+            arrival_seq=10,
+            sender_is_bot=False,
+        )
+        self.rt.store.add_turn(session_key, 'user', priv_msg.text, uid, 'Tester')
+        recent = builder._recent_texts(priv_msg, limit=6)
+        # 保留最近两轮 assistant 回复，保证隔一轮简短附和后追问代词仍能找到「月白」锚点
+        self.assertIn('今天刚和月白一起喝了麦茶～', recent)
+        self.assertIn('嗯嗯，还在镇口聊了会儿呢！', recent)
+
+        set_story_mode(self.rt.store, session_key, uid, True)
+        sys_prompt = builder.build(priv_msg, is_active=False)[0]['content']
+        self.assertIn('严禁擅自扩写或临场编造世界书里没写的异世界设定', sys_prompt)
+        self.assertIn('严禁为了聊得尽兴而自己编造新地名', sys_prompt)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

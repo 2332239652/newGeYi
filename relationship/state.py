@@ -46,6 +46,12 @@ class Params:
     event_stages: dict = field(default_factory=lambda: {4: 'A', 5: 'B'})
     event_timeout_turns: int = 6
     event_bonus: float = 3.0
+    # 边际递减（2026-11-11）：当天已经记过 `diminish_after` 次有效互动之后，
+    # 后续加分的增量乘以 `diminish_factor`。目的：让"前几句最值钱"，
+    # 避免 6 条普通对话就把日上限顶满（评审 70% 给 +2、上限 12 → 6 条）。
+    # presence 不计入次数、也不打折（每天第一次来的 +1 固定）。
+    diminish_after: int = 3
+    diminish_factor: float = 0.5
 
 
 def params_from_config(cfg: dict | None) -> Params:
@@ -71,6 +77,19 @@ def params_from_config(cfg: dict | None) -> Params:
     except (TypeError, ValueError):
         limit = p.tag_daily_limit
     p.tag_daily_limit = limit if 1 <= limit <= 5 else Params().tag_daily_limit
+    # 边际递减：次数 0~20，倍率 0~1（0 会把后续加分全归零，配置里允许但默认 0.5）
+    try:
+        after = int(cfg.get('galgame_diminish_after', p.diminish_after))
+    except (TypeError, ValueError):
+        after = p.diminish_after
+    if not 0 <= after <= 20:
+        after = Params().diminish_after
+    p.diminish_after = after
+    try:
+        factor = float(cfg.get('galgame_diminish_factor', p.diminish_factor))
+    except (TypeError, ValueError):
+        factor = p.diminish_factor
+    p.diminish_factor = factor if 0.0 <= factor <= 1.0 else Params().diminish_factor
     # 阈值必须单调不减，否则升级逻辑会乱
     if any(b < a for a, b in zip(p.thresholds, p.thresholds[1:])):
         p.thresholds = Params().thresholds
@@ -237,6 +256,12 @@ def apply_delta(rel: Relation, delta: int, tag: str, now: float, p: Params) -> O
             else:
                 # 两次独立计分：第二次照样按它自己的 delta 算，不再做「delta - 已记次数」的递减
                 eff = delta * p.stage_factor[rel.stage]
+                # 边际递减：当天前 `diminish_after` 次有效互动足额，之后每句打折。
+                # presence 不参与（它本身就是"每天来一次"的固定小奖励）。
+                if tag != 'presence' and p.diminish_after > 0:
+                    scored = sum(int(v) for k, v in rel.tag_counts.items() if k != 'presence')
+                    if scored >= p.diminish_after:
+                        eff *= p.diminish_factor
                 eff = max(0.0, min(eff, p.daily_cap[rel.stage] - rel.gain_today))
                 rel.tag_counts[tag] = seen + 1
                 rel.gain_today += eff
@@ -247,6 +272,10 @@ def apply_delta(rel: Relation, delta: int, tag: str, now: float, p: Params) -> O
                     out.note = 'daily_cap'
     elif delta < 0:
         out.applied = float(delta)
+        # 扣分从「今日已赚」里扣回去：日上限因此约束的是**净收益**，
+        # 不会出现"满额后所有互动都 0 分、只有扣分生效"（2026-11-10 抽查发现）。
+        # 刻意不限制单次扣分：恶劣行为该照常扣历史分（持续恶劣会掉级的测试依赖它）。
+        rel.gain_today = max(0.0, float(rel.gain_today) + out.applied)
         if tag in BAD_TAGS:
             rel.bad_streak += 1
             if rel.bad_streak >= p.bad_streak_lock:
@@ -331,12 +360,52 @@ def is_narration_hijack(text: str) -> bool:
     return wrote_you and inside >= 12 and inside * 2 >= len(raw)
 
 
-def is_repeat(text: str, recent: list[str], similarity) -> bool:
-    """和最近几条自己说过的话高度相似（复读/刷屏）。similarity 由调用方传入，避免循环依赖。"""
-    cur = _PUNCT.sub('', str(text or ''))
-    if len(cur) < 4:
+def is_repeat(text: str, recent, similarity, window_seconds: float = 1800.0,
+              now: float | None = None) -> bool:
+    """和**最近一段时间内**自己说过的话高度相似（复读/刷屏）。
+
+    2026-11-10 抽查修掉三个误判源（7 天 30 条 spam 里约 1/4 是冤枉的）：
+
+    1. **没有时间窗**：以前只看"最近 4 条用户消息"，而低频私聊的 8 轮历史能横跨
+       好几天——三天后说同一句口头禅被判刷屏（实测间隔 4088 分钟）。
+    2. **引用前缀**：`【引用消息】` 四个字每条引用回复都带，短句被它抬到 0.85 以上。
+    3. **短句寒暄**：`晚安歌伊`/`歌伊晚上好` 这种 4~6 字问候，字符集相似度天然高。
+
+    因此：先剥前缀 → 去标点 → 不足 6 字不算 → 只比 window 内的 → 长度差太多不比 →
+    阈值提到 0.95（长句仍可命中换说法的复读）。
+    """
+    cur = _PUNCT.sub('', strip_chat_prefix(text))
+    if len(cur) < 6:
         return False
-    for old in recent[-4:]:
-        if similarity(cur, _PUNCT.sub('', str(old or ''))) >= 0.85:
+    now = time.time() if now is None else float(now)
+    for old in list(recent)[-4:]:
+        old_text, old_ts = (old[0], float(old[1] or 0)) if isinstance(old, (tuple, list)) and len(old) >= 2 \
+            else (old, 0.0)
+        if window_seconds > 0 and old_ts > 0 and (now - old_ts) > window_seconds:
+            continue
+        old_norm = _PUNCT.sub('', strip_chat_prefix(old_text))
+        if not old_norm:
+            continue
+        if old_norm == cur:
+            return True
+        # 长度差一倍以上的，不可能是"复读同一句"（防"歌伊好的" vs "歌伊因为想你了"）
+        if min(len(cur), len(old_norm)) / max(len(cur), len(old_norm)) < 0.6:
+            continue
+        if similarity(cur, old_norm) >= 0.95:
             return True
     return False
+
+
+_RE_CQ = re.compile(r'\[(?:CQ|OP):[^\]]*\]')
+
+
+def strip_chat_prefix(text: str) -> str:
+    """剥掉 QQ 引用/表情码/@ 前缀，只留用户真正说的话。
+
+    这些前缀与内容无关，却会显著抬高字符集相似度（`【引用消息】` 每条都一样）。
+    """
+    s = str(text or '')
+    s = _RE_CQ.sub('', s)
+    s = s.replace('【引用消息】', '')
+    s = re.sub(r'@[^\s@]{1,24}', '', s)
+    return s.strip()

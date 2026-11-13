@@ -20,11 +20,13 @@ import time
 import traceback
 
 from .. import config as plugin_config
+from ..context import aliases
 from ..context.cross_plugin_observer import install_cross_plugin_observer
 from ..context.live_context import LiveContextStore
 from ..context.group_profile import GroupProfile
 from ..context.images import ImageContext
 from ..context.prompt_builder import PromptBuilder
+from ..context.scene import SceneKeeper
 from ..memory.curator import MemoryCurator
 from ..memory.repository import MemoryRepository
 from ..memory.worldbook import WorldbookService
@@ -123,6 +125,8 @@ class Runtime:
         self.gateway.set_notify(self._notify_owner)
         # 自动记忆：攒批提炼，跑在自己的后台线程里（不占用回复的会话队列）
         self.curator = MemoryCurator(self.config, self.store, self.gateway)
+        # 工作记忆：状态纸条（超出原文窗口那一段的「正在发生」），同样是后台线程
+        self.scene = SceneKeeper(self.config, self.store, self.gateway)
         self.live_context = LiveContextStore()
         # 图片理解：记住最近收到的图，回复时按需下载并内联成 base64
         self.images = ImageContext(self.config)
@@ -275,6 +279,11 @@ class Runtime:
             self.curator.start()
         except Exception:  # noqa: BLE001
             logger.exception('启动记忆提炼线程失败')
+        # 状态纸条巡检线程：把超出窗口的那一段压成「正在发生」
+        try:
+            self.scene.start()
+        except Exception:  # noqa: BLE001
+            logger.exception('启动状态纸条线程失败')
         # 跨插件消息感知钩子（捕获骰娘/运势/签到等其他插件输出，避免歌伊上下文理解脱节）
         try:
             self.cross_plugin_observer = install_cross_plugin_observer(self)
@@ -285,6 +294,10 @@ class Runtime:
     def save(self, Proc) -> None:
         try:
             self.curator.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.scene.stop()
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -507,6 +520,10 @@ class Runtime:
             sender = getattr(event.data, 'sender', None) or {}
             sender_id = str(getattr(event.data, 'user_id', '') or '-')
             sender_name = str(sender.get('name', '') or '用户')
+            # 自定义称呼：本人设过的名字优先于 QQ 昵称。改在入口这一处，
+            # 下游（prompt 标签 / 记忆缓冲 / turns / 旁观窗口 / 图片归属 / @ 替换）
+            # 全都自动跟着走，不用每处再查一次。
+            sender_name = aliases.display(self.store, sender_id, sender_name)
             session = self._session_key(event, is_group)
             # @码 → @名字：少数协议端不带 name=，这时至少把「@她自己」说成 @你，
             # 别让模型看到一串数字（2026-11-04：她学会了写【@2309394954】）。

@@ -32,9 +32,9 @@ from newGeYi.runtime.sleep import (  # noqa: E402
 )
 
 BOT = '53da3460cc454e12667452872284f47d'
-OWNER = '2332239652'
+OWNER = '9000000001'
 STRANGER = '1000000002'
-GROUP = '1013491196'
+GROUP = '9000000002'
 
 
 def ts_at(hour: int, minute: int, day_offset: int = 0) -> float:

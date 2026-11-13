@@ -135,13 +135,18 @@ class PrivateGate:
         #   单人上限临时压到 private_quota_squeeze —— 保证晚来的人也还有得聊。
         #   为什么要这样：11-06 实测 12 个人 317 条，前两名吃掉 50.5%，
         #   全局限额一打满，后面来的人一条都排不上（不是总量不够，是分配不均）。
-        user_quota = self._effective_user_quota(getattr(msg, 'sender_id', ''))
+        uid = getattr(msg, 'sender_id', '')
+        user_quota = self._effective_user_quota(uid)
         if user_quota > 0 and self.used_today(session_key) >= user_quota:
             return False, 'quota_user'
 
         # ⑤ 全体私聊每日限额（真正管并发的那个闸）
+        #   2026-11-11：**两档赞助者不受全局限额约束**。爱发电承诺写的是
+        #   「全员挤爆的时段对你不再收紧」，只在单人额度上免收紧是不够的——
+        #   全局 400 一打满，赞助者照样一条都排不上，承诺就成了空话。
         global_quota = self._num('private_daily_quota_global', 0)
-        if global_quota > 0 and self.used_today_global() >= global_quota:
+        if (global_quota > 0 and self.used_today_global() >= global_quota
+                and not self.is_sponsor(uid)):
             return False, 'quota_global'
         return True, ''
 
@@ -217,6 +222,35 @@ class PrivateGate:
             self.store.set_setting('priv.gday', '')
         except Exception:  # noqa: BLE001
             logger.exception('私聊闸门重置失败')
+
+    def user_usage_text(self, session_key: str) -> str:
+        """给**用户自己**看的今日额度（不含全体用量，别把服务器负载摊给所有人）。
+
+        2026-11-10 骰主反馈："大家希望私信可以查看今日额度次数"。
+        以前只有骰主的「私聊用量」能看到，普通用户被限额挡住时完全不知道为什么没回。
+        """
+        uid = str(session_key).rsplit(':', 1)[-1] if session_key else ''
+        used = self.used_today(session_key)
+        quota = self._effective_user_quota(uid)
+        tier = self.sponsor_tier(uid)
+        lines = ['【今日私聊额度】']
+        if quota > 0:
+            left = max(0, int(quota - used))
+            lines.append('已用 %d / %d 条，今天还能聊 %d 条' % (used, int(quota), left))
+            if tier:
+                lines.append('（赞助者·%s：每天 %d 条，拥挤期也不收紧）'
+                             % (sponsors.TIER_NAMES.get(tier, '档位未知'), int(quota)))
+            elif self.squeezed():
+                lines.append('（现在人多，单人额度临时收紧到 %d 条）' % int(quota))
+            else:
+                lines.append('（每天 0 点重置）')
+            if left <= 0:
+                lines.append('今天聊得够多啦，先帮主人省点 token，明天 0 点再继续～')
+        else:
+            lines.append('目前没有设置每日上限，放心聊就好～')
+        if self.trigger_only():
+            lines.append('（现在是触发词模式：叫我名字才会应～）')
+        return '\n'.join(lines)
 
     def usage_text(self, session_key: str = '') -> str:
         """给面板/命令看的一行摘要。"""

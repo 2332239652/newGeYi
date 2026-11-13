@@ -35,6 +35,10 @@ DEFAULT_SELF = 6
 DEFAULT_SUMMARIES = 3
 DEFAULT_MAX_CHARS = 3200
 
+# 私聊自己的「要不要读群聊记忆」选择，存 settings：`mempriv:<session_key>` = '1'/'0'。
+# 键不存在（空串）= 没设过，跟随 `memory_private_enabled` 这个默认值。
+SHARE_OVERRIDE_PREFIX = 'mempriv:'
+
 # 匹配汉字二元/三元短语与英文单词
 _TOKEN_RE = re.compile(r'[\u4e00-\u9fa5]{2,4}|[a-zA-Z0-9_]{2,}')
 _STOP_WORDS = {
@@ -163,23 +167,32 @@ def text_similarity(text1: str, text2: str) -> float:
     return 0.5 * overlap + 0.5 * jaccard
 
 
-def cross_scope_enabled(config: dict, is_group: bool, relation: dict | None = None) -> bool:
+def cross_scope_enabled(config: dict, is_group: bool, relation: dict | None = None,
+                        override: bool | None = None) -> bool:
     """当前这条消息能不能读到"另一侧"的记忆（群↔私聊）。
 
-    三个开关，语义从粗到细：
+    开关从粗到细：
 
-    `memory_private_enabled`  总闸。关掉 = 两边彻底隔离（v2.8.19 的默认行为）。
+    `memory_private_enabled`  **默认值**（2026-11-09 起不再是一票否决的总闸）。
+                              没被会话覆盖时，私聊按它决定要不要读群聊记忆。
+    `override`                会话级选择：True/False 表示这个私聊自己设过，
+                              None = 没设过、跟随上面的默认值。
+                              为什么不给群聊也能覆盖：群聊是公共场合，一个群里的
+                              "要不要翻私聊"不能由某个人临时决定；方向仍由
+                              `memory_private_to_group` 统一控制。
     `memory_private_to_group` 反向闸：**群聊里能不能读到私聊的记忆**，默认关。
                               关着时是"单向共享"——私聊知道群里聊了什么，群里不知道私聊里的事。
-                              2026-11-05 骰主提的正是这个：私聊要能接住群聊的话题，
-                              但不能让群里出现「好几个恋爱对象」的尴尬。
     `relation.cross`          关系阶段闸：私聊里到没到"朋友"（`galgame_cross_memory_min_stage`）。
-                              只影响私聊这一侧；群聊侧由上面那个反向闸决定。
+                              只影响私聊这一侧；**显式开了也要过这道门**——
+                              否则一个陌生人刚私聊就能把群里的你摸得一清二楚。
     """
-    if not config.get('memory_private_enabled', False):
-        return False
     if is_group:
+        if not config.get('memory_private_enabled', False):
+            return False
         return bool(config.get('memory_private_to_group', False))
+    enabled = bool(config.get('memory_private_enabled', False)) if override is None else bool(override)
+    if not enabled:
+        return False
     if relation is not None and not relation.get('cross', True):
         return False
     return True
@@ -216,6 +229,43 @@ class MemoryRepository:
     def list_facts(self, msg: IncomingMessage, limit: int = 10) -> list[str]:
         rows = self.store.list_user_facts(msg.session.as_text(), msg.sender_id, limit=limit)
         return [row['fact'] for row in rows]
+
+    # ==================== 私聊：群聊记忆共享（会话级选择）====================
+    # 为什么做成"会话级覆盖 + 全局默认"（2026-11-09）：
+    # 以前 `memory_private_enabled` 是唯一的总闸，于是"某个私聊不想被带进群聊的事"
+    # 只能靠运营改全局，一改就是**所有人**的私聊一起放开/关掉；
+    # 反过来「忘了我」在私聊也只清得掉当前会话（+global），群里的那份照旧被召回，
+    # 用户会觉得"说了忘记还照样提"。现在每个私聊自己选，全局值退化成默认值。
+    def share_override(self, session_key: str) -> bool | None:
+        """这个私聊自己的选择：True/False 表示设过，None = 跟随默认。"""
+        value = str(self.store.get_setting(SHARE_OVERRIDE_PREFIX + str(session_key)) or '').strip()
+        if value in ('1', 'on', 'true', 'True'):
+            return True
+        if value in ('0', 'off', 'false', 'False'):
+            return False
+        return None
+
+    def set_share_override(self, session_key: str, enabled: bool | None) -> None:
+        """写入/清除本会话的选择（None = 清除，恢复跟随默认）。"""
+        key = SHARE_OVERRIDE_PREFIX + str(session_key)
+        if enabled is None:
+            self.store.set_setting(key, '')
+        else:
+            self.store.set_setting(key, '1' if enabled else '0')
+
+    def share_status(self, session_key: str, relation: dict | None = None) -> dict:
+        """给命令/面板用的一句话状态：生效值、来源、是否被关系阶段挡住。"""
+        override = self.share_override(session_key)
+        default = bool(self.config.get('memory_private_enabled', False))
+        enabled = cross_scope_enabled(self.config, False, relation, override=override)
+        return {
+            'enabled': enabled,
+            'source': 'user' if override is not None else 'default',
+            'override': override,
+            'default': default,
+            # 显式开了却没生效 → 只可能是关系阶段门
+            'stage_blocked': bool(override is True and not enabled),
+        }
 
     # ==================== 打分与检索 ====================
     def score(self, row: dict, now: float | None = None, query_text: str | None = None) -> float:
@@ -280,7 +330,9 @@ class MemoryRepository:
         now = time.time()
         query_text = msg.text or ''
         is_group = bool(getattr(msg, 'is_group', True))
-        cross_enabled = cross_scope_enabled(cfg, is_group, relation)
+        # 私聊：会话自己的选择优先；没设过才看全局默认（群聊侧不提供会话级开关）
+        override = None if is_group else self.share_override(session)
+        cross_enabled = cross_scope_enabled(cfg, is_group, relation, override=override)
 
         # L2 群友/私聊事实：支持跨群全局偏好与私聊互通召回
         include_global = cfg.get('memory_cross_group_enabled', True)

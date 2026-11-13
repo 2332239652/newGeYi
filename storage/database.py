@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS api_calls(
     in_tokens INTEGER DEFAULT 0,
     out_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
+    cache_reported INTEGER DEFAULT 0,
     latency_ms INTEGER DEFAULT 0,
     ok INTEGER DEFAULT 1,
     error_code TEXT DEFAULT ''
@@ -388,6 +389,9 @@ class SQLiteStore:
         cols = {row[1] for row in conn.execute('PRAGMA table_info(api_calls)')}
         if cols and 'cached_tokens' not in cols:
             conn.execute('ALTER TABLE api_calls ADD COLUMN cached_tokens INTEGER DEFAULT 0')
+        # 渠道有没有透传缓存字段（2026-11-09 新增）：老库补列，默认 0 = 当时没记录，按"未上报"算。
+        if cols and 'cache_reported' not in cols:
+            conn.execute('ALTER TABLE api_calls ADD COLUMN cache_reported INTEGER DEFAULT 0')
         # 印象表增加 scope 支持（区分 group 与 private，独立提炼互不覆盖）
         try:
             imp_cols = {row[1] for row in conn.execute('PRAGMA table_info(user_impressions)')}
@@ -489,12 +493,13 @@ class SQLiteStore:
 
     def recent_turns(self, session_key: str, limit: int = 12) -> list[dict]:
         rows = self._conn().execute(
-            'SELECT role, sender_id, sender_name, content FROM turns '
+            'SELECT role, sender_id, sender_name, content, created_at FROM turns '
             'WHERE session_key=? ORDER BY seq DESC LIMIT ?',
             (session_key, limit),
         ).fetchall()
         return [
-            {'role': r[0], 'sender_id': r[1], 'sender_name': r[2], 'content': r[3]}
+            {'role': r[0], 'sender_id': r[1], 'sender_name': r[2], 'content': r[3],
+             'created_at': r[4]}
             for r in reversed(rows)
         ]
 
@@ -561,12 +566,15 @@ class SQLiteStore:
         ok: bool,
         error_code: str = '',
         cached_tokens: int = 0,
+        cache_reported: bool = False,
     ) -> None:
         self._conn().execute(
-            'INSERT INTO api_calls(day, ts, session_key, kind, model, in_tokens, out_tokens, cached_tokens, latency_ms, ok, error_code) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO api_calls(day, ts, session_key, kind, model, in_tokens, out_tokens, '
+            'cached_tokens, cache_reported, latency_ms, ok, error_code) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
             (time.strftime('%Y-%m-%d'), int(time.time()), session_key, kind, model,
-             in_tokens, out_tokens, int(cached_tokens or 0), latency_ms, 1 if ok else 0, error_code),
+             in_tokens, out_tokens, int(cached_tokens or 0), 1 if cache_reported else 0,
+             latency_ms, 1 if ok else 0, error_code),
         )
 
     def today_stats(self) -> dict:
@@ -575,6 +583,10 @@ class SQLiteStore:
         `total_tokens`（2026-11-08 新增）：骰主要的是「今天一共花掉多少 token」这一个数，
         以前得自己在「今日用量」里把输入和输出加起来。失败调用的行也算在内——
         上游已经计费了就该算，何况失败的多数根本没有 usage，加不加都是 0。
+
+        `cache_reported_calls`（2026-11-09）：有几次调用的 usage 里**真的带了**缓存字段。
+        为 0 说明这一天的渠道根本没透传，界面会据此显示「未上报」而不是让人以为
+        「缓存优化没生效」。
         """
         day = time.strftime('%Y-%m-%d')
         row = self._conn().execute(
@@ -582,7 +594,8 @@ class SQLiteStore:
             "COALESCE(SUM(CASE WHEN kind = 'active' THEN 1 ELSE 0 END), 0), "
             'COALESCE(SUM(in_tokens), 0), COALESCE(SUM(cached_tokens), 0), '
             'COALESCE(SUM(in_tokens + out_tokens), 0), '
-            'COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) '
+            'COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0), '
+            'COALESCE(SUM(cache_reported), 0) '
             'FROM api_calls WHERE day=?',
             (day,),
         ).fetchone()
@@ -595,6 +608,7 @@ class SQLiteStore:
             'total_tokens': int(row[5]),
             'ok_calls': int(row[6]),
             'failed_calls': int(row[0]) - int(row[6]),
+            'cache_reported_calls': int(row[7]),
         }
 
     def today_stats_by_kind(self) -> list[dict]:
@@ -699,15 +713,28 @@ class SQLiteStore:
         ).fetchone()
         return int(row[0])
 
-    def buffer_trim(self, session_key: str, keep: int = 300) -> None:
-        """清掉已消费的旧缓冲，并给未消费的部分留一个上限。"""
+    def buffer_trim(self, session_key: str, keep: int = 300, retention_seconds: int = 0) -> None:
+        """清掉**过期**的旧缓冲，并给总量留一个上限。
+
+        `retention_seconds > 0` 时，游标以下的行不再立刻删除，而是留一段时间：
+        工作记忆的状态纸条要读「刚刚过去、但还没进长期记忆」的那一段，行一删就没得读
+        （2026-11-10 实测：纸条线程永远看到 0 条）。默认 0 = 旧行为，运行时传
+        `memory_buffer_retention_seconds`（默认 2 小时）。
+        """
         conn = self._conn()
         try:
             cursor = int(self.get_setting(f'mem.cursor:{session_key}') or 0)
         except (TypeError, ValueError):
             cursor = 0
         if cursor > 0:
-            conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND id<=?', (session_key, cursor))
+            if retention_seconds > 0:
+                stale_before = int(time.time()) - int(retention_seconds)
+                conn.execute(
+                    'DELETE FROM memory_buffer WHERE session_key=? AND id<=? AND created_at<?',
+                    (session_key, cursor, stale_before))
+            else:
+                conn.execute('DELETE FROM memory_buffer WHERE session_key=? AND id<=?',
+                             (session_key, cursor))
         row = conn.execute(
             'SELECT COALESCE(MAX(id), 0) FROM memory_buffer WHERE session_key=?', (session_key,)
         ).fetchone()
@@ -968,6 +995,14 @@ class SQLiteStore:
             'UPDATE user_facts SET valid_to=? WHERE id=? AND valid_to=0',
             (int(when or time.time()), int(fact_id)),
         )
+
+    def delete_user_fact_by_id(self, fact_id: int, user_id: str) -> bool:
+        """精确物理删除一条用户事实（带 user_id 校验防越权）。"""
+        cur = self._conn().execute(
+            'DELETE FROM user_facts WHERE id=? AND user_id=?',
+            (int(fact_id), str(user_id)),
+        )
+        return bool(cur.rowcount > 0)
 
     def count_user_facts(self, session_key: str, user_id: Optional[str] = None) -> int:
         sql = 'SELECT COUNT(*) FROM user_facts WHERE session_key=? AND valid_to=0'

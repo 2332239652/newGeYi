@@ -31,6 +31,7 @@ BOOL_KEYS = {
     'memory_impression_enabled', 'memory_diversity_enabled', 'time_awareness_enabled',
     'active_escalate_enabled', 'gate_scorer_enabled', 'group_quota_enabled',
     'collapse_short_multiline', 'strip_repeated_ellipsis', 'strip_trailing_period',
+    'scene_enabled',
 }
 # 数字键 = (最小值, 最大值, 必须整数)。只开放确有热更新语义的字段。
 NUMBER_KEYS = {
@@ -62,8 +63,12 @@ NUMBER_KEYS = {
     'gate_score_window': (8, 1000, True), 'active_bare_image_factor': (0, 1, False),
     'rest_minutes': (0.1, 1440, False), 'voice_group_cooldown': (0, 86400, False),
     'panel_local_port': (0, 65535, True),
+    'worldbook_max_entries': (1, 15, True), 'worldbook_story_max_entries': (1, 20, True),
     'galgame_judge_min_chars': (1, 50, True), 'galgame_cross_memory_min_stage': (0, 5, True),
     'galgame_tag_daily_limit': (1, 5, True),
+    'galgame_diminish_after': (0, 20, True),
+    'galgame_diminish_factor': (0, 1, False),
+    'galgame_repeat_window_seconds': (0, 86400, True),
     'galgame_mild_gap': (0, 3, True),
     'voice_poke_rate': (0, 1, False), 'voice_speed': (0.5, 2, False), 'voice_timeout': (1, 120, False),
     'image_max_per_turn': (1, 10, True), 'image_max_bytes': (1024, 12582912, True),
@@ -77,11 +82,20 @@ NUMBER_KEYS = {
     'private_daily_quota_sponsor_tier1': (0, 100000, True),
     'private_daily_quota_sponsor_tier2': (0, 100000, True),
     'sponsor_fact_floor': (0, 100, True),
+    # 工作记忆·状态纸条（2026-11-10）
+    'memory_summary_keep': (10, 5000, True),
+    'memory_buffer_retention_seconds': (0, 86400, True),
+    'scene_update_messages': (1, 500, True), 'scene_idle_seconds': (0, 86400, True),
+    'scene_min_interval_seconds': (0, 86400, True), 'scene_input_messages': (4, 500, True),
+    'scene_idle_min_messages': (1, 100, True),
+    'scene_max_chars': (100, 5000, True), 'scene_ttl_seconds': (0, 604800, True),
+    'scene_tick_seconds': (15, 3600, True), 'scene_max_tokens': (50, 4000, True),
+    'scene_retry_seconds': (0, 86400, True),
 }
 STRING_KEYS = {'assistant_name': 80, 'active_quiet_hours': 11, 'reply_audit_fallback': 2000,
                'galgame_judge_model': 120, 'affection_provider': 80,
                'sponsor_thanks_text': 200,
-               'sleep_window': 11, 'sleep_notice_text': 120}
+               'sleep_window': 11, 'sleep_notice_text': 120, 'scene_provider': 80}
 LIST_KEYS = {'triggers': (50, 80), 'owner_ids': (50, 40), 'ignore_sender_ids': (200, 40),
              'incomplete_tails': (100, 80), 'galgame_exempt_ids': (50, 40),
              'sponsor_ids': (500, 40), 'sponsor_tier1_ids': (500, 40),

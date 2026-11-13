@@ -24,7 +24,7 @@ from newGeYi.presentation.renderer import (  # noqa: E402
 )
 
 SESSION = SessionKey(bot_hash='hash', platform='qq', sdk='onebot',
-                     session_type='group', host_id='-', target_id='1013491196')
+                     session_type='group', host_id='-', target_id='9000000002')
 
 
 def fake_msg() -> IncomingMessage:
@@ -36,7 +36,7 @@ def fake_msg() -> IncomingMessage:
     )
 
 
-# 线上原样（2026-11-05，群 1013491196 那一串「本大主教」）
+# 线上原样（2026-11-05，群 9000000002 那一串「本大主教」）
 ONLINE_SELF_TITLE = (
     '（赞许地拍拍你的肩膀）干得太漂亮了！不愧是本大主教的得力骑士，'
     '顺便把他的牢门彻底焊死，明早草莓蛋糕端上来之前谁也不许放他出来！'

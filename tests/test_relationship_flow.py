@@ -23,7 +23,7 @@ from newGeYi.panel import EVENT_NAME, Panel  # noqa: E402
 from newGeYi.panel_helpers import PanelError, validate_patch  # noqa: E402
 from newGeYi.runtime.app import Runtime  # noqa: E402
 
-OWNER = '2332239652'
+OWNER = '9000000001'
 
 
 class FakeEvent:
@@ -71,7 +71,7 @@ class Base(unittest.TestCase):
         C._CONFIG_STATE['error'] = ''
         self.rt = Runtime()
         self.rt.config.update({'private_enabled': True, 'galgame_enabled': True, 'galgame_shadow': False,
-                               'worldbook_enabled': True, 'time_awareness_enabled': False,
+                               'worldbook_enabled': True, 'owner_ids': [OWNER], 'time_awareness_enabled': False,
                                'emote_enabled': False, 'voice_enabled': False})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
@@ -221,7 +221,7 @@ class EndToEndTest(Base):
     def test_forget_me_resets_relationship(self):
         self.svc.force_stage(self.uid, 2)
         msg = private_msg('忘了我', self.uid, FakeEvent())
-        self.rt.commands._cmd_forget_me(msg)
+        self.rt.commands._cmd_forget_me(msg, force_confirm=True)
         self.assertEqual(self.svc.load(self.uid).stage, 0)
 
 
@@ -298,7 +298,7 @@ class PanelRelationshipTest(Base):
             self.assertIn(key, cfg['editable_keys'])
         current = dict(self.rt.config)
         validate_patch({'galgame_thresholds': [0, 20, 60, 120, 200, 290]}, current)
-        validate_patch({'galgame_exempt_ids': ['2332239652']}, current)
+        validate_patch({'galgame_exempt_ids': ['9000000001']}, current)
         for bad in ({'galgame_thresholds': [0, 20, 60]},
                     {'galgame_thresholds': [0, 50, 10, 99, 100, 200]},
                     {'galgame_min_days': [0, 1, 3, 7, 14, -5]},
@@ -379,6 +379,86 @@ class MildOverstepTest(Base):
         msg, out = self._run('今天好累啊', 1)
         self.assertGreaterEqual(out['delta_raw'], 0)
         self.assertNotIn('刚才那句有点太亲近了', self.svc.block_for(msg))
+
+
+class ScoringFixTest(Base):
+    """2026-11-10 抽查发现的三处不合理判定的回归测试。"""
+
+    SESSION = None
+
+    def setUp(self):
+        super().setUp()
+        self.SESSION = SessionKey('bot', 'qq', 'onebot', 'private', '-', self.uid).as_text()
+
+    def _seed(self, affection=10.0, stage=1):
+        rel = self.svc.load(self.uid)
+        rel.affection = float(affection)
+        rel.stage = int(stage)
+        rel.gain_today = 0.0
+        rel.last_day = ''
+        self.svc.save(rel)
+
+    def test_spam_no_longer_swallows_presence_bonus(self):
+        """刷屏只该扣一次：以前连「今日首次互动 +1」也被跳过，等于罚两次。"""
+        text = '投喂歌伊小蛋糕'
+        for _ in range(3):
+            self.rt.store.add_turn(self.SESSION, 'user', text)
+        self._seed(affection=10.0)
+        out = self.svc.process_interaction(self.uid, 'Oracle', self.SESSION, text, '诶？')
+        self.assertEqual(out['tag'], 'spam')
+        self.assertAlmostEqual(out['applied'], 0.0, 'presence +1 与 spam -1 应当抵消')
+        self.assertAlmostEqual(self.svc.load(self.uid).affection, 10.0)
+
+    def test_overstep_delta_is_capped_at_minus_one(self):
+        """越界扣分封顶 -1：评审给 -2 也只扣 1（lie/rude 除外）。"""
+        msg = private_msg('我爱你，做我老婆吧', self.uid, FakeEvent())
+        verdict = {'delta': -2, 'tag': 'pushy', 'advance_level': 3,
+                   'mood': '', 'event_done': False, 'note': ''}
+        out = self.svc.process_interaction(
+            self.uid, 'Oracle', msg.session.as_text(), msg.text, '……',
+            judge=lambda *a, **k: dict(verdict))
+        self.assertEqual(out['delta_raw'], -1, '越界不该一次扣 2 分')
+        row = self.svc.recent_log(self.uid, 1)[0]
+        self.assertEqual(row['tag'], 'flirt_early')
+
+    def test_feeling_shows_today_progress(self):
+        self._seed(affection=20.0, stage=1)
+        rel = self.svc.load(self.uid)
+        rel.gain_today = 12.0
+        rel.last_day = time.strftime('%Y-%m-%d')
+        self.svc.save(rel)
+        text = self.svc.feeling(self.uid)
+        self.assertIn('+12/12', text)
+        self.assertIn('已经满啦', text)
+
+    def test_feeling_ignores_yesterday_gain(self):
+        """隔天还没说话时，gain_today 还是昨天的数——不能显示成"今天已满"。"""
+        self._seed(affection=20.0, stage=1)
+        rel = self.svc.load(self.uid)
+        rel.gain_today = 12.0
+        rel.last_day = '2026-01-01'
+        self.svc.save(rel)
+        text = self.svc.feeling(self.uid)
+        self.assertNotIn('已经满啦', text)
+        self.assertNotIn('+12/12', text)
+        self.assertIn('今天还没聊', text)
+        # 骰主的详情也不该把昨天算成今天
+        self.assertIn('今日 +0.0', self.svc.describe(self.uid))
+
+    def test_repeat_window_ignores_day_old_message(self):
+        """三天前说过的话不该被判刷屏。"""
+        text = '投喂歌伊小蛋糕'
+        self.rt.store.add_turn(self.SESSION, 'user', text)
+        old = int(time.time()) - 3 * 86400
+        self.rt.store._conn().execute(
+            'UPDATE turns SET created_at=? WHERE session_key=?', (old, self.SESSION))
+        self.rt.store.add_turn(self.SESSION, 'user', '今天天气不错')
+        self.rt.store.add_turn(self.SESSION, 'assistant', '是呀～')
+        out = self.svc.process_interaction(self.uid, 'Oracle', self.SESSION, text, '诶？',
+                                           judge=lambda *a, **k: {'delta': 1, 'tag': 'care',
+                                                                  'advance_level': 1, 'mood': '',
+                                                                  'event_done': False, 'note': ''})
+        self.assertNotEqual(out['tag'], 'spam', '跨天的重复不该算刷屏')
 
 
 if __name__ == '__main__':

@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import shutil
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,7 +26,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.9.11'
+PLUGIN_VERSION = '2.9.18'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -110,7 +112,7 @@ DEFAULT_CONFIG = {
     #      "model": "deepseek-flash", "api_key": "sk-...",
     #      "extra_body": {"thinking": {"type": "disabled"}}},
     #     {"name": "relay", "kinds": ["memory_curate"], "priority": 1,
-    #      "endpoint": "https://api.ginka.cloud/v1/chat/completions",
+    #      "endpoint": "https://api.example.invalid/v1/chat/completions",
     #      "model": "deepseek-v4.1-flash", "api_key": "sk-...",
     #      "extra_body": {"reasoning_effort": "low"}}
     #   ]
@@ -128,6 +130,23 @@ DEFAULT_CONFIG = {
         'probe_success_needed': 1,       # 探测成功几次算恢复并切回
         'probe_repair_per_round': 2,     # 每轮顺手体检几个「挂着不可用标签」的低优先渠道
         'probe_timeout_seconds': 10,     # 单次探测超时
+        # ===== 链路抖动容忍（2026-11-12，骰主：中转/反代波动很正常）=====
+        # 全挂后**先不锁定**：等这么多秒，从锚点重试一次；重试成功就当作没发生，
+        # 仍失败才通知骰主 + 锁定兜底渠道。0 = 退回「立刻锁定」的老行为。
+        'retry_before_hold_seconds': 300,
+        # 真实调用里「刚成功过」的渠道再次超时/连不上时，先不计故障（秒）。
+        # 夜里链路抖一下不该把整条线判死 5 分钟。
+        'failure_grace_seconds': 90,
+        # 探测判定「渠道活着」的状态码：429 是被限流，说明路是通的，只是忙。
+        'probe_ok_statuses': [200, 429],
+        # 探测遇到连接类抖动时先重试几次再判「未恢复」。
+        'probe_retry': 1,
+        # ===== 熔断冷却（2026-11-12，骰主：「多次失败就移出队列等一段时间，通了再回来」）=====
+        # 判死的渠道不只是「排到队尾」，而是**整条移出候选**；冷却到期后由后台探测
+        # 重新召回。以前队尾等于每条消息都要在它身上各等一次 60 秒超时——
+        # 四个死渠道就能把一条回复拖到 150 秒总预算上限。
+        'cooldown_base_seconds': 120,    # 首次冷却：2 分钟；再次失败翻倍
+        'cooldown_max_seconds': 1800,    # 冷却上限：30 分钟（认证类错误直接关满）
         'notify_owner': True,            # 所有渠道都挂时私聊通知骰主
         'notify_cooldown_seconds': 600,  # 同类通知节流间隔，防刷屏
         'switch_history_limit': 50,      # 保留多少条切换历史
@@ -235,6 +254,8 @@ DEFAULT_CONFIG = {
     'active_enabled': True,
     'route_debug': False,
     'worldbook_enabled': False,
+    'worldbook_max_entries': 3,
+    'worldbook_story_max_entries': 6,
     # ===== 私聊 galgame：好感度 / 关系阶段（设计见 docs/GALGAME_PLAN.md）=====
     # 总开关。关着时私聊和以前完全一样；世界书里 min_stage>0 的深层设定也不会放行（主人除外）。
     'galgame_enabled': False,
@@ -244,7 +265,7 @@ DEFAULT_CONFIG = {
     # 主人豁免：不评分、不注入关系块，世界书按最高阶段放行。
     'galgame_owner_exempt': True,
     # 额外豁免名单（role_prompt 里写死的主人 QQ；owner_ids 里的人也自动豁免）
-    'galgame_exempt_ids': ['2332239652'],
+    'galgame_exempt_ids': [],
     # 评审用的模型（留空沿用 fast_model）；它走 kind='affection'，可用 affection_provider 指到便宜渠道
     'galgame_judge_model': '',
     'galgame_judge_max_tokens': 1024,
@@ -270,15 +291,27 @@ DEFAULT_CONFIG = {
     # 结果是「第一次 +1、之后全 0」，实测大多数人一天只能加 3~5 点，升一档要一周。
     # 现在改成每天两次、各自独立计分（第二次不折损），第三次起归零。
     'galgame_tag_daily_limit': 2,
+    # 边际递减：当天已经记过这么多**次**有效互动后，后续每句的加分乘以 galgame_diminish_factor。
+    # 2026-11-11：评审 70% 给 +2、日上限 12 → 6 条普通对话就顶满（群友反馈"几句话就满"）。
+    # 前 3 次足额、之后打对折 → 大约 9~10 条才满，当天总上限不变。
+    # 设为 0 关闭该机制（恢复旧行为）。presence 不计入、也不打折。
+    'galgame_diminish_after': 3,
+    'galgame_diminish_factor': 0.5,
+    # 刷屏判定只看这么多秒内的消息（2026-11-10 抽查：以前没有时间窗，低频私聊里
+    # 8 轮历史能横跨好几天，三天后重复一句口头禅被判 spam -1）。
+    'galgame_repeat_window_seconds': 1800,
     'memory_enabled': True,
     # 注意：`auto_memory_enabled` 已经废除了——它从 v2.5 起就没有任何代码读，
     # 用户设 true 以为开了自动记忆，实际生效的一直是 memory_curator_enabled。
     # load_config 会把只写了旧键的老配置迁移成 memory_curator_enabled（见 _migrate_legacy_keys）。
     # ===== 自动记忆：批量提炼 =====
     'memory_curator_enabled': True,
-    # 私聊与群聊记忆库互通开关：默认关闭（私聊与群聊记忆独立隔离）。
-    # 开启后，私聊里能读到群聊的记忆；是否**反向**也开放，由下面那个键决定。
-    # 关闭时，私聊和群聊各自单独提取记忆和印象，互不影响。
+    # 私聊**能不能读到群聊记忆**的**默认值**（2026-11-09 起不再是唯一总闸）。
+    # 以前它一票决定所有人的私聊：于是「某个私聊不想被带进群聊的事」只能改全局，
+    # 一改就是所有人一起放开/关掉。现在每个私聊可以自己选：
+    #   会话里发「群聊记忆开 / 群聊记忆关」→ 覆盖；发「群聊记忆默认」→ 回到这里。
+    # 覆盖值存在 settings 的 `mempriv:<session_key>`（'1'/'0'，没有这个键 = 跟随默认）。
+    # 群聊那一侧不提供会话级开关：那个群要不要翻私聊，统一由下面 `memory_private_to_group` 决定。
     'memory_private_enabled': False,
     # 反向共享：**群聊里能不能读到私聊的记忆**（默认关）。
     # 关着 = 单向共享（私聊知道群里聊了什么，群里不知道私聊里的事）；
@@ -297,6 +330,13 @@ DEFAULT_CONFIG = {
     'memory_inject_facts': 12,      # 每轮注入几条群友事实（L2，由 6 扩至 12）
     'memory_inject_self': 6,        # 每轮注入几条她的自我记忆（L3，由 3 扩至 6）
     'memory_inject_summaries': 3,   # 每轮注入几条群摘要（L1，由 2 扩至 3）
+    # L1 摘要**保留**条数（注入只取最近几条，但「导出记忆」/面板/排查要看历史）。
+    # 2026-11-10：`trim_group_summaries()` 早就写了却**从没被调用**，大群的
+    # group_summaries 一路涨到 1800+ 条；现在每次写完摘要顺手裁到这么多条。
+    'memory_summary_keep': 200,
+    # L0 原始缓冲在「提炼游标之后」还保留多久（秒）。状态纸条要读这一段；
+    # 以前提炼完立刻删，纸条线程永远看到 0 条（2026-11-10 实测）。
+    'memory_buffer_retention_seconds': 7200,
     'memory_max_chars': 3200,       # 记忆注入总字符上限（由硬编码 900 放宽至 3200）
     'memory_relevance_enabled': True,   # 是否启用话题关键词重叠相关度召回
     'memory_relevance_weight': 0.25,    # 话题相关度在打分中的权重（0~1）
@@ -306,6 +346,22 @@ DEFAULT_CONFIG = {
     'memory_diversity_enabled': True,   # 是否启用检索召回 MMR 语义多样性去重过滤（防同类记忆霸屏）
     'memory_diversity_threshold': 0.30, # 检索去重相似度阈值（超过此值视为同类话题，只保留最高分那条）
     'memory_fuzzy_dedup_threshold': 0.60, # 写入端模糊判重阈值（超过此值视为重复事实，转为刷新已有条目）
+    # ===== 工作记忆：状态纸条（2026-11-10）=====
+    # 把「超出原文窗口、但还没进长期记忆」的那一段压成 5 行注入：
+    # 场景 / 进行中 / 她答应过 / 未解决。
+    # 成本靠 scene_provider 分流到便宜渠道；失败只退避，不会影响正常回复。
+    'scene_enabled': True,
+    'scene_update_messages': 24,        # 新增这么多条就更新一次
+    'scene_idle_seconds': 300,          # 或空闲这么久（且有待处理消息）
+    'scene_idle_min_messages': 3,       # 空闲触发也要求至少几条：1 条就把厚纸条写薄了
+    'scene_min_interval_seconds': 180,  # 同一会话两次更新的最小间隔
+    'scene_input_messages': 80,         # 每次读多少条原文重建纸条
+    'scene_max_chars': 500,             # 纸条硬上限（塞 system 用）
+    'scene_ttl_seconds': 7200,          # 超过就不注入（别拿下午的状态答晚上的话）
+    'scene_tick_seconds': 60,           # 后台巡检间隔
+    'scene_max_tokens': 3200,           # 抽取输出上限：思考链会吃掉上千 token（400/1200 都实测截断）
+    'scene_retry_seconds': 600,         # 失败退避
+    'scene_provider': '',               # 指定渠道（空 = 跟随聊天渠道）
     'time_awareness_enabled': True,
     # 记忆提炼里代表「她自己」的署名（也是「AI 说了什么」的行首标签）
     'assistant_name': '歌伊',
@@ -503,6 +559,27 @@ def _find_plugin_root() -> Path:
     return BASE_DIR.parent
 
 
+# unittest 兜底状态目录（见 _unittest_state_dir；空串 = 还没建过）
+_UNITTEST_STATE = ''
+
+
+def _unittest_state_dir() -> str:
+    """unittest 进程里兜底用的隔离状态目录（进程内只建一次，且**不写环境变量**）。
+
+    为什么需要：`python -m unittest newGeYi.tests.xxx` 会先导入父包并初始化运行时，
+    此时测试模块尚未设置自己的状态目录，因此隔离必须在包导入期间完成。
+
+    刻意不写环境变量：测试模块自己的 `setdefault('GEYI_DATA_DIR', ...)` 还要能生效，
+    这里只保护"包被导入的那一瞬间"。OlivOS 本体不会 import unittest，所以对线上无影响。
+    """
+    global _UNITTEST_STATE
+    if _UNITTEST_STATE:
+        return _UNITTEST_STATE
+    _UNITTEST_STATE = tempfile.mkdtemp(prefix='geyi_unittest_')
+    logger.warning('检测到 unittest 进程且未指定 GEYI_DATA_DIR，状态目录已隔离到 %s', _UNITTEST_STATE)
+    return _UNITTEST_STATE
+
+
 def get_state_dir() -> Path:
     """**可变状态**放这里：配置、数据库、导出的记忆、用户自己加的立绘。
 
@@ -523,6 +600,9 @@ def get_state_dir() -> Path:
     放在 data/ 的**上一层**就安全：release 只删 data 子目录。
     """
     override = os.environ.get('GEYI_DATA_DIR', '').strip()
+    if not override and 'unittest' in sys.modules:
+        # 直接 `python -m unittest` 时，包导入早于测试模块设环境变量，这里兜住
+        override = _unittest_state_dir()
     if override:
         # 测试 / 自定义模式：状态和资源合并到同一个目录，保持隔离
         path = Path(override)
@@ -581,16 +661,8 @@ def get_data_dir() -> Path:
 
 
 # ===== 资源目录自愈 =====
-# OlivOS 0.11.81 在这台机器上的 pluginAPI.run_plugin_data_release_by_name 每次加载都会失败：
-# 它先把 ./plugin/data/<ns>/data 建好，再用 shutil.copytree 往这个**已经存在**的目录上复制，
-# 于是抛 FileExistsError(WinError 183) 被上层 except 吞掉——
-# 结果是 data/ 被 rmtree 清空之后**再也没被填回来**（2026-10-30 日志实测：目录里 0 个文件）。
-#
-# 插件一直是「资源目录优先、插件包兜底」，所以功能没哑；但带来了两个坑：
-#   1) 启动日志打印的「角色设定: …/data/role_prompt.txt」指向一个不存在的文件，
-#      照着它去改会白改一场；
-#   2) 想在服务器上热改 role_prompt / 世界书的人，改了没反应也没提示。
-# 这里补上自愈：把插件包 data/ 里缺的（或比目标更新的）文件补进资源目录。
+# 插件宿主可能只创建资源目录而未完成文件复制。同步插件包内缺少或更新的资源，
+# 保持角色提示词和世界书等运行时资源可用。
 _MIRROR_SKIP_SUFFIXES = ('.bak', '.pyc', '.tmp', '.log', '.swp')
 _MIRROR_SKIP_DIRS = {'__pycache__', '.git'}
 _MIRROR_MIN_INTERVAL = 60.0   # 懒同步节流：同一进程内 60 秒最多扫一次

@@ -1,5 +1,5 @@
 {
-  "api_endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+  "api_endpoint": "https://api.example.invalid/v1/chat/completions",
   "api_key": "",
   "fast_model": "deepseek-v4-flash",
   "fast_temperature": 0.7,
@@ -13,7 +13,7 @@
   "galgame_enabled": false,
   "galgame_shadow": true,
   "galgame_owner_exempt": true,
-  "galgame_exempt_ids": ["2332239652"],
+  "galgame_exempt_ids": [],
   "galgame_judge_model": "",
   "affection_provider": "",
   "galgame_judge_min_chars": 4,

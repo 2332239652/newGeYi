@@ -70,30 +70,118 @@ def is_provider_fault(error_code: str) -> bool:
     return True
 
 
+# 各家 usage 里「命中前缀缓存的输入 token」可能出现的位置，按优先级排列。
+# 为什么列这么长：缓存命中率是「省钱改造」唯一的尺子，而厂商连同中转站字段名完全不统一，
+# 漏一个就永远是 0% —— 而 0% 既可能是"没命中"，也可能只是"没读到"，两者该做的是相反的事。
+_CACHE_TOKEN_PATHS = (
+    ('prompt_tokens_details', 'cached_tokens'),      # OpenAI / 智谱 / 多数中转
+    ('input_tokens_details', 'cached_tokens'),       # 新版 OpenAI Responses
+    ('cached_tokens',),                              # 部分中转拍平
+    ('cached_input_tokens',),                        # 另一批中转的写法
+    ('prompt_cache_hit_tokens',),                    # DeepSeek 官方
+    ('cache_read_input_tokens',),                    # Anthropic（读缓存）
+    ('cachedContentTokenCount',),                    # Gemini 原生（驼峰）
+    ('cached_content_token_count',),                 # Gemini 原生（下划线）
+    ('usageMetadata', 'cachedContentTokenCount'),    # Gemini 原生整块透传
+    ('usageMetadata', 'cached_content_token_count'),
+)
+
+
+def _int_at(usage: dict, path: tuple) -> int:
+    """按路径取一个整数；缺失或类型不对都当 0（usage 是厂商自由发挥的重灾区）。"""
+    node = usage
+    for part in path:
+        node = node.get(part) if isinstance(node, dict) else None
+    try:
+        return int(node) if node is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _has_at(usage: dict, path: tuple) -> bool:
+    """这条路径是否**存在字段**（值是 0 也算存在，和"没这个字段"是两件事）。"""
+    node = usage
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node.get(part)
+    return node is not None
+
+
 def cached_tokens_from_usage(usage: dict) -> int:
     """从各家 response.usage 里挖出「命中前缀缓存的输入 token 数」。
 
-    各家字段名互不兼容，而且不少中转站干脆把字段透传丢了：
-    - OpenAI / 智谱：usage.prompt_tokens_details.cached_tokens
-    - DeepSeek：usage.prompt_cache_hit_tokens
-    - Anthropic（含本地 gemini 反代）：usage.cache_read_input_tokens
-    拿不到就当 0。这个数字**只用来算缓存命中率**，不参与任何业务判断。
+    支持 OpenAI/智谱的 details、DeepSeek 的 prompt_cache_hit_tokens、Anthropic 的
+    cache_read_input_tokens，以及 Gemini 原生的 cachedContentTokenCount（见路径表）。
+    拿不到就当 0。这个数字**只用来算缓存命中率与观测**，不参与任何业务判断。
     """
-    try:
-        if not isinstance(usage, dict):
-            return 0
-        details = usage.get('prompt_tokens_details')
-        for value in (
-            details.get('cached_tokens') if isinstance(details, dict) else None,
-            usage.get('cached_tokens'),
-            usage.get('prompt_cache_hit_tokens'),
-            usage.get('cache_read_input_tokens'),
-        ):
-            if value:
-                return int(value)
-    except (TypeError, ValueError):
+    if not isinstance(usage, dict):
         return 0
+    for path in _CACHE_TOKEN_PATHS:
+        value = _int_at(usage, path)
+        if value > 0:
+            return value
     return 0
+
+
+def usage_reports_cache(usage: dict) -> bool:
+    """这份 usage 里是否**出现**了缓存字段（哪怕是显式的 0）。
+
+    用来把「真的没命中」和「渠道压根没透传」分开：界面上两者都是 0，
+    但前者该去调提示词/前缀，后者该去换渠道——不做这个区分，
+    「缓存命中 0%」就永远是一句没有信息量的话。
+    """
+    if not isinstance(usage, dict):
+        return False
+    return any(_has_at(usage, path) for path in _CACHE_TOKEN_PATHS)
+
+
+def response_usage(data: dict) -> dict:
+    """从响应体取 usage：优先 `usage`，退回 Gemini 原生的 `usageMetadata`。"""
+    if not isinstance(data, dict):
+        return {}
+    usage = data.get('usage')
+    if isinstance(usage, dict) and usage:
+        return usage
+    meta = data.get('usageMetadata')
+    if isinstance(meta, dict):
+        return meta
+    return usage if isinstance(usage, dict) else {}
+
+
+def usage_tokens(usage: dict, protocol: str = 'openai') -> tuple[int, int, int]:
+    """把各家 usage 归一成（**总输入** token, 输出 token, 命中缓存 token）。
+
+    归一的关键是「总输入」：命中率的分子是 cached，分母必须是**含缓存的全部输入**，
+    否则这个百分比会撒谎。三套口径线上都真的出现过：
+
+    - Anthropic：`input_tokens` **不含** `cache_read_input_tokens` /
+      `cache_creation_input_tokens`。命中时会出现「输入 43、缓存 5376」这种
+      12500% 的荒谬比例（历史库里有 2 行）。
+    - OpenAI 兼容：`prompt_tokens` 通常**已含**缓存（子集），直接当总量。
+    - 个别中转（实测某个 gemini 反代）：把两者报成**互斥**，`prompt_tokens` 只给未命中的
+      部分，于是 cached > prompt（历史库里有 4 行），既少算 token 又会算出 >100%。
+      判据就是 `cached > prompt`：只有互斥口径才可能这样。
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    cached = cached_tokens_from_usage(usage)
+    if str(protocol or '').strip().lower() == 'anthropic':
+        prompt = _int_at(usage, ('input_tokens',))
+        cache_write = _int_at(usage, ('cache_creation_input_tokens',))
+        output = _int_at(usage, ('output_tokens',))
+        total = prompt + cached + cache_write
+    else:
+        prompt = (_int_at(usage, ('prompt_tokens',))
+                  or _int_at(usage, ('input_tokens',))
+                  or _int_at(usage, ('promptTokenCount',)))
+        output = (_int_at(usage, ('completion_tokens',))
+                  or _int_at(usage, ('output_tokens',))
+                  or _int_at(usage, ('candidatesTokenCount',)))
+        total = prompt + cached if cached > prompt else prompt
+    if total < cached:      # 兜底：命中数不可能超过总输入
+        total = cached
+    return total, output, cached
+
 
 # 仅单渠道兼容模式使用：opencode 网关要求 x-opencode-session 路由头
 _OPCODE_SESSION_ID = uuid.uuid4().hex
@@ -183,7 +271,7 @@ class ProviderState:
     """渠道运行时状态（随调用变化，部分会持久化）。"""
 
     __slots__ = ('name', 'fail_count', 'healthy', 'last_error', 'last_fail_at',
-                 'last_ok_at', 'last_probe_at', 'probe_ok_streak')
+                 'last_ok_at', 'last_probe_at', 'probe_ok_streak', 'cooldown_until')
 
     def __init__(self, name):
         self.name = name
@@ -194,6 +282,10 @@ class ProviderState:
         self.last_ok_at = 0.0
         self.last_probe_at = 0.0
         self.probe_ok_streak = 0
+        # 熔断冷却：判死之后到这一刻之前**不再进入候选队列**（2026-11-12，骰主需求
+        # 「挂了就先移出队列，通了再回来」）。以前只是把不可用渠道排到队尾，
+        # 于是每条消息都要在某几条死渠道上各等 60 秒超时，实测一条回复卡 150 秒。
+        self.cooldown_until = 0.0
 
 
 def build_providers(config: dict) -> list[Provider]:
@@ -274,6 +366,17 @@ class LLMGateway:
         self._hold_name = ''
         self._history: list[dict] = []
         self._last_down_notify = 0.0
+        # 「软降级」（2026-11-12）：全挂后不立刻锁定，先等 retry_before_hold_seconds
+        # 再从锚点重试，仍失败才通知 + 锁定。0 = 没有待重试。
+        self._pending_hold_at = 0.0
+        self._pending_error = ''
+        self._pending_from = ''
+        # 手动切换的代数：后台重试跑到一半时骰主手动切了渠道，就靠它作废这次重试，
+        # 否则「我刚切到官方，13 秒后它又把我锁回中转站」（2026-11-12 现场）
+        self._manual_epoch = 0
+
+        # 上一轮被冷却跳过的渠道名单：只在名单发生变化时打一行日志，免得每条消息都刷
+        self._cooling_note = ''
         self._notify_cb = None
         self._probe_stop = threading.Event()
         self._probe_thread: threading.Thread | None = None
@@ -305,6 +408,30 @@ class LLMGateway:
     def _failover_cfg(self) -> dict:
         value = self.config.get('failover')
         return value if isinstance(value, dict) else {}
+
+    def _cooldown_cfg(self) -> tuple[float, float]:
+        """熔断冷却的 (首次秒数, 上限秒数)。`cooldown_base_seconds = 0` 表示关闭熔断
+        （退回「不可用渠道排到队尾」的老行为）。配置写错一律回默认，绝不让机器人哑掉。"""
+        cfg = self._failover_cfg
+        raw = cfg.get('cooldown_base_seconds', 120)
+        try:
+            base = float(120 if raw is None else raw)
+        except (TypeError, ValueError):
+            base = 120.0
+        if base <= 0:
+            return 0.0, 0.0
+        raw_cap = cfg.get('cooldown_max_seconds', 1800)
+        try:
+            cap = float(1800 if raw_cap is None else raw_cap)
+        except (TypeError, ValueError):
+            cap = 1800.0
+        if cap < base:
+            cap = base
+        return base, cap
+
+    def _last_resort_name(self) -> str:
+        """兜底渠道名（`failover.last_resort_provider`），没配就是空串。"""
+        return str(self._failover_cfg.get('last_resort_provider', 'official-chat') or '').strip()
 
     def set_notify(self, callback) -> None:
         """注入「通知骰主」的回调：callback(text) -> None。"""
@@ -403,6 +530,25 @@ class LLMGateway:
                 provider.name,
             )
 
+        # ===== 熔断冷却（2026-11-12）=====
+        # 判死的渠道**整条移出候选**，不是排到队尾：排到队尾等于每条消息都还要在它身上
+        # 等一次 60 秒超时（实测四个死渠道能把一条回复拖到 150 秒上限）。
+        # 全部都在冷却时挑最早到期的一条硬试，免得「一条都发不出去」。
+        now = time.time()
+        alive = [(p, st) for p, st in pairs if st.healthy or st.cooldown_until <= now]
+        if alive:
+            skipped = [p.name for p, st in pairs if not (st.healthy or st.cooldown_until <= now)]
+            if skipped and self._cooling_note != ','.join(skipped):
+                self._cooling_note = ','.join(skipped)
+                logger.info('本轮跳过冷却中的渠道：%s', '、'.join(skipped))
+            pairs = alive
+        elif pairs:
+            pairs = sorted(pairs, key=lambda x: (x[1].cooldown_until, x[0].priority))[:1]
+            if self._cooling_note != 'all':
+                self._cooling_note = 'all'
+                logger.warning('所有渠道都在熔断冷却中，本轮只硬试最早到期的一条：%s',
+                               pairs[0][0].name)
+
         ordered = sorted(pairs, key=rank)
         preferred = self._preferred_for(kind)
         if preferred:
@@ -420,6 +566,8 @@ class LLMGateway:
         'memory_curate': 'curate_provider',
         'gate': 'gate_provider',
         'affection': 'affection_provider',
+        # 工作记忆的状态纸条（2026-11-10）：机械压缩活，指到便宜渠道
+        'scene': 'scene_provider',
     }
 
     def _preferred_for(self, kind: str) -> str:
@@ -491,6 +639,11 @@ class LLMGateway:
                          f' → 故障只在它以下找备份，恢复只回到这里；「切换渠道 自动」取消')
         else:
             lines.append('手动锚点: 无（按优先级自动恢复，会一路爬回最上面）')
+        pending = self._pending_hold_at
+        if pending:
+            left = max(0, int(pending - time.time()))
+            lines.append(f'⏳ 全挂冷却中：{left} 秒后从锚点重试（重试成功不通知也不锁定；'
+                         f'仍失败才切兜底并通知）')
         for index, (provider, state) in enumerate(pairs, 1):
             marks = ''
             if provider.name == current:
@@ -500,6 +653,8 @@ class LLMGateway:
             if provider.name == hold:
                 marks += ' ⛔ 锁定'
             health = '正常' if state.healthy else f'不可用({state.last_error or "未知"})'
+            if not state.healthy and state.cooldown_until > time.time():
+                health += f'·冷却{max(0, int(state.cooldown_until - time.time()))}s'
             tag = '可选·手动' if provider.manual_only else f'优先级{provider.priority}'
             lines.append(
                 f'{index}. {provider.name} | {provider.model} | {tag} | '
@@ -526,12 +681,15 @@ class LLMGateway:
         with self._lock:
             pairs = list(self._pairs)
             key = str(name_or_index or '').strip()
+            self._manual_epoch += 1      # 任何手动切换都让后台重试作废
 
             if key in ('自动', 'auto', 'AUTO', 'Auto', '自动选择', '取消锚点'):
                 self._anchor_name = ''
                 # 手动操作一律解除「锁定兜底渠道」：骰主回来了就听骰主的
                 was_held = self._hold_name
                 self._hold_name = ''
+                self._pending_hold_at = 0.0      # 手动操作也撤掉「待重试」
+                self._pending_error = ''
                 best = None
                 for provider, state in sorted(pairs, key=lambda x: (x[0].priority, x[0].name)):
                     if provider.manual_only or not state.healthy:
@@ -565,10 +723,13 @@ class LLMGateway:
             self._current_name = target.name
             self._anchor_name = target.name
             self._hold_name = ''        # 手动指定锚点 = 解除兜底锁定
+            self._pending_hold_at = 0.0  # 也撤掉全挂后的待重试
+            self._pending_error = ''
             state = next(st for p, st in pairs if p.name == target.name)
             state.healthy = True
             state.fail_count = 0
             state.last_error = ''
+            state.cooldown_until = 0.0   # 骰主亲手点的渠道，冷却清零：必须真的去试
             self._append_history_locked(old, target.name, 'manual', '锚点')
             self._persist_locked()
             unlock = '\n（已解除「五连挂后锁定兜底渠道」的状态）' if was_held else ''
@@ -652,7 +813,7 @@ class LLMGateway:
             # 已经锁在兜底渠道上还失败：按冷却通知，不做二次降级
             self._notify_all_down(last_error)
         else:
-            self._escalate_to_last_resort(last_error)
+            self._handle_all_down(last_error)
         return ModelResult(
             ok=False,
             model=req.model,
@@ -661,11 +822,143 @@ class LLMGateway:
             error_message=last_message,
         )
 
+    # ==================== 全挂：先软降级，再决定要不要锁 ====================
+    def _handle_all_down(self, error_code: str) -> None:
+        """候选全挂后的第一反应：**先不锁定**。
+
+        2026-11-12 骰主口径：中转/反代渠道本来就爱抖，一次「两轮全挂」常常是十几秒的
+        链路波动——以前这时立刻通知 + 锁定，等于每次抖动都把机器人钉在贵的官方渠道上，
+        得等人手动切回。现在：
+
+        1. 记下 `pending_hold_at = now + retry_before_hold_seconds`（默认 300 秒），
+           期间**不通知、不锁定**；当前渠道先切到兜底那份，保证这几分钟还有话可回；
+        2. 到点由探测线程从锚点开始重试（`retry_pending_once`）；
+        3. 重试成功 → 直接切回去，当成没发生过；
+        4. 重试仍失败 → 才走 `_escalate_to_last_resort`（通知 + 锁定），也就是老行为。
+
+        `retry_before_hold_seconds = 0` 时退回 2026-11-01 的「立刻锁定」。
+        """
+        cfg = self._failover_cfg
+        try:
+            wait = float(cfg.get('retry_before_hold_seconds', 300) or 0)
+        except (TypeError, ValueError):
+            wait = 300.0
+        if wait <= 0:
+            self._escalate_to_last_resort(error_code)
+            return
+        now = time.time()
+        with self._lock:
+            first = not self._pending_hold_at
+            if first:
+                self._pending_hold_at = now + wait
+                self._pending_error = error_code
+                self._pending_from = self._current_name
+                logger.warning('候选渠道全挂（%s）：先不锁定，%d 秒后从锚点重试；'
+                               '期间继续用兜底渠道回话', error_code, int(wait))
+            else:
+                # 冷却期内的再次全挂**不重置**倒计时：否则晚上一直有人聊，
+                # 这个定时器永远到不了点，等于永不重试。
+                logger.info('候选渠道仍然全挂（%s），%d 秒后按原计划重试',
+                            error_code, max(0, int(self._pending_hold_at - now)))
+            self._soft_switch_to_last_resort_locked(error_code)
+            self._persist_locked()
+
+    def _soft_switch_to_last_resort_locked(self, error_code: str) -> None:
+        """切到兜底渠道但**不锁定**（调用方持锁）。
+
+        与 `_escalate_to_last_resort` 的唯一区别就是 `_hold_name` 保持空：
+        下一次调用仍会从兜底渠道开始，但别的渠道也还在候选里，
+        真恢复了自然就切回去了。
+        """
+        name = self._last_resort_name()
+        if not name:
+            return
+        target = next((p for p, _ in self._pairs if p.name == name), None)
+        if target is None or self._current_name == name:
+            return
+        old = self._current_name
+        self._current_name = name
+        state = next(st for p, st in self._pairs if p.name == name)
+        state.healthy = True
+        state.fail_count = 0
+        state.last_error = ''
+        self._append_history_locked(old, name, 'all_down_soft', error_code)
+        logger.warning('已临时切到兜底渠道 %s（未锁定，%s）', name, error_code)
+
+    def pending_retry_at(self) -> float:
+        """全挂后计划重试的时间戳；0 = 没有待重试。"""
+        with self._lock:
+            return self._pending_hold_at
+
+    def _anchor_retry_targets(self) -> list[tuple[Provider, ProviderState]]:
+        """待重试时的候选顺序：锚点排第一，其余按优先级（绝不越过锚点往上）。
+
+        **锚点即使标了 `manual_only` 也要试**：骰主手动切过去的那条本来就可能带这个标记
+        （线上 official-chat 就是 manual_only），把它过滤掉等于「从锚点重试」却一次都不碰锚点。
+        """
+        with self._lock:
+            pairs = list(self._pairs)
+            anchor = self._anchor_name
+            ceiling = self._anchor_priority_locked()
+        auto = [(p, st) for p, st in pairs if (not p.manual_only) or p.name == anchor]
+        if anchor:
+            scoped = [(p, st) for p, st in auto if ceiling is None or p.priority >= ceiling]
+            if scoped:
+                auto = scoped
+        ordered = sorted(auto, key=lambda x: (0 if x[0].name == anchor else 1,
+                                              x[0].priority, x[0].name))
+        if not ordered:
+            ordered = sorted(pairs, key=lambda x: (x[0].priority, x[0].name))
+        return ordered
+
+    def retry_pending_once(self) -> str:
+        """执行一次「全挂后的重试」。返回 'recovered' / 'held' / 'cancelled' / ''。"""
+        with self._lock:
+            if not self._pending_hold_at:
+                return ''
+            epoch = self._manual_epoch
+            self._pending_hold_at = 0.0
+            error = self._pending_error or 'retry'
+            self._pending_error = ''
+        targets = self._anchor_retry_targets()
+        logger.warning('全挂重试：从锚点开始试 %d 个渠道（%s）',
+                       len(targets), '、'.join(p.name for p, _ in targets) or '（无）')
+        for provider, state in targets:
+            with self._lock:
+                if self._manual_epoch != epoch:
+                    # 骰主在这轮探测期间手动切了渠道：他的话比后台判断优先，
+                    # 这次重试作废——**不锁定、不通知**，按新渠道继续跑
+                    logger.info('全挂重试期间骰主手动切换了渠道，放弃本次重试（不锁定、不通知）')
+                    return 'cancelled'
+            if not self._probe_provider(provider):
+                continue
+            with self._lock:
+                if self._manual_epoch != epoch:
+                    logger.info('探测刚通过时骰主手动切换了渠道，按手动选择为准')
+                    return 'cancelled'
+                state.healthy = True
+                state.fail_count = 0
+                state.last_error = ''
+                old = self._current_name
+                self._current_name = provider.name
+                self._pending_from = ''
+                self._append_history_locked(old, provider.name, 'retry_recover',
+                                            '全挂重试成功')
+                self._persist_locked()
+            logger.info('全挂重试成功：已切回 %s（未锁定、未通知骰主）', provider.name)
+            return 'recovered'
+        with self._lock:
+            if self._manual_epoch != epoch:
+                logger.info('全挂重试期间骰主手动切换了渠道，放弃本次重试（不锁定、不通知）')
+                return 'cancelled'
+        logger.warning('全挂重试仍然失败（%s），开始通知骰主并锁定兜底渠道', error)
+        self._escalate_to_last_resort(error)
+        return 'held'
+
     def _escalate_to_last_resort(self, error_code: str) -> None:
         """候选渠道全挂 → 通知骰主 + 切到兜底渠道并锁定（等人手动切回）。
 
-        骰主原话：「五个全测了一轮都挂了就给骰主发一条通知然后切换官方 Deepseek 为锚点
-        不再尝试，直到我手动切回那五个中的一个为锚点」。
+        全挂重试失败后通知并切到兜底渠道，等待操作者手动选择恢复目标。
 
         实现要点：
         - **锁定**（`gw.hold`）而不是普通锚点：官方 DeepSeek 排在最后，普通锚点的
@@ -673,7 +966,7 @@ class LLMGateway:
         - 锁定期间 `probe_once` 不再自动爬回，`_switch_locked` 也不再把渠道切走；
         - 解除只有一条路：骰主「切换渠道 X」或「切换渠道 自动」。
         """
-        name = str(self._failover_cfg.get('last_resort_provider', 'official-chat') or '').strip()
+        name = self._last_resort_name()
         if not name:
             self._notify_all_down(error_code)
             return
@@ -689,7 +982,10 @@ class LLMGateway:
             old = self._current_name
             self._current_name = name
             self._hold_name = name
-            self._anchor_name = ''          # 锁定时锚点无意义，清掉免得多一套限制打架
+            # 2026-11-12：**不再清掉手动锚点**。锁定期间 `_ordered_pairs` 只看 hold，
+            # 锚点本来就无效；清掉只会让骰主解锁后发现「我设的锚点没了」。
+            self._pending_hold_at = 0.0      # 已经真锁了，待重试状态收掉
+            self._pending_error = ''
             state = next(st for p, st in self._pairs if p.name == name)
             state.healthy = True
             state.fail_count = 0
@@ -741,6 +1037,9 @@ class LLMGateway:
                     if resp.status_code == 200:
                         data = resp.json()
                         ok, content, input_tokens, output_tokens, cached_tokens, err_msg = self._parse_response(provider, data)
+                        # 「有没有缓存字段」和「缓存命中多少」是两件事：前者为零时说明渠道没透传，
+                        # 界面要能说清，不然优化提示词前缀会变成对着空气使劲。
+                        cache_reported = usage_reports_cache(response_usage(data))
                         if not ok:
                             last_error = 'empty_content'
                             result = ModelResult(
@@ -748,6 +1047,7 @@ class LLMGateway:
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 cached_tokens=cached_tokens,
+                                cache_reported=cache_reported,
                                 latency_ms=int((time.time() - start) * 1000),
                                 error_code=last_error, error_message=err_msg or '模型没有输出内容',
                             )
@@ -761,6 +1061,7 @@ class LLMGateway:
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             cached_tokens=cached_tokens,
+                            cache_reported=cache_reported,
                             latency_ms=int((time.time() - start) * 1000),
                         )
                         self._record(session_key, kind, result)
@@ -923,6 +1224,10 @@ class LLMGateway:
         return url, body
 
     def _parse_response(self, provider: Provider, data: dict) -> tuple[bool, str, int, int, int, str]:
+        # usage 统一走 usage_tokens：Token 口径（总输入是否含缓存）只在这一处定义，
+        # 三个协议分支不再各算一套，否则命中率的分母迟早又对不上。
+        input_tokens, output_tokens, cached_tokens = usage_tokens(
+            response_usage(data), provider.protocol)
         if provider.protocol == 'anthropic':
             raw_content = data.get('content', [])
             text_parts = []
@@ -944,11 +1249,6 @@ class LLMGateway:
                 logger.debug('渠道 %s [%s] 思考链输出 (len=%d): %s',
                              provider.name, provider.model, len(thinking), thinking[:300])
 
-            usage = data.get('usage') or {}
-            input_tokens = int(usage.get('input_tokens') or 0)
-            output_tokens = int(usage.get('output_tokens') or 0)
-            cached_tokens = cached_tokens_from_usage(usage)
-
             if not text:
                 msg = '思考链耗尽 max_tokens' if (thinking and data.get('stop_reason') == 'max_tokens') else '模型没有输出内容'
                 return False, '', input_tokens, output_tokens, cached_tokens, msg
@@ -960,10 +1260,6 @@ class LLMGateway:
         choices = data.get('choices') or []
         message = (choices[0].get('message') if choices else None) or {}
         content = message.get('content')
-        usage = data.get('usage') or {}
-        input_tokens = int(usage.get('prompt_tokens', 0))
-        output_tokens = int(usage.get('completion_tokens', 0))
-        cached_tokens = cached_tokens_from_usage(usage)
         if not isinstance(content, str) or not content.strip():
             return False, '', input_tokens, output_tokens, cached_tokens, '模型没有输出内容'
         if _UPSTREAM_SAFETY_RE.search(content):
@@ -975,6 +1271,8 @@ class LLMGateway:
         s = getattr(self._local, 'session', None)
         if s is None:
             s = requests.Session()
+            # 宿主系统代理可能指向失效的本地代理；模型 API 需走已验证的直连链路。
+            s.trust_env = False
             s.headers.update({
                 'Content-Type': 'application/json',
                 'User-Agent': 'newGeYi/2.0',
@@ -996,11 +1294,23 @@ class LLMGateway:
     # ==================== 健康状态 ====================
     def _mark_success(self, provider: Provider, state: ProviderState) -> None:
         with self._lock:
-            changed = state.fail_count or not state.healthy
+            changed = state.fail_count or not state.healthy or state.cooldown_until
             state.fail_count = 0
             state.healthy = True
             state.probe_ok_streak = 0
+            state.cooldown_until = 0.0
             state.last_ok_at = time.time()
+            if self._pending_hold_at and provider.name != self._last_resort_name():
+                # 冷却期内真的有调用通了：链路自己恢复了，撤掉「待锁定」
+                self._pending_hold_at = 0.0
+                self._pending_error = ''
+                self._pending_from = ''
+                logger.info('渠道 %s 调用成功，取消全挂待锁定状态', provider.name)
+                changed = True
+            # 兜底渠道自己通了**不算**链路恢复（2026-11-12）：待重试期间我们被软切到兜底
+            # 渠道上，它当然会成功；一旦撤掉定时器，`probe_once` 又因为「当前是 manual_only
+            # 且非锚点」完全不动手，机器人就会安静地一直挂在官方 DeepSeek 上花钱。留着定时
+            # 器，到点照常探测一轮：真恢复就切回自动链路，没恢复才通知骰主并锁定兜底。
             if changed:
                 self._persist_locked()
 
@@ -1025,6 +1335,23 @@ class LLMGateway:
                 state.last_fail_at = time.time()
                 self._persist_locked()
             return
+        # 链路抖动容忍（2026-11-12）：刚成功过的渠道隔几十秒又来一次超时/连不上，
+        # 大概率是这条路抖了一下，不是渠道坏了。中转站和反代的实测就是这个样子
+        # （晚上 40~70 秒的正常响应、偶发 connection reset）。宽限期内先不计数，
+        # 只留一行 INFO；连续抖到宽限期外才照常累计。
+        try:
+            grace = float(self._failover_cfg.get('failure_grace_seconds', 90) or 0)
+        except (TypeError, ValueError):
+            grace = 90.0
+        if (grace > 0 and error_code in ('timeout', 'connection_error')
+                and state.last_ok_at and (time.time() - state.last_ok_at) < grace):
+            logger.info('渠道 %s %.0f 秒前刚成功过，这次 %s 先不计故障',
+                        provider.name, time.time() - state.last_ok_at, error_code)
+            with self._lock:
+                state.last_error = error_code
+                state.last_fail_at = time.time()
+                self._persist_locked()
+            return
         threshold = int(self._failover_cfg.get('fail_threshold', 1) or 1)
         immediate = error_code in ('http_401', 'http_403', 'no_api_key')
         with self._lock:
@@ -1035,6 +1362,20 @@ class LLMGateway:
             if state.healthy and (immediate or state.fail_count >= threshold):
                 state.healthy = False
                 became_unhealthy = True
+            # 冷却到期后被重新召回、结果又失败：重新关起来并翻倍。
+            # （以前只在「首次判死」那一瞬间设冷却，召回后一失败就再也不关，
+            # 死渠道又会跟着每条消息各等一次 60 秒超时。）
+            if not state.healthy and state.cooldown_until <= time.time():
+                base, cap = self._cooldown_cfg()
+                if immediate:
+                    delay = cap          # 401/403/key 缺失不会自己好，直接关满
+                else:
+                    over = max(0, state.fail_count - threshold)
+                    delay = min(cap, base * (2 ** min(over, 6)))
+                if delay > 0:            # 0 = 熔断关闭，保持老行为
+                    state.cooldown_until = time.time() + delay
+                    logger.warning('渠道 %s 判为不可用（%s x%d），移出候选队列 %.0f 秒',
+                                   provider.name, error_code, state.fail_count, delay)
             if became_unhealthy and provider.name == self._current_name:
                 self._switch_locked('auto', f'{error_code} x{state.fail_count}')
             self._persist_locked()
@@ -1121,6 +1462,15 @@ class LLMGateway:
             target=self._probe_loop, name='geyi-probe', daemon=True
         )
         self._probe_thread.start()
+        # 2026-11-12：以前探测线程起来后**一行日志都没有**，出问题时无法判断
+        # 「它到底在跑吗」。这行在 init_after 里打，日志桥已经装好了。
+        cfg = self._failover_cfg
+        logger.info('渠道探测已启动：每 %s 秒一轮，单次超时 %s 秒，失败重试 %s 次，'
+                    '刚成功过 %s 秒内的抖动不计故障',
+                    int(cfg.get('probe_interval_seconds', 900) or 900),
+                    cfg.get('probe_timeout_seconds', 10),
+                    int(cfg.get('probe_retry', 1) or 0),
+                    int(cfg.get('failure_grace_seconds', 90) or 0))
 
     def stop_probe(self) -> None:
         self._probe_stop.set()
@@ -1135,6 +1485,15 @@ class LLMGateway:
         while not self._probe_stop.wait(wait_for):
             wait_for = interval
             try:
+                # 全挂待重试优先：到点就重试，没到点就睡到点（不要等满一个探测周期）
+                pending = self.pending_retry_at()
+                if pending:
+                    remaining = pending - time.time()
+                    if remaining > 0:
+                        wait_for = min(interval, max(5.0, remaining))
+                        continue
+                    self.retry_pending_once()
+                    continue
                 recovered = self.probe_once()
                 if recovered:
                     logger.info('渠道已恢复并切回：%s', ', '.join(recovered))
@@ -1182,10 +1541,13 @@ class LLMGateway:
                 continue  # 可选渠道不参与自动恢复
             if ceiling is not None and provider.priority < ceiling:
                 continue  # 不越过手动锚点
+            if state.cooldown_until > time.time():
+                continue  # 熔断冷却还没到期：到点再召回，不白花探测时间
             targets.append((provider, state))
         targets.sort(key=lambda x: (x[0].priority, x[0].name))
 
         recovered: list[str] = []
+        failed_probes: list[str] = []
         for provider, state in targets:
             # 已经健康、只是当前站在它下面的渠道：直接切回，不用再花钱探测
             if not provider.manual_only and state.healthy:
@@ -1216,10 +1578,17 @@ class LLMGateway:
                     self._persist_locked()
                     recovered.append(provider.name)
                     switched = True
+                elif not ok:
+                    failed_probes.append(provider.name)
             if switched:
                 break
         if recovered:
             self._persist_locked()
+        if failed_probes:
+            # 以前探测失败**一条日志都没有**：看不出「它在跑」还是「它早死了」。
+            # 只在这一轮真的发过请求且没通过时打一行，频率很低（每轮最多一次）。
+            logger.info('探测未通过：%s（下一轮再试；429 视为活着）',
+                        '、'.join(dict.fromkeys(failed_probes)))
 
         # 体检：顺手复位「比当前低、却还挂着不可用标签」的渠道。
         # 不复位的话标志会永远留着——真需要它兜底时会被排到更差的渠道后面，
@@ -1235,6 +1604,7 @@ class LLMGateway:
                     (p, st) for p, st in pairs
                     if not p.manual_only and not st.healthy
                     and p.name != cur_name and p.priority > cur_rank2
+                    and st.cooldown_until <= time.time()   # 冷却中的先不动，到点再查
                 ]
             stale.sort(key=lambda x: ((x[1].last_probe_at or 0), x[0].priority))
             for provider, state in stale[:limit]:
@@ -1245,28 +1615,56 @@ class LLMGateway:
                         state.healthy = True
                         state.fail_count = 0
                         state.last_error = ''
+                        state.cooldown_until = 0.0
                         self._persist_locked()
                         logger.info('渠道 %s 体检通过，已复位为可用', provider.name)
+                    else:
+                        # 查了还是不通：再关一段时间，别每轮都去撞同一堵墙
+                        base, _cap = self._cooldown_cfg()
+                        state.cooldown_until = time.time() + base
+                        self._persist_locked()
         return recovered
 
     def _probe_provider(self, provider: Provider) -> bool:
-        """一次极轻量请求：只为验证渠道是否可达（成本可忽略）。"""
+        """一次极轻量请求：只为验证渠道是否可达（成本可忽略）。
+
+        2026-11-12 增加两条容忍（中转/反代夜里抖动很常见）：
+        - **429 算活着**：被限流说明渠道是通的，只是忙；真要判死交给真实调用去累计；
+        - **连接类抖动重试一次**：单次 reset / 超时不再直接判「未恢复」。
+        """
         url, body = self._build_request_body(provider, ModelRequest(
             model=provider.model,
             messages=[{'role': 'user', 'content': PROBE_PROMPT}],
             max_tokens=1,
         ))
-        timeout = float(self._failover_cfg.get('probe_timeout_seconds', 10) or 10)
+        cfg = self._failover_cfg
+        timeout = float(cfg.get('probe_timeout_seconds', 10) or 10)
         try:
-            resp = self._get_session().post(
-                url,
-                headers=self._headers(provider),
-                json=body,
-                timeout=timeout,
-            )
-            return resp.status_code == 200
-        except Exception:  # noqa: BLE001 - 探测失败即视为未恢复
+            ok_statuses = {int(x) for x in (cfg.get('probe_ok_statuses') or (200, 429))}
+        except (TypeError, ValueError):
+            ok_statuses = {200, 429}
+        try:
+            retries = max(0, int(cfg.get('probe_retry', 1) or 0))
+        except (TypeError, ValueError):
+            retries = 1
+        for attempt in range(retries + 1):
+            try:
+                resp = self._get_session().post(
+                    url,
+                    headers=self._headers(provider),
+                    json=body,
+                    timeout=timeout,
+                )
+            except Exception:  # noqa: BLE001 - 连接类异常：先按抖动重试一次
+                if attempt < retries:
+                    time.sleep(min(2.0, 0.5 * (attempt + 1)))
+                    continue
+                return False
+            if resp.status_code in ok_statuses:
+                return True
+            # 4xx（key 错、模型名错）重试没用；5xx 留给下一轮探测
             return False
+        return False
 
     # ==================== 持久化 ====================
     def _persist_locked(self) -> None:
@@ -1361,6 +1759,7 @@ class LLMGateway:
                 in_tokens=result.input_tokens,
                 out_tokens=result.output_tokens,
                 cached_tokens=result.cached_tokens,
+                cache_reported=result.cache_reported,
                 latency_ms=result.latency_ms,
                 ok=result.ok,
                 error_code=result.error_code,

@@ -105,14 +105,14 @@ class NormalSaveTest(_TempState):
 
 class OwnerIdsTest(unittest.TestCase):
     def test_dirty_owner_ids_do_not_raise(self):
-        cases = [None, 2332239652, '2332239652', [], [None, 2332239652, 'abc'], {'a': 1}]
+        cases = [None, 9000000001, '9000000001', [], [None, 9000000001, 'abc'], {'a': 1}]
         for raw in cases:
             perms = Permissions({'owner_ids': raw}, owner_ids_env='')
             ids = perms._owner_set()             # 以前这里会 TypeError
             self.assertTrue(all(str(x).isdigit() for x in ids))
-        self.assertEqual(Permissions({'owner_ids': 2332239652}, '')._owner_set(), {'2332239652'})
-        self.assertEqual(Permissions({'owner_ids': ['2332239652', 'abc']}, '')._owner_set(),
-                         {'2332239652'})
+        self.assertEqual(Permissions({'owner_ids': 9000000001}, '')._owner_set(), {'9000000001'})
+        self.assertEqual(Permissions({'owner_ids': ['9000000001', 'abc']}, '')._owner_set(),
+                         {'9000000001'})
 
     def test_env_owners_are_merged(self):
         perms = Permissions({'owner_ids': None}, owner_ids_env='111，222')
@@ -140,6 +140,34 @@ class ExampleConfigTest(unittest.TestCase):
         self.assertEqual(self.example.get('api_key', ''), '')
         self.assertEqual(self.example.get('voice_auth_token', ''), '')
         self.assertEqual(self.example.get('voice_onebot_access_token', ''), '')
+
+
+class UnittestIsolationTest(unittest.TestCase):
+    """直接 `python -m unittest` 时，包导入阶段也必须隔离状态目录。
+
+    Python 会先导入父包并初始化运行时，再执行测试模块中的环境变量设置；
+    因此 config 层在 unittest 进程中提供临时目录兜底。
+    """
+
+    def test_import_time_state_dir_is_isolated(self):
+        prev = os.environ.pop('GEYI_DATA_DIR', None)
+        saved = C._UNITTEST_STATE
+        try:
+            C._UNITTEST_STATE = ''       # 模拟"进程刚启动、还没人设过环境变量"
+            path = C.get_state_dir()
+            self.assertIn('geyi_unittest_', str(path))
+            self.assertTrue(str(path).startswith(tempfile.gettempdir()), '必须落在临时目录')
+            self.assertIsNone(os.environ.get('GEYI_DATA_DIR'),
+                              '不能写环境变量：测试模块自己的 setdefault 还要生效')
+        finally:
+            C._UNITTEST_STATE = saved
+            if prev is not None:
+                os.environ['GEYI_DATA_DIR'] = prev
+
+    def test_explicit_env_wins_over_guard(self):
+        """显式给了目录就照用（run_webui_tests.py 与各测试模块都靠这条）。"""
+        self.assertTrue(os.environ.get('GEYI_DATA_DIR'), '本测试进程应当已经指定了隔离目录')
+        self.assertEqual(str(C.get_state_dir()), os.environ['GEYI_DATA_DIR'])
 
 
 if __name__ == '__main__':
