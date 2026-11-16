@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -134,7 +135,8 @@ CREATE TABLE IF NOT EXISTS turns(
     model TEXT DEFAULT '',
     in_tokens INTEGER DEFAULT 0,
     out_tokens INTEGER DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_turns_sk ON turns(session_key, seq);
 
@@ -189,9 +191,51 @@ CREATE TABLE IF NOT EXISTS memory_buffer(
     sender_id TEXT DEFAULT '',
     sender_name TEXT DEFAULT '',
     content TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_mbuf_sk ON memory_buffer(session_key, id);
+
+-- 共同经历与承诺独立于legacy self_memory，不自动迁移旧资料。
+CREATE TABLE IF NOT EXISTS memory_events(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT NOT NULL, space_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    summary TEXT NOT NULL, evidence_type TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '', hook TEXT NOT NULL DEFAULT '', story_time TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mevent_owner ON memory_events(session_key,space_id,user_id,id);
+CREATE TABLE IF NOT EXISTS memory_commitments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT NOT NULL, space_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    promisor TEXT NOT NULL DEFAULT 'assistant', recipient_id TEXT NOT NULL,
+    content TEXT NOT NULL, condition TEXT NOT NULL DEFAULT '', due_text TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL, result TEXT NOT NULL DEFAULT '', event_id INTEGER,
+    supersedes_id INTEGER, superseded_by INTEGER,
+    version INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcommit_owner ON memory_commitments(session_key,space_id,user_id,status,id);
+CREATE TABLE IF NOT EXISTS memory_episode_evidence(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL, entity_id INTEGER NOT NULL, entity_version INTEGER NOT NULL,
+    session_key TEXT NOT NULL, space_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    record_id INTEGER NOT NULL, quote TEXT NOT NULL, content_hash TEXT NOT NULL,
+    role TEXT NOT NULL, recipient_id TEXT NOT NULL, delivery_level TEXT NOT NULL,
+    message_id TEXT NOT NULL, reply_to TEXT NOT NULL, occurred_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mevidence_owner ON memory_episode_evidence(kind,entity_id);
+CREATE TABLE IF NOT EXISTS memory_episode_operations(
+    operation_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL,
+    kind TEXT NOT NULL, entity_id INTEGER NOT NULL,
+    session_key TEXT NOT NULL, user_id TEXT NOT NULL
+);
+-- 墓碑只留身份与自增ID/水位，永久保留，不存被删正文。
+CREATE TABLE IF NOT EXISTS memory_episode_tombstones(
+    kind TEXT NOT NULL, entity_id INTEGER NOT NULL,
+    session_key TEXT NOT NULL, space_id TEXT NOT NULL, user_id TEXT NOT NULL,
+    buffer_id INTEGER NOT NULL, deleted_at INTEGER NOT NULL,
+    PRIMARY KEY(kind,entity_id)
+);
 
 -- L1：群级滚动摘要。只放公共事件，严禁放任何人的个人事实。
 CREATE TABLE IF NOT EXISTS group_summaries(
@@ -456,6 +500,12 @@ class SQLiteStore:
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
         """老库补列：只做加法，绝不删列——升级不能把数据搞丢。"""
+        turn_cols = {row[1] for row in conn.execute('PRAGMA table_info(turns)')}
+        if turn_cols and 'metadata' not in turn_cols:
+            conn.execute("ALTER TABLE turns ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+        buffer_cols = {row[1] for row in conn.execute('PRAGMA table_info(memory_buffer)')}
+        if buffer_cols and 'metadata' not in buffer_cols:
+            conn.execute("ALTER TABLE memory_buffer ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
         cols = {row[1] for row in conn.execute('PRAGMA table_info(api_calls)')}
         if cols and 'cached_tokens' not in cols:
             conn.execute('ALTER TABLE api_calls ADD COLUMN cached_tokens INTEGER DEFAULT 0')
@@ -543,16 +593,21 @@ class SQLiteStore:
         model: str = '',
         in_tokens: int = 0,
         out_tokens: int = 0,
+        metadata=None,
     ) -> int:
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError('turn metadata must be object')
+        encoded = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True, allow_nan=False)
         conn = self._conn()
         row = conn.execute(
             'SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_key=?', (session_key,)
         ).fetchone()
         seq = int(row[0]) + 1
         conn.execute(
-            'INSERT INTO turns(session_key, seq, role, sender_id, sender_name, content, model, in_tokens, out_tokens, created_at) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?)',
-            (session_key, seq, role, sender_id, sender_name, content, model, in_tokens, out_tokens, int(time.time())),
+            'INSERT INTO turns(session_key, seq, role, sender_id, sender_name, content, model, in_tokens, '
+            'out_tokens, created_at, metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            (session_key, seq, role, sender_id, sender_name, content, model, in_tokens, out_tokens,
+             int(time.time()), encoded),
         )
         # 控制单会话总行数，防止无限增长
         conn.execute(
@@ -563,15 +618,19 @@ class SQLiteStore:
 
     def recent_turns(self, session_key: str, limit: int = 12) -> list[dict]:
         rows = self._conn().execute(
-            'SELECT role, sender_id, sender_name, content, created_at FROM turns '
+            'SELECT role, sender_id, sender_name, content, created_at, metadata FROM turns '
             'WHERE session_key=? ORDER BY seq DESC LIMIT ?',
             (session_key, limit),
         ).fetchall()
-        return [
-            {'role': r[0], 'sender_id': r[1], 'sender_name': r[2], 'content': r[3],
-             'created_at': r[4]}
-            for r in reversed(rows)
-        ]
+        out = []
+        for r in reversed(rows):
+            try:
+                metadata = json.loads(r[5] or '{}')
+            except (TypeError, ValueError):
+                metadata = {}
+            out.append({'role': r[0], 'sender_id': r[1], 'sender_name': r[2], 'content': r[3],
+                        'created_at': r[4], 'metadata': metadata if isinstance(metadata, dict) else {}})
+        return out
 
     def clear_turns(self, session_key: str) -> None:
         self._conn().execute('DELETE FROM turns WHERE session_key=?', (session_key,))
@@ -752,23 +811,34 @@ class SQLiteStore:
 
     # ==================== 记忆 L0：原始缓冲 ====================
     def buffer_append(self, session_key: str, role: str, content: str,
-                      sender_id: str = '', sender_name: str = '') -> int:
-        """把一条消息追加进缓冲，等提炼器成批消费（不直接进 prompt）。"""
+                      sender_id: str = '', sender_name: str = '', metadata=None) -> int:
+        """追加原文及接入端冻结的证据属性；旧调用继续写空metadata。"""
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError('buffer metadata must be object')
+        encoded = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True, allow_nan=False)
         cur = self._conn().execute(
-            'INSERT INTO memory_buffer(session_key, role, sender_id, sender_name, content, created_at) '
-            'VALUES(?,?,?,?,?,?)',
-            (session_key, role, sender_id, sender_name, str(content or ''), int(time.time())),
+            'INSERT INTO memory_buffer(session_key, role, sender_id, sender_name, content, created_at, metadata) '
+            'VALUES(?,?,?,?,?,?,?)',
+            (session_key, role, sender_id, sender_name, str(content or ''), int(time.time()), encoded),
         )
         return int(cur.lastrowid or 0)
 
     def buffer_fetch(self, session_key: str, after_id: int = 0, limit: int = 200) -> list[dict]:
         rows = self._conn().execute(
-            'SELECT id, role, sender_id, sender_name, content, created_at FROM memory_buffer '
+            'SELECT id, role, sender_id, sender_name, content, created_at, metadata FROM memory_buffer '
             'WHERE session_key=? AND id>? ORDER BY id LIMIT ?',
             (session_key, int(after_id), int(limit)),
         ).fetchall()
-        return [{'id': r[0], 'role': r[1], 'sender_id': r[2], 'sender_name': r[3],
-                 'content': r[4], 'created_at': r[5]} for r in rows]
+        out = []
+        for r in rows:
+            try:
+                metadata = json.loads(r[6] or '{}')
+            except (TypeError, ValueError):
+                metadata = {}
+            out.append({'id': r[0], 'role': r[1], 'sender_id': r[2], 'sender_name': r[3],
+                        'content': r[4], 'created_at': r[5], 'session_key': str(session_key),
+                        'metadata': metadata if isinstance(metadata, dict) else {}})
+        return out
 
     def buffer_pending(self, session_key: str, after_id: int = 0) -> int:
         row = self._conn().execute(
@@ -1138,7 +1208,68 @@ class SQLiteStore:
             conn.execute('DELETE FROM user_relationship WHERE user_id=?', (uid,))
             conn.execute('DELETE FROM relationship_log WHERE user_id=?', (uid,))
             conn.execute('DELETE FROM settings WHERE key=?', ('rel_mild:' + str(session_key),))
+            for scope in sessions:
+                if scope != 'global':
+                    self.purge_episode_user(scope, uid, high)
             return int(row[0])
+
+    def list_episode_records(self, session_key: str, user_id: str, space_id: str = 'chat',
+                             kind: str = 'event', limit: int = 20) -> list[dict]:
+        """受控只读查询，供prompt preview代理开放；不暴露连接或SQL。"""
+        table = {'event': 'memory_events', 'commitment': 'memory_commitments'}.get(kind)
+        if table is None:
+            raise ValueError('episode kind')
+        if not session_key or session_key == 'global' or not user_id or not space_id:
+            return []
+        cur = self._conn().execute(
+            f'SELECT * FROM {table} WHERE session_key=? AND space_id=? AND user_id=? '
+            'ORDER BY updated_at DESC,id DESC LIMIT ?',
+            (str(session_key), str(space_id), str(user_id), max(0, min(100, int(limit)))))
+        names = [col[0] for col in cur.description]
+        rows = [dict(zip(names, row)) for row in cur.fetchall()]
+        for row in rows:
+            proof = self._conn().execute(
+                'SELECT MIN(occurred_at),MAX(occurred_at) FROM memory_episode_evidence '
+                'WHERE kind=? AND entity_id=? AND record_id>0', (kind, row['id'])).fetchone()
+            row['occurred_at'] = proof[0] or row['created_at']
+            row['last_evidence_at'] = proof[1] or row['updated_at']
+        return rows
+
+    def invalidate_episode_derivatives(self, session_key: str, high: int = 0) -> None:
+        """混合纸条缺少参与者出处，删除/纠正后整体丢弃，从新水位重建。"""
+        conn = self._conn()
+        session = str(session_key)
+        conn.execute('DELETE FROM group_summaries WHERE session_key=?', (session,))
+        conn.execute('DELETE FROM self_memories WHERE session_key=?', (session,))
+        conn.execute('DELETE FROM settings WHERE key IN (?,?)',
+                     ('scene:' + session, 'scene.fail_until:' + session))
+        generation = int(self.get_setting('scene.generation:' + session, '0') or 0)
+        self.set_setting('scene.generation:' + session, generation + 1)
+        previous = int(self.get_setting('episode.derivation_watermark:' + session, '0') or 0)
+        self.set_setting('episode.derivation_watermark:' + session, max(previous, int(high)))
+
+    def purge_episode_user(self, session_key: str, user_id: str, high: int = 0) -> int:
+        """调用者持有事务及遗忘版本；物理删除正文/证据，保留最小墓碑。"""
+        conn = self._conn()
+        count = 0
+        for kind, table in (('event', 'memory_events'), ('commitment', 'memory_commitments')):
+            rows = conn.execute(
+                f'SELECT id,space_id FROM {table} WHERE session_key=? AND user_id=?',
+                (str(session_key), str(user_id))).fetchall()
+            for entity_id, space in rows:
+                conn.execute(
+                    'INSERT OR IGNORE INTO memory_episode_tombstones '
+                    '(kind,entity_id,session_key,space_id,user_id,buffer_id,deleted_at) VALUES(?,?,?,?,?,?,?)',
+                    (kind, entity_id, str(session_key), space, str(user_id), int(high), int(time.time())))
+                conn.execute('DELETE FROM memory_episode_evidence WHERE kind=? AND entity_id=?',
+                             (kind, entity_id))
+            conn.execute(f'DELETE FROM {table} WHERE session_key=? AND user_id=?',
+                         (str(session_key), str(user_id)))
+            count += len(rows)
+        conn.execute('DELETE FROM memory_episode_operations WHERE session_key=? AND user_id=?',
+                     (str(session_key), str(user_id)))
+        self.invalidate_episode_derivatives(session_key, high)
+        return count
 
     def migrate_legacy_memories(self) -> int:
         """把旧 memories 表（user_key = session|u|uid）迁进 user_facts，只做一次。"""
@@ -1356,7 +1487,7 @@ class SQLiteStore:
         而提炼按**消息量**算（每 `memory_curate_messages` 条一次）。
         小群一天几十次提炼，配额瞬间见底。
 
-        合成配额示例（19 人，配额 40）：
+        线上实测（群 957309761，19 人，配额 40）：
 
             09-17   提炼 39 + 被动 6 + 主动 21 = 66   ★ 超配额
             09-18   提炼 33 + 被动 0 + 主动 10 = 43   ★ 超配额

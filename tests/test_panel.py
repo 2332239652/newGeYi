@@ -257,10 +257,44 @@ class PanelTest(unittest.TestCase):
 
     def test_read_actions_do_not_resolve_or_mirror_resources(self):
         before = sorted(str(item.relative_to(self.temp)) for item in self.temp.rglob('*'))
+        before_db = '\n'.join(self.runtime.store._conn().iterdump())
         with patch.object(C, 'get_resource_path', side_effect=AssertionError('resource mirror')):
-            for action in ('overview', 'config_get', 'prompt_get', 'sessions', 'logs'):
+            for action in ('overview', 'config_get', 'prompt_get', 'sessions', 'logs', 'worldbook'):
                 self.assertTrue(self.call(action)['ok'], action)
         self.assertEqual(before, sorted(str(item.relative_to(self.temp)) for item in self.temp.rglob('*')))
+        self.assertEqual(before_db, '\n'.join(self.runtime.store._conn().iterdump()))
+
+    def test_worldbook_browser_returns_normalized_triggers_and_derived_categories(self):
+        self.runtime.worldbook.entries = [{
+            'id': 'private-secret-door', 'keywords': ['密门'], 'weak_keywords': ['暗处'],
+            'excludes': ['公开大厅'], 'links': ['castle'], 'content': '一扇只在私聊提及的门。',
+            'always': False, 'topic': True, 'scope': 'private', 'min_stage': 2,
+            'max_stage': 4, 'priority': 1.5, 'max_chars': 240,
+        }]
+        result = self.call('worldbook')
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['data']['total'], 1)
+        item = result['data']['items'][0]
+        self.assertEqual(item['keywords'], ['密门'])
+        self.assertEqual(item['weak_keywords'], ['暗处'])
+        self.assertEqual(item['excludes'], ['公开大厅'])
+        self.assertEqual(item['links'], ['castle'])
+        self.assertEqual(item['display_categories'], ['主动谈资', '私聊限定', '阶段限定', '关键词触发', '关联条目'])
+        self.assertEqual(item['min_stage'], 2)
+        self.assertEqual(item['max_stage'], 4)
+        self.assertEqual(item['priority'], 1.5)
+        self.assertFalse(result['data']['truncated'])
+
+    def test_worldbook_browser_response_is_bounded(self):
+        self.runtime.worldbook.entries = [
+            {'id': 'entry-%d' % i, 'content': '设定' * 12000, 'keywords': ['词%d' % i]}
+            for i in range(100)
+        ]
+        result = self.call('worldbook')
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['data']['truncated'])
+        self.assertEqual(result['data']['total'], 100)
+        self.assertLess(len(json.dumps(result['data'], ensure_ascii=False).encode('utf-8')), 900000)
 
     def test_sessions_pagination_and_session_get(self):
         self.runtime.store.add_turn(self.key, 'user', 'offline-message')

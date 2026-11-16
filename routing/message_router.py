@@ -105,7 +105,9 @@ class MessageRouter:
         if msg.is_group:
             directed = bool(msg.mentioned_bot or self._trigger_hit(msg.text))
         elif self._private_gate().trigger_only():
-            directed = bool(msg.mentioned_bot or self._private_gate().hit_trigger(msg.text))
+            from ..runtime.private_turns import is_direct_invitation
+            directed = bool(msg.mentioned_bot or self._private_gate().hit_trigger(msg.text)
+                            or is_direct_invitation(msg.text))
         else:
             directed = True
         gate = self._gate() if msg.is_group else None
@@ -150,9 +152,11 @@ class MessageRouter:
         # 被动被关时保持安静，不把「被点名」当成主动搭话的机会
         if directed:
             if passive_allowed:
-                # 私聊再过失控三道闸（触发词已在上面判过：连发间隔 / 连发条数 / 每日限额）。
-                # 闸门只挡"排一次回复"，消息本身照常进记忆缓冲——她知道你在说啥，只是不回。
                 if not msg.is_group:
+                    coordinator = getattr(self.r, 'private_turns', None)
+                    if coordinator is not None:
+                        coordinator.offer(msg)
+                        return
                     allowed, why = self._private_gate().allow(msg)
                     if not allowed:
                         if why.startswith('quota'):
@@ -166,14 +170,13 @@ class MessageRouter:
                                          msg.session.as_text()[-12:])
                         self._debug(msg, directed, passive_allowed, '私聊闸门：' + why)
                         return
-                # 提交失败（队列满）以前是彻底静默的：用户只看到「她不理我」，
-                # 日志里连一行都没有。这里补一条，和 scheduler 里的告警对得上。
+                    if self.r.scheduler.submit(msg, kind='passive'):
+                        self._private_gate().commit(msg.session.as_text())
+                    return
+                # 群聊保持原有即时被动回复流程。
                 if not self.r.scheduler.submit(msg, kind='passive'):
                     logger.warning('被动回复没能进队列（会话积压已满）| %s | %r',
                                    msg.session.as_text()[-16:], (msg.text or '')[:30])
-                elif not msg.is_group:
-                    # 只有真正排进去了才记账（队列满不扣额度）
-                    self._private_gate().commit(msg.session.as_text())
             elif self.r.config.get('route_debug'):
                 logger.info('被点名但本群被动回复已关，保持安静 | %s', msg.session.as_text()[-16:])
             return

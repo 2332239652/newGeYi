@@ -122,6 +122,7 @@ class QuotaHintTest(unittest.TestCase):
         })
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.submitted = []
+        self.rt.private_turns = None  # 本用例直测 QuotaHint 同步路由，不走防抖定时器
         self.rt.scheduler.submit = lambda msg, kind: (self.submitted.append(kind), True)[1]
         self.router = MessageRouter(self.rt)
 

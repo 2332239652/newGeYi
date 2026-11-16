@@ -90,7 +90,13 @@ NUMBER_KEYS = {
     'scene_idle_min_messages': (1, 100, True),
     'scene_max_chars': (100, 5000, True), 'scene_ttl_seconds': (0, 604800, True),
     'scene_tick_seconds': (15, 3600, True), 'scene_max_tokens': (50, 4000, True),
+    'private_companion_debounce_seconds': (0, 30, False),
+    'private_companion_invite_delay_seconds': (0, 30, False),
+    'private_companion_max_wait_seconds': (0, 60, False),
     'scene_retry_seconds': (0, 86400, True),
+}
+ENUM_KEYS = {
+    'private_companion_mode': ('warm', 'natural', 'focused'),
 }
 STRING_KEYS = {'assistant_name': 80, 'active_quiet_hours': 11, 'reply_audit_fallback': 2000,
                'galgame_judge_model': 120, 'affection_provider': 80,
@@ -104,7 +110,7 @@ LIST_KEYS = {'triggers': (50, 80), 'owner_ids': (50, 40), 'ignore_sender_ids': (
 # 难度数组：长度必须是 6（对应阶段 0~5），每项 (最小值, 最大值)；阈值还要求单调不减
 GALGAME_ARRAYS = {'galgame_thresholds': (0, 300), 'galgame_min_days': (0, 365),
                   'galgame_daily_cap': (0, 100)}
-EDITABLE_KEYS = sorted((BOOL_KEYS | set(NUMBER_KEYS) | set(STRING_KEYS) | set(LIST_KEYS)
+EDITABLE_KEYS = sorted((BOOL_KEYS | set(NUMBER_KEYS) | set(ENUM_KEYS) | set(STRING_KEYS) | set(LIST_KEYS)
                         | set(GALGAME_ARRAYS) | {'gate_weights', 'active_tier_probability'}) & set(plugin_config.DEFAULT_CONFIG))
 SECRET_FIELDS = ['api_key', 'voice_auth_token', 'voice_onebot_access_token', 'extra_headers',
                  'providers[].api_key', 'providers[].extra_headers']
@@ -208,6 +214,9 @@ def validate_patch(patch: dict, current: dict) -> dict:
                 raise PanelError('%s 必须是布尔值' % key)
         elif key in NUMBER_KEYS:
             number(value, key, *NUMBER_KEYS[key])
+        elif key in ENUM_KEYS:
+            if not isinstance(value, str) or value not in ENUM_KEYS[key]:
+                raise PanelError('%s 必须是 %s 之一' % (key, ' / '.join(ENUM_KEYS[key])))
         elif key in STRING_KEYS:
             text_value(value, key, STRING_KEYS[key])
             if key in ('active_quiet_hours', 'sleep_window') and value and not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d', value):

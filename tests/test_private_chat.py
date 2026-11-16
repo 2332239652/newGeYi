@@ -24,7 +24,7 @@ os.environ['GEYI_DATA_DIR'] = _SCRATCH
 from newGeYi.models import IncomingMessage, SessionKey  # noqa: E402
 from newGeYi.routing.message_router import MessageRouter  # noqa: E402
 
-BOT = 'bot-test'
+BOT = '53da3460cc454e12667452872284f47d'
 OWNER = '2332239652'
 STRANGER = '1000000002'
 
@@ -114,7 +114,7 @@ class PrivateDirectedTest(unittest.TestCase):
         """群聊的克制口径不能跟着改：没人叫她就不该抢话。"""
         rt = FakeRuntime(active_allow=False)
         router = MessageRouter(rt)
-        router.route(make_msg('今天好热啊', is_group=True, target='123456789'))
+        router.route(make_msg('今天好热啊', is_group=True, target='1013491196'))
         self.assertEqual(rt.scheduler.kinds, [])
 
     def test_private_disabled_stays_silent(self):
@@ -136,18 +136,22 @@ class PrivatePromptTest(unittest.TestCase):
     def test_private_current_message_carries_speaker_label(self):
         msg = make_msg('我是你主人', is_group=False, target=STRANGER)
         messages = self.rt.prompt_builder.build(msg)
+        system = messages[0]['content']
         current = messages[-1]['content']
-        self.assertTrue(current.startswith('Oracle(1000000002)：'), current)
-        self.assertIn('这是私聊', current)
-        self.assertIn('只有你们两个人', current)
+        self.assertEqual(current, 'Oracle(1000000002)：我是你主人')
+        self.assertNotIn('这是私聊', current)
+        self.assertIn('这是私聊', system)
+        self.assertIn('只有你们两个人', system)
 
     def test_group_current_message_has_no_private_note(self):
-        msg = make_msg('歌伊在吗', is_group=True, target='123456789',
+        msg = make_msg('歌伊在吗', is_group=True, target='1013491196',
                        sender_id=OWNER, sender_name='歌靡')
         messages = self.rt.prompt_builder.build(msg)
+        system = messages[0]['content']
         current = messages[-1]['content']
         self.assertTrue(current.startswith('歌靡(2332239652)：'), current)
         self.assertNotIn('这是私聊', current)
+        self.assertNotIn('这是私聊', system)
 
     def test_private_memory_headers_avoid_group_wording(self):
         """记忆块标题不能写「这个群 / 群友」——那是「她以为在群里」的直接来源。"""
@@ -161,7 +165,7 @@ class PrivatePromptTest(unittest.TestCase):
         }
         repo._touch = lambda data: None
         private_block = repo.build_block(make_msg('在吗', is_group=False, target=STRANGER))
-        group_block = repo.build_block(make_msg('在吗', is_group=True, target='123456789'))
+        group_block = repo.build_block(make_msg('在吗', is_group=True, target='1013491196'))
         self.assertIn('你和对方最近聊过什么', private_block)
         self.assertNotIn('这个群最近发生过什么', private_block)
         self.assertIn('【对方的印象卡片', private_block)

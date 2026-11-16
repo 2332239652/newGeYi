@@ -44,7 +44,25 @@ from io import BytesIO
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
-from requests.adapters import HTTPAdapter
+try:
+    from requests.adapters import HTTPAdapter
+except ImportError:  # 裁剪过的宿主（例如离线测试桩）可能没有 adapters 子模块
+    class HTTPAdapter:  # type: ignore[no-redef]
+        """占位基类：只保证模块可导入；真正发请求时按失败处理。"""
+
+        socket_options = ()
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send(self, request, **kwargs):
+            raise RuntimeError('host has no requests.adapters')
+
+        def get_connection(self, *args, **kwargs):
+            raise RuntimeError('host has no requests.adapters')
+
+        def close(self):
+            pass
 try:
     from urllib3.connection import HTTPConnection, HTTPSConnection
     from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool

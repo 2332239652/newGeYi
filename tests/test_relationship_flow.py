@@ -13,6 +13,7 @@ import tempfile
 import time
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 os.environ['GEYI_DATA_DIR'] = tempfile.mkdtemp(prefix='geyi_relpanel_import_')
@@ -72,7 +73,7 @@ class Base(unittest.TestCase):
         self.rt = Runtime()
         self.rt.config.update({'private_enabled': True, 'galgame_enabled': True, 'galgame_shadow': False,
                                'worldbook_enabled': True, 'time_awareness_enabled': False,
-                               'emote_enabled': False, 'voice_enabled': False, 'owner_ids': [OWNER]})
+                               'emote_enabled': False, 'voice_enabled': False})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.uid = str(int(time.time() * 1000) % 10 ** 9 + 300000)
@@ -177,6 +178,28 @@ class EndToEndTest(Base):
         self.assertEqual(gateway.judge_calls, 0)
         self.assertEqual(len(gateway.chat_requests), 1, '主人不做越界审计')
         self.assertEqual(self.svc.recent_log(OWNER), [])
+
+    def test_pre_recorded_private_turn_is_not_counted_as_repeat(self):
+        """生产路径回归：私聊用户轮在到达时就落库，评审不能把它当成复读扣分。
+
+        以前 `process_job` 在落库之后才取历史快照，复读判定拿这句话和它自己比，
+        相似度恒为 1.0 → 每条私聊都记 `spam`，评审模型永远不被调用（好感度只跌不涨）。
+        """
+        text = '歌伊，早安，像这样每天道一声早安，一天心情都会好很多呢'
+        event = FakeEvent()
+        arrival = private_msg(text, self.uid, event)
+        self.rt._remember_user_turn(arrival)          # 模拟 handle_message 的到达即落库
+        msg = replace(arrival, history_pre_recorded=True)
+        gateway = ScriptedGateway(('早安～',), {'delta': 2, 'tag': 'care', 'advance_level': 1,
+                                               'mood': '', 'event_done': False, 'note': ''})
+        self.rt.gateway = self.svc.gateway = gateway
+        self.rt.process_job(msg, 'passive')
+        self.drain()
+        self.assertEqual(gateway.judge_calls, 1, '评审必须真的被调用')
+        row = self.svc.recent_log(self.uid, 1)[0]
+        self.assertEqual(row['tag'], 'care')
+        self.assertGreater(row['delta_applied'], 0)
+        self.assertEqual(self.svc.load(self.uid).bad_streak, 0)
 
     def test_group_message_never_touches_relationship(self):
         gateway = ScriptedGateway(['嗯～'], {'delta': 2, 'tag': 'care', 'advance_level': 1, 'mood': '',

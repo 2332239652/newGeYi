@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from newGeYi import config as C
+from newGeYi.models import IncomingMessage, SessionKey
 from newGeYi.panel import Panel
 from newGeYi.runtime.app import Runtime
 
@@ -47,7 +48,12 @@ class ConfigReviewTest(unittest.TestCase):
 
     def test_process_job_preserves_gateway_snapshot(self):
         self.runtime.is_resting = lambda session: True
-        message = types.SimpleNamespace(is_group=True, session=types.SimpleNamespace(as_text=lambda: 'fixture'))
+        message = IncomingMessage(
+            session=SessionKey('fixture', 'qq', 'onebot', 'group', '', '1'),
+            message_id='fixture-message', sender_id='fixture-user', sender_name='fixture',
+            text='fixture', raw_text='fixture', is_group=True, mentioned_bot=True,
+            event=types.SimpleNamespace(), proc=None,
+        )
         self.runtime.process_job(message, 'passive')
         self.assertIsNot(self.runtime.gateway.config, self.runtime.config)
 
@@ -55,7 +61,7 @@ class ConfigReviewTest(unittest.TestCase):
         before = copy.deepcopy(self.runtime.config)
         path = C.get_config_path()
         self.assertEqual(path.name, 'config.json')
-        self.assertTrue(str(path.resolve()).startswith(str(self.temp.name)))
+        self.assertTrue(str(path.resolve()).startswith(os.path.realpath(self.temp.name)))
         path.unlink()
         self.assertTrue(self.runtime.reload_config())
         self.assertEqual(self.runtime.config, before)

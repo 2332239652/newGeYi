@@ -13,6 +13,15 @@ os.environ.setdefault('GEYI_DATA_DIR', tempfile.mkdtemp(prefix='geyi_batch2_imag
 import requests
 from newGeYi.context.images import ImageContext, _ImageSession, _PinnedAdapter, host_is_local
 
+try:  # 裸 Python（离线测试桩）没有真实 requests/urllib3 时，跳过传输层回归。
+    import urllib3  # noqa: F401
+    from requests.adapters import BaseAdapter  # noqa: F401
+    REAL_TRANSPORT = True
+except Exception:  # pragma: no cover - 取决于宿主解释器
+    REAL_TRANSPORT = False
+
+requires_transport = unittest.skipUnless(REAL_TRANSPORT, '需要真实 requests + urllib3 传输栈')
+
 # 有效 1x1 PNG；所有传输和 DNS 均为受控 fixture。
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=')
 URL = 'https://images.example.test/a.png'
@@ -239,6 +248,7 @@ class PinnedTransportTest(unittest.TestCase):
         with patch('newGeYi.context.images._PinnedAdapter', side_effect=AssertionError('adapter')):
             self.assertEqual(ctx._fetch(URL), (b'', ''))
 
+    @requires_transport
     def test_socket_uses_validated_address_without_second_dns(self):
         address = (socket.AF_INET, socket.SOCK_STREAM, 6, ('93.184.216.34', 8443))
         adapter = _PinnedAdapter('https', 'images.example.test', 8443, address,
@@ -262,6 +272,7 @@ class PinnedTransportTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             adapter.send(request, proxies={'https': 'http://proxy'})
 
+    @requires_transport
     def test_tls_connect_passes_original_sni_hostname_and_verification(self):
         import ssl
         address = (socket.AF_INET, socket.SOCK_STREAM, 6, ('93.184.216.34', 443))
@@ -303,6 +314,7 @@ class PinnedTransportTest(unittest.TestCase):
             with self.assertRaises(ssl.SSLCertVerificationError):
                 conn.connect()
 
+    @requires_transport
     def test_requests_disabled_redirect_does_not_read_body(self):
         class Adapter(requests.adapters.BaseAdapter):
             def send(self, request, **kwargs):
@@ -325,6 +337,7 @@ class PinnedTransportTest(unittest.TestCase):
         self.assertFalse(response._content_consumed)
         response.close()
 
+    @requires_transport
     def test_deadline_watchdog_closes_pinned_socket(self):
         address = (socket.AF_INET, socket.SOCK_STREAM, 6, ('93.184.216.34', 80))
         adapter = _PinnedAdapter('http', 'images.example.test', 80, address,
@@ -339,6 +352,7 @@ class PinnedTransportTest(unittest.TestCase):
         self.assertTrue(closed.wait(0.3))
         fake.shutdown.assert_called_with(socket.SHUT_RDWR)
 
+    @requires_transport
     def test_session_disables_proxy_env_and_preserves_host_port(self):
         target = ('https', 'images.example.test', 8443,
                   (socket.AF_INET, socket.SOCK_STREAM, 6, ('93.184.216.34', 8443)))

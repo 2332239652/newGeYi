@@ -239,8 +239,11 @@ class ObserverIdentityTest(unittest.TestCase):
         runtime._self_sent_lock = threading.Lock()
         runtime._inflight_self_sent = Counter()
         runtime._recent_self_sent = deque()
-        runtime.store = SimpleNamespace(add_turn=lambda *args: None)
-        runtime.live_context = SimpleNamespace(append_assistant=lambda *args: None)
+        runtime.store = SimpleNamespace(
+            add_turn=lambda *args, **kwargs: None,
+            get_setting=lambda key, default=None: default,
+        )
+        runtime.live_context = SimpleNamespace(append_assistant=lambda *args, **kwargs: None)
         runtime._next_arrival_seq = lambda: 1
         for session in sessions() + [replace(SESSION, session_type='private')]:
             msg = replace(message(session=session), is_group=session.session_type == 'group',

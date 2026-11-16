@@ -37,6 +37,14 @@ class IncomingMessage:
     arrival_seq: int = 0
     # 发送者是否为机器人/其他插件账号（防「机器人互相引用」的刷屏循环）
     sender_is_bot: bool = False
+    # 命令处理后冻结空间及代际，排队和模型返回时据此拦截过期任务。
+    memory_space_id: str = ''
+    space_generation: int = 0
+    # 对应的用户 L0 证据；0 表示本条消息没有进入记忆缓冲。
+    memory_record_id: int = 0
+    # 私聊防抖已把原始用户轮写入 turns；process_job 不再重复添加合并文本。
+    history_pre_recorded: bool = False
+    coalesced_messages: tuple = ()
 
 
 @dataclass(frozen=True)

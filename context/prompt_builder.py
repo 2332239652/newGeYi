@@ -26,6 +26,7 @@ from datetime import datetime
 from ..config import SKIP_ACTIVE
 from ..context.live_context import LiveContextStore
 from ..memory.repository import MemoryRepository
+from ..memory.spaces import current_space
 from . import aliases
 from . import scene as scene_brief
 from ..memory.worldbook import WorldbookService, is_story_mode
@@ -324,6 +325,14 @@ class PromptBuilder:
         except Exception:  # noqa: BLE001
             return None
 
+    def _space_id(self, msg: IncomingMessage) -> str:
+        return getattr(msg, 'memory_space_id', '') or current_space(self.store, msg.session.as_text())
+
+    def _space_history(self, rows: list[dict], msg: IncomingMessage) -> list[dict]:
+        space_id = self._space_id(msg)
+        return [row for row in rows
+                if (row.get('metadata') or {}).get('space_id', 'chat') == space_id]
+
     def _recent_texts(self, msg: IncomingMessage, limit: int = 5) -> list[str]:
         """最近几条对话的文本，给世界书检索当辅助查询。
 
@@ -334,7 +343,9 @@ class PromptBuilder:
         if not msg.is_group:
             # 私聊：前文在 turns 里（当前这句已经先落库，去掉它）
             try:
-                rows = self.store.recent_turns(msg.session.as_text(), limit=limit * 2 + 2)
+                rows = self._space_history(
+                    self.store.recent_turns(msg.session.as_text(), limit=max(100, limit * 2 + 2)), msg,
+                )[-(limit * 2 + 2):]
             except Exception:  # noqa: BLE001
                 return []
             if rows and rows[-1].get('role') == 'user' and str(rows[-1].get('content') or '').strip() == str(msg.text or '').strip():
@@ -360,6 +371,7 @@ class PromptBuilder:
                 window_seconds=int(self.config.get('group_live_window_seconds', 1800)),
                 max_messages=limit + 3,
                 max_chars=1500,
+                space_id=self._space_id(msg),
             )
         except Exception:  # noqa: BLE001 - 检索辅助拿不到就算了
             return []
@@ -450,7 +462,9 @@ class PromptBuilder:
             # 它只该写人物关系级别的摘要，详细设定仍然走检索。
             wb_stage = self._relation_stage(msg)
             wb_scope = 'group' if msg.is_group else 'private'
-            story_on = is_story_mode(self.store, msg.session.as_text(), getattr(msg, 'sender_id', ''))
+            frozen_space = getattr(msg, 'memory_space_id', '')
+            story_on = (frozen_space != 'chat' if frozen_space else
+                        is_story_mode(self.store, msg.session.as_text(), getattr(msg, 'sender_id', '')))
             wb_limit = (int(cfg.get('worldbook_story_max_entries', 6))
                         if story_on else int(cfg.get('worldbook_max_entries', 3)))
             recent_limit = 8 if story_on else 5
@@ -495,7 +509,8 @@ class PromptBuilder:
         # 放在记忆之后、资料之前：它比长期事实更"当下"，但绝不能压过角色与关系。
         # 过期就不注入（scene.to_prompt 内部判 TTL），坏数据只当没有。
         try:
-            brief_block = scene_brief.to_prompt(self.store, msg.session.as_text(), cfg)
+            brief_block = scene_brief.to_prompt(self.store, msg.session.as_text(), cfg,
+                                                space_id=self._space_id(msg))
         except Exception:  # noqa: BLE001 - 纸条坏了不能影响出话
             brief_block = ''
         if brief_block:
@@ -524,6 +539,13 @@ class PromptBuilder:
         # 确实注入了资料才加反幻觉条款（没资料时它就是废话，省掉这点 token）
         if len(system_parts) > material_start:
             system_parts.append(ANTI_HALLUCINATION_CLAUSE)
+
+        # 私聊场景说明放 system，不附在 user 正文末尾：
+        # 附在 user 正文后会让模型以为是对方每句话自己打的括号说明（2026-11-15 线上穿帮）。
+        if not msg.is_group:
+            system_parts.append(
+                '【对话场景】\n这是私聊：只有你们两个人，群里其他人看不到这段对话。'
+            )
 
         # 时间感知放最后：越靠近对话，对当前这条回复的影响越强
         if cfg.get('time_awareness_enabled', True):
@@ -587,9 +609,12 @@ class PromptBuilder:
                 window_seconds=int(cfg.get('group_live_window_seconds', 1800)),
                 max_messages=int(cfg.get('group_live_max_messages', 60)),
                 max_chars=int(cfg.get('group_live_max_chars', 16000)),
+                space_id=self._space_id(msg),
             )
         else:
-            history = self.store.recent_turns(msg.session.as_text(), limit=max_turns)
+            history = self._space_history(
+                self.store.recent_turns(msg.session.as_text(), limit=max(100, max_turns)), msg,
+            )[-max_turns:] if max_turns > 0 else []
             # 私聊的当前消息在这之前已经落库（防早退丢话），这里要摘掉，否则一句变两遍
             history = self._drop_echoed_current(history, msg)
         max_chars = int(cfg.get('max_context_chars', 32000))
@@ -643,10 +668,10 @@ class PromptBuilder:
             current = f'{speaker}：{current}'
         else:
             # 私聊也必须带「昵称(QQ号)」：
-            # ① 少了它，【主人】那条「只有某个 QQ 号是主人」的规则**根本无从判定**，
-            #    陌生人私聊说「我是你主人」就成了盲区；
-            # ② 少了场景说明，她会在私聊里说「这里是群诶，大家都看见了」（2026-11-01 线上真发生）。
-            current = f'{speaker}：{current}\n（这是私聊：只有你们两个人，群里其他人看不到这段对话）'
+            # 少了它，【主人】那条「只有某个 QQ 号是主人」的规则**根本无从判定**，
+            # 陌生人私聊说「我是你主人」就成了盲区；
+            # 「这是私聊」的场景说明已放在 system 的【对话场景】中，不再附进 user 正文。
+            current = f'{speaker}：{current}'
 
         if is_voice_req:
             current += '\n（对方想听你的声音/希望你发语音，请在本轮回复末尾附带 [VOICE:情绪|简短日文] 伴生语音）'

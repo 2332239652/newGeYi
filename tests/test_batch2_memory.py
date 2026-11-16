@@ -41,8 +41,9 @@ class Batch2MemoryTest(unittest.TestCase):
         self.store = SQLiteStore(self.path)
         self.session = 'bot:qq:onebot:group:-:100'
         self.gateway = ControlledGateway()
+        # 本组专门回归旧schema的事务与分片；新episode开启路径见test_episode_curator。
         self.config = {'memory_curate_known_facts': 5, 'memory_cross_group_enabled': False,
-                       'memory_buffer_retention_seconds': 7200,
+                       'memory_episodes_enabled': False, 'memory_buffer_retention_seconds': 7200,
                        'memory_fuzzy_dedup_threshold': 1.0}
         self.curator = MemoryCurator(self.config, self.store, self.gateway)
 

@@ -15,6 +15,7 @@ from ..config import SKIP_ACTIVE
 from ..context import aliases
 from ..memory.exporter import export_memory
 from ..memory.repository import SHARE_OVERRIDE_PREFIX
+from ..memory.spaces import current_space, ensure_space, list_stories, new_story, pause_story, resume_story
 from ..memory.worldbook import is_story_mode, list_story_mode_users, set_story_mode
 from ..models import IncomingMessage
 from ..presentation.renderer import load_emote_table  # noqa: F401  （保留导出）
@@ -121,6 +122,8 @@ class CommandRouter:
             '',
             '[状态] 歌伊状态 | 今日用量',
             '[对话] 我的记忆 / 查看记忆 | 删除记忆 <序号> | 忘了我',
+            '[共同记忆] 共同经历 | 我的约定 | 删除经历/约定 ID | 纠正经历/约定 ID 内容 | 完成/取消约定 ID',
+            '[篇章] 剧情篇章 | 新建剧情 名称 | 续接剧情 编号 | 重开剧情 名称',
             '[称呼] 叫我 <名字> | 我的称呼',
             '[私聊] 关系（看看她现在怎么看你） | 今日额度 | 群聊记忆开/关（私聊里要不要带上群里的事）',
             '[世界书] 世界书状态 | 剧情模式 | 剧情模式开/关（探索歌伊的世界与故事）',
@@ -728,6 +731,74 @@ class CommandRouter:
             return f'✅ 已为你删除第 {idx} 条记忆：「{fact_text}」'
         return '删除失败，该条记忆可能已被删除。请发送「我的记忆」刷新查看～'
 
+    @staticmethod
+    def _plain_command_text(value) -> str:
+        """命令回执直接走 Runtime.reply：先打断 CQ/OP 码和实体编码。"""
+        return str(value or '').replace('&', '&amp;').replace('[', '&#91;').replace(']', '&#93;')
+
+    def _episode_memory(self):
+        # 延迟导入，模块关闭时不影响既有命令加载。
+        from ..memory.episodes import EpisodeMemory
+        return EpisodeMemory(self.r.store, self.r.config)
+
+    def _cmd_episode_list(self, msg: IncomingMessage, kind: str) -> str:
+        session_key = msg.session.as_text()
+        space_id = ensure_space(self.r.store, session_key,
+                                is_story_mode(self.r.store, session_key, msg.sender_id))
+        uid = str(msg.sender_id or '').strip()
+        if not uid:
+            return '未获取到你的账号信息。'
+        rows = self._episode_memory().list_for_user(session_key, uid, space_id=space_id, kind=kind, limit=10)
+        items = rows['events' if kind == 'event' else 'commitments']
+        label = '共同经历' if kind == 'event' else '我的约定'
+        if not items:
+            return f'【{label}】当前会话和篇章暂无记录。'
+        lines = [f'【{label} · 当前会话/篇章 · 仅本人】']
+        states = {'proposed': '待确认', 'open': '未完成', 'fulfilled': '已完成',
+                  'cancelled': '已取消', 'superseded': '已替代'}
+        for row in items:
+            content = row.get('summary' if kind == 'event' else 'content', '')
+            state = '' if kind == 'event' else '（%s）' % states.get(row.get('status'), '待确认')
+            lines.append('%s%s：%s' % (row['id'], state, self._plain_command_text(str(content)[:240])))
+        noun = '经历' if kind == 'event' else '约定'
+        lines.append(f'管理：删除{noun} ID / 纠正{noun} ID 内容'
+                     + (' / 完成约定 ID / 取消约定 ID' if kind == 'commitment' else ''))
+        return '\n'.join(lines)
+
+    def _cmd_episode_change(self, msg: IncomingMessage, action: str, kind: str, arg: str) -> str:
+        """只接显式命令；归属/空间/version 在核心事务中校验，失败统一回执。"""
+        parts = str(arg or '').strip().split(maxsplit=1)
+        noun = '经历' if kind == 'event' else '约定'
+        usage = f'格式：{action}{noun} ID' + (' 内容' if action == '纠正' else '')
+        if (not parts or not parts[0].isdecimal() or len(parts[0]) > 18
+                or int(parts[0]) < 1 or (action == '纠正' and len(parts) != 2)
+                or (action != '纠正' and len(parts) != 1)):
+            return usage
+        session_key = msg.session.as_text()
+        uid = str(msg.sender_id or '').strip()
+        space_id = ensure_space(self.r.store, session_key,
+                                is_story_mode(self.r.store, session_key, uid))
+        if not uid:
+            return '未获取到你的账号信息。'
+        memory = self._episode_memory()
+        entity_id = int(parts[0])
+        try:
+            if action == '删除':
+                ok = memory.delete_for_user(session_key, uid, kind, entity_id, space_id=space_id)
+            elif action == '纠正':
+                text = parts[1].strip()
+                if not text or len(text) > 400:
+                    return usage + '（内容限 1～400 字）'
+                ok = memory.correct_for_user(session_key, uid, kind, entity_id, text, space_id=space_id)
+            else:
+                status = 'fulfilled' if action == '完成' else 'cancelled'
+                ok = memory.set_status_for_user(session_key, uid, kind, entity_id, status, space_id=space_id)
+        except ValueError:
+            ok = False
+        if not ok:
+            return '当前会话和篇章中没有可操作的本人记录，或记录状态已改变。'
+        return f'✅ 已{action}该{noun}。'
+
     def _cmd_forget_me(self, msg: IncomingMessage, force_confirm: bool = False) -> str:
         uid = str(msg.sender_id)
         session_key = msg.session.as_text()
@@ -920,8 +991,13 @@ class CommandRouter:
         story_on = is_story_mode(self.r.store, msg.session.as_text(), msg.sender_id)
         normal_n = int(self.r.config.get('worldbook_max_entries', 3))
         story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
+        space_id = ensure_space(self.r.store, msg.session.as_text(), story_on)
+        chapter = next((row['title'] for row in list_stories(self.r.store, msg.session.as_text())
+                        if row['space_id'] == space_id), '日常聊天')
         state_text = '开启' if story_on else '关闭（日常模式）'
         lines = [
+            '· 当前记忆空间：' + self._plain_command_text(chapter),
+            '· 篇章操作：剧情篇章 / 新建剧情 名称 / 续接剧情 编号 / 重开剧情 名称。',
             f'【剧情探索模式】当前状态：{state_text}',
             f'· 效果：与歌伊对话时，世界书设定注入上限由 {normal_n} 条提升至 {story_n} 条，'
             '自动展开关联设定簇，她也会多聊一些细节与见闻。',
@@ -936,16 +1012,46 @@ class CommandRouter:
         return '\n'.join(lines)
 
     def _cmd_story_mode_toggle(self, msg: IncomingMessage, enabled: bool) -> str:
-        set_story_mode(self.r.store, msg.session.as_text(), msg.sender_id, enabled)
-        story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
-        normal_n = int(self.r.config.get('worldbook_max_entries', 3))
+        session_key = msg.session.as_text()
+        with self.r.store.transaction():
+            if enabled:
+                if current_space(self.r.store, session_key) == 'chat':
+                    new_story(self.r.store, session_key)
+            else:
+                pause_story(self.r.store, session_key)
+            set_story_mode(self.r.store, session_key, msg.sender_id, enabled)
         if enabled:
-            return (
-                f'📖 已为你开启「剧情探索模式」（单轮世界书注入上限提升至 {story_n} 条，开启关联设定展开）！\n'
-                '现在你可以向歌伊打听「清泉镇」「教会日常」「麦穗面包坊」「猎人公会」「治愈粒子」「天灾传说」或她身边的朋友啦～\n'
-                '（发「剧情模式」可查看话题线索，发「剧情模式关」随时退回日常模式）'
-            )
-        return f'✅ 已切回日常聊天模式（世界书按默认最多 {normal_n} 条精简注入）。'
+            return ('📖 已开启剧情模式，当前篇章独立保存经历和约定。\n'
+                    '「剧情模式关」暂停；「续接剧情 [编号]」恢复原篇章；「重开剧情 [名称]」另开篇章。')
+        return '✅ 已切回日常聊天，原剧情已暂停。发「续接剧情」可恢复。'
+
+    def _cmd_story_chapters(self, msg: IncomingMessage) -> str:
+        rows = list_stories(self.r.store, msg.session.as_text())
+        if not rows:
+            return '当前会话暂无篇章。发「新建剧情 名称」开始。'
+        active = current_space(self.r.store, msg.session.as_text())
+        lines = ['【当前会话的剧情篇章】']
+        for idx, row in enumerate(rows, 1):
+            suffix = '（当前）' if row['space_id'] == active else ''
+            lines.append(f'{idx}. {self._plain_command_text(row.get("title"))}{suffix}')
+        lines.append('续接剧情 编号 / 新建剧情 名称 / 重开剧情 名称 / 剧情模式关')
+        return '\n'.join(lines)
+
+    def _cmd_story_open(self, msg: IncomingMessage, selector: str = '', resume: bool = False) -> str:
+        session_key = msg.session.as_text()
+        try:
+            with self.r.store.transaction():
+                if resume:
+                    space_id = resume_story(self.r.store, session_key, selector)
+                else:
+                    space_id = new_story(self.r.store, session_key, selector)
+                set_story_mode(self.r.store, session_key, msg.sender_id, True)
+        except ValueError:
+            return '请选择当前会话的篇章编号。\n' + self._cmd_story_chapters(msg)
+        title = next((row['title'] for row in list_stories(self.r.store, session_key)
+                      if row['space_id'] == space_id), '剧情')
+        verb = '续接' if resume else '新开'
+        return f'📖 已{verb}「{self._plain_command_text(title)}」。经历和约定按当前篇章保存。'
 
     def _cmd_story_mode_list(self, msg: IncomingMessage) -> str:
         users = list_story_mode_users(self.r.store)
@@ -954,7 +1060,7 @@ class CommandRouter:
         lines = [f'【剧情探索模式 · 已开启用户（共 {len(users)} 人）】']
         for uid in users[:40]:
             alias = aliases.get(self.r.store, uid)
-            suffix = f'（{alias}）' if alias else ''
+            suffix = f'（{self._plain_command_text(alias)}）' if alias else ''
             lines.append(f'  · {uid}{suffix}')
         if len(users) > 40:
             lines.append(f'  ……还有 {len(users) - 40} 人')
@@ -964,18 +1070,24 @@ class CommandRouter:
         target = str(arg or '').strip()
         users = list_story_mode_users(self.r.store)
         if target in ('', '全部', 'all', 'ALL'):
-            for uid in users:
-                set_story_mode(self.r.store, '', uid, None)
-            for key, _ in self.r.store.settings_with_prefix('story_mode:'):
-                self.r.store.set_setting(key, '')
-            return f'✅ 已重置全部 {len(users)} 位用户的剧情模式（均回到日常模式）'
+            with self.r.store.transaction():
+                for uid in users:
+                    set_story_mode(self.r.store, '', uid, None)
+                for key, _ in self.r.store.settings_with_prefix('story_mode:'):
+                    self.r.store.set_setting(key, '')
+                # 当前会话空间是共享边界；主控重置时一并暂停，不删除原始聊天。
+                pause_story(self.r.store, msg.session.as_text())
+            return f'✅ 已重置全部 {len(users)} 位用户的剧情模式（当前会话回到日常模式）'
         if not target.isdigit():
             return '格式：剧情模式重置 <QQ号>，或「剧情模式重置 全部」'
-        set_story_mode(self.r.store, '', target, None)
-        for key, _ in self.r.store.settings_with_prefix('story_mode:'):
-            if key.rsplit(':', 1)[-1] == target:
-                self.r.store.set_setting(key, '')
-        return f'✅ 已重置 QQ {target} 的剧情模式（回到日常模式）'
+        with self.r.store.transaction():
+            set_story_mode(self.r.store, '', target, None)
+            for key, _ in self.r.store.settings_with_prefix('story_mode:'):
+                if key.rsplit(':', 1)[-1] == target:
+                    self.r.store.set_setting(key, '')
+                    pause_story(self.r.store, key[len('story_mode:'):])
+            pause_story(self.r.store, msg.session.as_text())
+        return f'✅ 已重置 QQ {target} 的剧情模式（当前会话回到日常模式）'
 
     # ------------- 私聊关系（galgame）-------------
     def _cmd_relation(self, msg: IncomingMessage) -> str:
@@ -1027,8 +1139,18 @@ class CommandRouter:
         return '✅ 已开启私聊' if on else '🔕 已关闭私聊'
 
     def _cmd_reset_context(self, msg: IncomingMessage) -> str:
-        self.r.store.clear_turns(msg.session.as_text())
-        return '✅ 已重置当前会话上下文'
+        key = msg.session.as_text()
+        self.r.store.clear_turns(key)
+        live = getattr(self.r, 'live_context', None)
+        if live is not None and hasattr(live, 'clear_session'):
+            live.clear_session(key)
+        images = getattr(self.r, 'images', None)
+        if images is not None and hasattr(images, 'clear_session'):
+            images.clear_session(key)
+        turns = getattr(self.r, 'private_turns', None)
+        if turns is not None and hasattr(turns, 'clear_session'):
+            turns.clear_session(key)
+        return '✅ 已清空当前会话上下文（不影响已保存的长期记忆）'
 
     @plugin_config.config_locked
     def _cmd_reload(self, msg: IncomingMessage) -> str:
@@ -1325,6 +1447,39 @@ class CommandRouter:
             self.r.reply(msg, deny)
             return True
 
+        # 私聊陪伴节奏由会话参与者控制，不影响其它私聊或群聊。
+        if text in ('清空上下文', '清除上下文'):
+            if msg.is_group and not (is_master or p.is_group_admin(msg)):
+                self.r.reply(msg, '群聊里只有群管或骰主才能清空上下文哦～')
+                return True
+            self.r.reply(msg, self._cmd_reset_context(msg))
+            return True
+        if not msg.is_group and text in ('暂时安静', '恢复陪聊', '陪聊状态'):
+            key = msg.session.as_text()
+            quiet_key = 'private_companion:quiet:' + key
+            if text == '暂时安静':
+                self.r.store.set_setting(quiet_key, '1')
+                self.r.reply(msg, '好，我先安静陪着你。发「恢复陪聊」我再接话。')
+            elif text == '恢复陪聊':
+                self.r.store.set_setting(quiet_key, '')
+                self.r.reply(msg, '好，我回来啦。')
+            else:
+                quiet = str(self.r.store.get_setting(quiet_key) or '') == '1'
+                mode = str(self.r.store.get_setting('private_companion:mode:' + key)
+                           or self.r.config.get('private_companion_mode', 'natural'))
+                self.r.reply(msg, f'当前状态：{"安静" if quiet else "陪聊中"}；模式：{mode}。')
+            return True
+        if not msg.is_group and text.startswith('陪聊模式 '):
+            mode = text[len('陪聊模式 '):].strip()
+            aliases = {'热情': 'warm', '自然': 'natural', '专注': 'focused'}
+            mode = aliases.get(mode, '')
+            if not mode:
+                self.r.reply(msg, '可选模式：热情、自然、专注。')
+            else:
+                self.r.store.set_setting('private_companion:mode:' + msg.session.as_text(), mode)
+                self.r.reply(msg, f'陪聊模式已设为「{ {"warm": "热情", "natural": "自然", "focused": "专注"}[mode] }」。')
+            return True
+
         # 公共命令
         if text == '歌伊菜单':
             self.r.reply(msg, self._cmd_menu(msg))
@@ -1358,6 +1513,17 @@ class CommandRouter:
         if text == '删除记忆':
             self.r.reply(msg, '提示：请发送「删除记忆 <序号>」，例如「删除记忆 1」。（序号可在「我的记忆」中查看）')
             return True
+        if text in ('共同经历', '我的约定'):
+            self.r.reply(msg, self._cmd_episode_list(msg, 'event' if text == '共同经历' else 'commitment'))
+            return True
+        for command, action, kind in (
+            ('删除经历', '删除', 'event'), ('删除约定', '删除', 'commitment'),
+            ('纠正经历', '纠正', 'event'), ('纠正约定', '纠正', 'commitment'),
+            ('完成约定', '完成', 'commitment'), ('取消约定', '取消', 'commitment'),
+        ):
+            if text == command or text.startswith(command + ' '):
+                self.r.reply(msg, self._cmd_episode_change(msg, action, kind, text[len(command):]))
+                return True
         if text == '忘了我':
             self.r.reply(msg, self._cmd_forget_me(msg, force_confirm=False))
             return True
@@ -1402,6 +1568,13 @@ class CommandRouter:
         if text == '世界书状态':
             self.r.reply(msg, self._cmd_worldbook_status(msg))
             return True
+        if text in ('剧情篇章', '我的剧情', '篇章列表'):
+            self.r.reply(msg, self._cmd_story_chapters(msg))
+            return True
+        for command, resume in (('新建剧情', False), ('重开剧情', False), ('续接剧情', True)):
+            if text == command or text.startswith(command + ' '):
+                self.r.reply(msg, self._cmd_story_open(msg, text[len(command):].strip(), resume=resume))
+                return True
         if text in ('剧情模式', '剧情模式状态', '探索模式', '故事模式'):
             self.r.reply(msg, self._cmd_story_mode_status(msg))
             return True

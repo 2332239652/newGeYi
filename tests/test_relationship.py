@@ -374,8 +374,7 @@ class ServiceTest(unittest.TestCase):
         from newGeYi.runtime.app import Runtime
         self.rt = Runtime()
         self.rt.config.update({'galgame_enabled': True, 'galgame_shadow': False,
-                               'worldbook_enabled': True, 'galgame_owner_exempt': True,
-                               'owner_ids': [OWNER]})
+                               'worldbook_enabled': True, 'galgame_owner_exempt': True})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.svc.worldbook = self.rt.worldbook = self.rt.prompt_builder.worldbook = _wb([
@@ -577,14 +576,20 @@ class ServiceTest(unittest.TestCase):
         self.assertNotIn('【剧情探索模式', sys_before)
         # 执行指令开启剧情模式
         reply_on = self.rt.commands._cmd_story_mode_toggle(msg, True)
-        self.assertIn('已为你开启「剧情探索模式」', reply_on)
+        from newGeYi.memory.spaces import current_space, list_stories
+        self.assertIn('已开启剧情模式', reply_on)
+        story_space = current_space(self.rt.store, msg.session.as_text())
+        self.assertTrue(story_space.startswith('story:'))
+        self.assertIn(story_space, [row['space_id'] for row in list_stories(self.rt.store, msg.session.as_text())])
         self.assertIn('开启', self.rt.commands._cmd_story_mode_status(msg))
         self.assertIn(self.uid, self.rt.commands._cmd_story_mode_list(msg))
         sys_after = self.rt.prompt_builder.build(msg)[0]['content']
         self.assertIn('【剧情探索模式', sys_after)
         # 关闭剧情模式
         reply_off = self.rt.commands._cmd_story_mode_toggle(msg, False)
-        self.assertIn('日常聊天模式', reply_off)
+        self.assertIn('已切回日常聊天', reply_off)
+        self.assertEqual(current_space(self.rt.store, msg.session.as_text()), 'chat')
+        self.assertIn(story_space, [row['space_id'] for row in list_stories(self.rt.store, msg.session.as_text())])
         self.assertNotIn('【剧情探索模式', self.rt.prompt_builder.build(msg)[0]['content'])
 
 

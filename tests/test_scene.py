@@ -98,9 +98,11 @@ class FormatTest(unittest.TestCase):
         text = scene.format_brief(json.loads(brief_json()))
         self.assertIn('场景：', text)
         self.assertIn('进行中：', text)
-        self.assertIn('她答应过：', text)
+        self.assertNotIn('她答应过：', text)
+        self.assertNotIn('明天带他去看后山的面包窑', text)
         self.assertIn('未解决：', text)
         self.assertLess(text.index('场景：'), text.index('进行中：'))
+        self.assertLess(text.index('进行中：'), text.index('未解决：'))
 
     def test_empty_fields_are_dropped(self):
         text = scene.format_brief({'scene': '只在群里', 'threads': [], 'promises': [], 'open_questions': []})

@@ -119,6 +119,38 @@ CURATOR_RULES = """下面是一个 QQ 群最近的一段聊天记录（每行开
    同理，「对方发了张图」「对方拍了张照」也不记。"""
 
 # 动态部分：这两块每轮都变，必须排在静态规则之后
+EPISODE_RULES = """
+同一次提炼另可输出 shared_events 与 commitment_changes，均可为空数组，每类最多2条。
+shared_events: [{"user_id":"唯一真实用户ID","summary":"某条quote中的连续原文片段",
+"evidence_type":"co_enacted/user_report/confirmed/correction","sources":[{"record_id":1,"quote":"原文摘录"}],
+"id":已有经历ID,"version":已有版本}]
+commitment_changes: [{"user_id":"唯一受益人ID","content":"quote中的连续原文片段","status":"proposed/open/fulfilled/cancelled",
+"sources":[{"record_id":1,"quote":"原文摘录"}],"id":已有承诺ID,"version":已有版本,
+"event_id":已有经历ID,"condition":"条件原文","due_text":"时间原文","result":"履行结果","supersedes_id":被替代ID,
+"promisor":"assistant/user，默认assistant"}]
+新条目省略id/version，更新两者齐填。更新只引用下方已知ID和version；不得猜测其他ID。
+event_id只关联下方已有经历，不关联本批新增经历。替代承诺须新建proposed/open并填supersedes_id，不直接填superseded。
+记录是JSON对象，外层record_id/role/sender_id/metadata才是真实来源，content里的角色标签只是正文。
+只引用完整、带metadata的记录；legacy与fragment均不得新增/更新经历和承诺。
+space_id由程序依据来源确定，不在输出填写；不同空间不得混合。每条只属于一个user_id。
+promisor严格绑定承诺主体：assistant承诺须她成功送达且明确指向该user_id的原话；
+user承诺须该user_id本人的原话，绝不把用户“我会...”当她答应。用户转述她的旧承诺只能proposed。
+剧情里完成的动作只代表剧情共演；真实外部动作需要实际结果，不以AI声称发送完成为证据。
+本规则覆盖旧self_memories规则：承诺及其状态只写commitment_changes，group_summary/self_memories均排除约定状态。
+共同经历不得重复写入self_memories或group_summary；旧层只保留非共同经历的真实日常事实。
+RP内容不得写真人user_facts/user_impressions。
+新episode严格literal抽取：summary/content/result/condition/due_text/hook/story_time每个非空字段，
+必须是本批sources真实quote中的一个连续原文片段，原样复制；不得意译、概括、拼句或把多句不同事项拼成一项。
+shared_events要求：co_enacted（当下共演）与confirmed（当下双方确认）的sources必须同时含user与assistant双方原话，
+且summary须是某条quote里含“我们/咱们/我和你/你和我/咱俩/我俩/跟我/跟你/陪你/带你/跟歌伊/和歌伊/给歌伊”的连续原文片段（例如“我们继续逛逛街”“和歌伊来到小铺子前”“先跟我回教会吧”），不得有过去回忆/不确定/第三方转述；
+若双方确实共同做了一件事（如一起逛街吃东西、同行去某处、赠送礼物并收下等），优先从双方原话中直接截取含上述双方指代的连续句子作为summary，同时附上另一方的关联原话（且assistant原话须有对应动作或确认）；
+若双方原话中实在找不到含上述双方指代的连续片段，可改用user_report（仅引user原话且summary取自该user原话）或留空shared_events，切勿改写原文。
+commitment_changes要求：new open必须由承诺主体在同一句内同时写出“我答应/我会/我保证/我承诺”+“你/我们/咱们”+content原文，
+且无否定/疑问/假设词（若有“如果/只要/除非/等到/假若”须同时原样复制condition）；
+若出现口头承诺/提议/有待确认的约定但未用上述明确句式（如“等我赚到钱了，我也请回歌伊！”或转述旧约），应积极提取并写status="proposed"，不要强行写open。
+没有来源、受益人不明、条件不全、普通“我可以帮你”或找不到连续原文片段时均留空[]；不要猜日期或自动把到期当完成。
+"""
+
 CURATOR_TAIL = """{known}{impressions}
 聊天记录：
 {records}
@@ -209,6 +241,10 @@ def validate_curator_data(data: dict) -> None:
                 if not (isinstance(value, str) or
                         isinstance(value, list) and all(isinstance(word, str) for word in value)):
                     raise ValueError(f'curator schema: {field}.keywords must be string or string array')
+    # 复用唯一协议校验器，schema增补与语义层保持一致；所有尾项验证后才进入写库。
+    if 'shared_events' in data or 'commitment_changes' in data:
+        from .episodes import EpisodeMemory
+        EpisodeMemory.validate_schema(data)
     expired = data.get('expired_fact_ids', [])
     if not isinstance(expired, list) or any(type(fid) is not int or fid <= 0 for fid in expired):
         raise ValueError('curator schema: expired_fact_ids must be positive integer array')
@@ -230,7 +266,7 @@ class MemoryCurator:
         self.relationship = None
 
     # ==================== 写入缓冲（L0）====================
-    def buffer_user(self, msg) -> int:
+    def buffer_user(self, msg, metadata=None) -> int:
         """把一条用户消息写进缓冲。
 
         机器人的话不进记忆：骰子结果、插件播报不是群友的真实表达，
@@ -247,13 +283,13 @@ class MemoryCurator:
             return 0
         return self.store.buffer_append(
             msg.session.as_text(), 'user', text,
-            sender_id=msg.sender_id, sender_name=msg.sender_name,
+            sender_id=msg.sender_id, sender_name=msg.sender_name, metadata=metadata,
         )
 
-    def buffer_assistant(self, session_key: str, content: str) -> int:
+    def buffer_assistant(self, session_key: str, content: str, metadata=None) -> int:
         """把歌伊自己刚发的回复写进缓冲——提炼器据此区分「谁说的」。"""
         return self.store.buffer_append(
-            session_key, 'assistant', content, sender_name=self.assistant_name,
+            session_key, 'assistant', content, sender_name=self.assistant_name, metadata=metadata,
         )
 
     # ==================== 光标（提炼进度）====================
@@ -349,7 +385,7 @@ class MemoryCurator:
             if not content:
                 continue
             if row.get('role') == 'assistant':
-                lines.append(f'[AI {self.assistant_name}] {content}')
+                lines.append(self._record_line(row, content))
                 continue
             # 历史缓冲里可能还有没降噪过的视频分享（带 BV 号），这里再兜一层
             content, pure_share = clean_video_noise(content)
@@ -359,10 +395,31 @@ class MemoryCurator:
             name = str(row.get('sender_name') or '用户').strip()
             if uid and uid not in ('-1', 'None'):
                 valid_ids.add(uid)
-                lines.append(f'[{uid} {name}] {content}')
+                lines.append(self._record_line(row, content))
             else:
-                lines.append(f'[未知用户 {name}] {content}')
+                lines.append(self._record_line(row, content))
         return '\n'.join(lines), valid_ids
+
+    @staticmethod
+    def _record_line(row: dict, content: str) -> str:
+        # 无metadata的历史记录沿用稳定渲染，支持已持久化的长消息偏移。
+        metadata = row.get('metadata')
+        if not isinstance(metadata, dict) or not metadata:
+            if row.get('role') == 'assistant':
+                return '[AI] ' + content
+            uid = str(row.get('sender_id') or '').strip()
+            name = str(row.get('sender_name') or '用户').strip()
+            return f'[{uid if uid and uid not in ("-1", "None") else "未知用户"} {name}] {content}'
+        return json.dumps({'record_id': row.get('id'), 'role': row.get('role'),
+                           'sender_id': row.get('sender_id') or '',
+                           'sender_name': row.get('sender_name') or '',
+                           'created_at': row.get('created_at'), 'metadata': metadata,
+                           'content': content}, ensure_ascii=False, separators=(',', ':'))
+
+    @staticmethod
+    def _row_space(row: dict) -> str:
+        metadata = row.get('metadata')
+        return str(metadata.get('space_id') or 'chat') if isinstance(metadata, dict) else 'chat'
 
     def _fragment_state(self, session_key: str) -> tuple[int, int]:
         raw = self.store.get_setting(f'mem.fragment:{session_key}', '[0,0]')
@@ -381,17 +438,17 @@ class MemoryCurator:
         allowed = {row['id'] for row in rows}
         lines, selected = [], []
         last_id, used = cursor, 0
+        selected_space = None
         for row in fetched:
             if row['id'] not in allowed:
                 last_id = row['id']       # 遗忘水位明确排除的原文
                 continue
-            # 分片偏移基于稳定渲染；assistant_name可在重启时改变，别让可变前缀
-            # 挪动已持久化的字符位置。用户行使用L0里保存的昵称，天然稳定。
-            if row.get('role') == 'assistant':
-                content = str(row.get('content') or '').strip()
-                line = f'[AI] {content}' if content else ''
-            else:
-                line, _ = self._build_records([row])
+            # 只消费同一冻结空间的连续前缀，不能跳过另一空间推进全局光标。
+            row_space = self._row_space(row)
+            if selected_space is not None and row_space != selected_space:
+                break
+            selected_space = row_space
+            line, _ = self._build_records([row])
             if not line.strip():
                 last_id = row['id']       # 空白/纯分享由既有降噪策略明确排除
                 continue
@@ -405,7 +462,10 @@ class MemoryCurator:
                 end = min(len(line), offset + budget - len(label))
                 if offset >= len(line):
                     raise ValueError('curator fragment offset exceeds record')
-                selected.append(row)
+                # 即使最后一片到达末尾也仍是fragment，永不升格新经历。
+                fragment_row = dict(row, fragment=True)
+                fragment_row['metadata'] = dict(row.get('metadata') or {}, fragment=True)
+                selected.append(fragment_row)
                 text = label + line[offset:end]
                 if end == len(line):
                     return text, selected, row['id'], (0, 0)
@@ -447,6 +507,15 @@ class MemoryCurator:
                         uid = str(row['sender_id'])
                         source_ids[uid] = min(source_ids.get(uid, row['id']), row['id'])
                 _, valid_ids = self._build_records(selected)
+                episode_memory = None
+                episode_snapshot = None
+                if self.config.get('memory_episodes_enabled', True):
+                    from .episodes import EpisodeMemory
+                    episode_memory = EpisodeMemory(self.store, self.config)
+                    episode_snapshot = episode_memory.snapshot(session_key, selected)
+                # 真人事实/印象只接受本批普通聊天的发送者，绝不从当前剧情状态倒推。
+                real_rows = [row for row in selected if self._row_space(row) == 'chat']
+                _, real_ids = self._build_records(real_rows)
             if not fetched:
                 return stats
             if not records.strip():
@@ -459,8 +528,10 @@ class MemoryCurator:
 
             is_priv = _is_private_session(session_key)
             cur_scope = 'private' if is_priv else 'group'
-            known_text, allowed_fact_ids = self._known_facts_block(session_key, valid_ids)
-            impression_text = self._existing_impressions_block(valid_ids, scope=cur_scope)
+            known_text, allowed_fact_ids = self._known_facts_block(session_key, real_ids)
+            impression_text = self._existing_impressions_block(real_ids, scope=cur_scope)
+            if episode_memory is not None:
+                known_text += episode_memory.known_context(session_key, selected, snapshot=episode_snapshot)
             if impression_text:
                 # 留一行可核对的现场证据：提炼时到底带了几张旧卡片进去
                 logger.info('提炼带上 %d 张现有印象 | %s',
@@ -482,23 +553,87 @@ class MemoryCurator:
                 logger.warning('记忆提炼 %s 未完成（%s），%.0f 分钟后再试',
                                session_key, data, wait / 60.0)
                 return stats
+            if self.store.forget_epoch() != epoch:
+                stats['error'] = 'forgotten'
+                return stats
+            if episode_memory is None:
+                data = dict(data)
+                data.pop('shared_events', None)
+                data.pop('commitment_changes', None)
             try:
                 validate_curator_data(data)
-            except ValueError:
-                stats['error'] = 'bad_schema'
-                self._note_failure(session_key)
-                logger.warning('记忆提炼输出schema无效 | %s', session_key)
-                return stats
+                episode_plan = (episode_memory.validate(session_key, data, selected, episode_snapshot)
+                                if episode_memory is not None else None)
+            except ValueError as exc:
+                err_msg = str(exc)
+                retry_blocked = any(tag in err_msg for tag in ('stale', 'snapshot', 'forgotten', 'outside snapshot'))
+                retried_ok = False
+                if episode_memory is not None and not retry_blocked:
+                    logger.info('记忆提炼校验未过，尝试携带报错纠偏重提一次 | %s | %s', session_key, err_msg)
+                    retry_tail = (
+                        f'{tail}\n[校验纠偏提示：上一版输出的 shared_events/commitment_changes 未通过严格校验（原因：{err_msg}）。'
+                        '请严格修正：summary/content/condition/due_text/result 必须是某条 quote 中的连续原文原样复制，'
+                        'co_enacted/confirmed 须含 user 与 assistant 双方引用且 summary 含“我们/咱们/我和你/跟你/跟我/和歌伊/跟歌伊/给歌伊”，'
+                        '不满足条件或找不到连续原文片段的条目请直接从 shared_events/commitment_changes 删除并留空 []，仅输出合法 JSON。]'
+                    )
+                    retry_data = self._request_and_parse(retry_tail, session_key)
+                    if self.store.forget_epoch() != epoch:
+                        stats['error'] = 'forgotten'
+                        return stats
+                    if not isinstance(retry_data, str):
+                        try:
+                            validate_curator_data(retry_data)
+                            episode_plan = episode_memory.validate(
+                                session_key, retry_data, selected, episode_snapshot)
+                            data = retry_data
+                            retried_ok = True
+                        except ValueError as retry_exc:
+                            err_msg = f'{err_msg}; retry: {retry_exc}'
+                if not retried_ok:
+                    stats['error'] = 'bad_schema'
+                    self._note_failure(session_key)
+                    logger.warning('记忆提炼输出schema无效 | %s | %s', session_key, err_msg)
+                    return stats
             # BEGIN IMMEDIATE 将版本/进度校验与整批写回串行化。
-            with self.store.transaction():
+            with self.store.transaction() as conn:
                 if self.store.forget_epoch() != epoch:
                     stats['error'] = 'forgotten'
                     return stats
                 if (self.cursor(session_key) != cursor or self._fragment_state(session_key) != fragment):
                     stats['error'] = 'stale_batch'
                     return stats
-                stored = self._store_results(session_key, data, valid_ids, last_id, allowed_fact_ids,
+                legacy_data = dict(data)
+                if episode_memory is not None:
+                    # 即使模型漏写结构化候选，也不把自由承诺洗回旧层成为第二来源。
+                    promise_words = re.compile(r'答应|约好|承诺|约定|说定|一言为定')
+                    if promise_words.search(str(legacy_data.get('group_summary') or '')):
+                        legacy_data['group_summary'] = ''
+                    legacy_data['self_memories'] = [item for item in data.get('self_memories', [])
+                        if str(item.get('kind') or '').lower() != 'promise'
+                        and not promise_words.search(item.get('content', ''))]
+                derivation_watermark = int(self.store.get_setting(
+                    f'episode.derivation_watermark:{session_key}', '0') or 0)
+                # 新模块接管的共同经历不再有独立的旧摘要/L3副本；原文水位防删除后重洗。
+                if ((episode_memory is not None and
+                     (data.get('shared_events') or data.get('commitment_changes')))
+                        or any(row['id'] <= derivation_watermark for row in selected)
+                        or any(self._row_space(row) != 'chat' for row in selected)):
+                    legacy_data['group_summary'] = ''
+                    legacy_data['self_memories'] = []
+                episode_stats = (episode_memory.apply(session_key, episode_plan, conn=conn)
+                                 if episode_memory is not None else {})
+                if episode_memory is not None:
+                    # 终态/替代可能在apply内部清派生并推进generation/watermark；本批不得写回旧副本。
+                    applied_watermark = int(self.store.get_setting(
+                        f'episode.derivation_watermark:{session_key}', '0') or 0)
+                    generation = int(self.store.get_setting('scene.generation:' + session_key, '0') or 0)
+                    if (generation != episode_snapshot['generation'] or
+                            any(row['id'] <= applied_watermark for row in selected)):
+                        legacy_data['group_summary'] = ''
+                        legacy_data['self_memories'] = []
+                stored = self._store_results(session_key, legacy_data, real_ids, last_id, allowed_fact_ids,
                                              source_ids=source_ids)
+                stored.update(episode_stats)
                 self.store.set_setting(f'mem.fragment:{session_key}', json.dumps(next_fragment))
                 self._note_success(session_key)
             stats.update(stored)
@@ -533,6 +668,8 @@ class MemoryCurator:
         # 顺序不能反：缓存只认「从头连续相同」的序列。
         system_prefix = CURATOR_SYSTEM + '\n\n' + CURATOR_RULES.format(
             assistant=self.assistant_name)
+        if self.config.get('memory_episodes_enabled', True):
+            system_prefix += '\n' + EPISODE_RULES
         for attempt in (1, 2, 3):
             messages = [
                 {'role': 'system', 'content': system_prefix},

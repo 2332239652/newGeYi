@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
 import logging
 import os
@@ -31,7 +31,8 @@ from ..context.prompt_builder import PromptBuilder
 from ..context.scene import SceneKeeper
 from ..memory.curator import MemoryCurator
 from ..memory.repository import MemoryRepository
-from ..memory.worldbook import WorldbookService
+from ..memory.spaces import current_space, ensure_space, snapshot_space
+from ..memory.worldbook import WorldbookService, is_story_mode
 from ..models import IncomingMessage, ModelRequest, SessionKey
 from ..presentation.renderer import Renderer, is_silent_reply, op_codes_to_plain
 from ..providers.llm_gateway import LLMGateway
@@ -45,6 +46,7 @@ from ..storage.database import SQLiteStore
 from ..voice.manager import VoiceManager
 from .rest import RestGuard
 from .private_gate import PrivateGate
+from .private_turns import PrivateTurnCoordinator, strip_current_turn
 from .scheduler import SessionScheduler
 from .sleep import SleepWindow
 
@@ -166,6 +168,7 @@ class Runtime:
         self.commands = CommandRouter(self)
         self.router = MessageRouter(self)
         self.scheduler = SessionScheduler(self)
+        self.private_turns = PrivateTurnCoordinator(self, self._flush_private_turn)
         self._poke_counts: dict[str, tuple[int, float]] = {}
         self._poke_back_at: dict[str, float] = {}
         self.video_context = None
@@ -328,6 +331,10 @@ class Runtime:
 
     def save(self, Proc) -> None:
         try:
+            self.private_turns.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self.curator.stop()
         except Exception:  # noqa: BLE001
             pass
@@ -432,6 +439,33 @@ class Runtime:
                 logger.exception('私聊通知骰主 %s 失败', owner_id)
         return sent
 
+    def _flush_private_turn(self, messages: list[IncomingMessage]) -> None:
+        """Apply private rate limits once, after the debounce window has chosen a turn."""
+        if not messages:
+            return
+        msg = messages[-1]
+        session_key = msg.session.as_text()
+        if not self.config.get('private_enabled', False) or self.is_resting(session_key):
+            return
+        gate = self.private_gate
+        batch_text = '\\n'.join(str(item.text or '') for item in messages)
+        gate_msg = replace(msg, text=batch_text,
+                           mentioned_bot=any(item.mentioned_bot for item in messages))
+        allowed, why = gate.allow(gate_msg)
+        if not allowed:
+            if why.startswith('quota'):
+                logger.info('私聊额度用尽（%s），本条不回 | %s', why, session_key[-16:])
+                hint = self.router._quota_hint(msg, why)
+                if hint:
+                    self.reply(msg, hint)
+            else:
+                logger.info('私聊陪聊回合被闸门拦截（%s）| %s', why, session_key[-16:])
+            return
+        if not self.scheduler.submit(msg, kind='passive'):
+            logger.warning('私聊陪聊回合未能进入队列 | %s', session_key[-16:])
+            return
+        gate.commit(session_key)
+
     # ==================== 作息（休眠）====================
     def send_sleep_notice(self, msg: IncomingMessage) -> None:
         """睡着时被叫醒的那一句。
@@ -451,7 +485,7 @@ class Runtime:
         if not self.reply(msg, text).accepted:
             return
         try:
-            self._track_self_sent(msg.session, text, msg.is_group)
+            self._track_self_sent(msg.session, text, msg.is_group, space_id=msg.memory_space_id)
         except Exception:  # noqa: BLE001 - 记账失败不影响已经发出去的那句话
             logger.debug('休眠提示写入账本失败', exc_info=True)
 
@@ -566,7 +600,7 @@ class Runtime:
             sender_name = aliases.display(self.store, sender_id, sender_name)
             session = self._session_key(event, is_group)
             # @码 → @名字：少数协议端不带 name=，这时至少把「@她自己」说成 @你，
-            # 避免模型模仿账号数字前缀，显示名称统一由程序解析。
+            # 别让模型看到一串数字（2026-11-04：她学会了写【@2309394954】）。
             try:
                 self_id = str((getattr(event, 'base_info', None) or {}).get('self_id', '') or '')
             except Exception:  # noqa: BLE001 - base_info 结构变了就当没有
@@ -592,6 +626,8 @@ class Runtime:
             # 管理命令不进入聊天上下文；普通消息到达即写旁观窗口与记忆缓冲
             if self.commands.try_handle(msg):
                 return
+            # 剧情命令完成后冻结空间；缓冲、排队和回复一律沿用此快照。
+            msg = self._freeze_message_space(msg)
             if msg.is_group:
                 self.live_context.append_user(msg)
                 # 群人数决定这个群的每日额度：缓存过期就在后台补一次，不阻塞这条消息
@@ -602,10 +638,49 @@ class Runtime:
             # 只有「会进记忆」的会话才写缓冲：私聊默认不进（隐私），
             # 记忆/提炼关掉时也不写（否则缓冲只增不减，而且会被提炼成记忆）。
             if self._memory_tracking_on(msg):
-                self.curator.buffer_user(msg)
+                record_id = self.curator.buffer_user(msg, metadata=self._user_memory_metadata(msg))
+                msg = replace(msg, memory_record_id=int(record_id or 0))
+            if not msg.is_group:
+                self._remember_user_turn(msg)
+                msg = replace(msg, history_pre_recorded=True)
             self.router.route(msg)
         except Exception:  # noqa: BLE001 - 事件入口永不抛出
             logger.exception('handle_message failed')
+
+    def _freeze_message_space(self, msg: IncomingMessage) -> IncomingMessage:
+        session_key = msg.session.as_text()
+        with self.store.transaction():
+            ensure_space(self.store, session_key, is_story_mode(self.store, session_key, msg.sender_id))
+            state = snapshot_space(self.store, session_key)
+        return replace(msg, memory_space_id=state['space_id'], space_generation=state['generation'])
+
+    def _message_space_current(self, msg: IncomingMessage) -> bool:
+        # 旧测试/插件构造的消息没有冻结字段，按当前空间兼容处理。
+        if not getattr(msg, 'memory_space_id', ''):
+            return True
+        state = snapshot_space(self.store, msg.session.as_text())
+        return (state['space_id'] == msg.memory_space_id
+                and state['generation'] == msg.space_generation)
+
+    def _user_memory_metadata(self, msg: IncomingMessage) -> dict:
+        return {
+            'space_id': getattr(msg, 'memory_space_id', '') or current_space(self.store, msg.session.as_text()),
+            'space_generation': getattr(msg, 'space_generation', 0),
+            'message_id': msg.message_id,
+            'sender_id': msg.sender_id,
+            'outer_role': 'user',
+        }
+
+    def _assistant_memory_metadata(self, msg: IncomingMessage) -> dict:
+        return {
+            'space_id': getattr(msg, 'memory_space_id', '') or current_space(self.store, msg.session.as_text()),
+            'space_generation': getattr(msg, 'space_generation', 0),
+            'message_id': f'reply:{msg.message_id or msg.arrival_seq}:{msg.arrival_seq}',
+            'recipient_id': msg.sender_id,
+            'delivery_level': 'accepted',
+            'reply_to': getattr(msg, 'memory_record_id', 0),
+            'outer_role': 'assistant',
+        }
 
     def _memory_tracking_on(self, msg: IncomingMessage) -> bool:
         """这条消息该不该进记忆缓冲。私聊与群聊均独立缓冲和提炼。"""
@@ -691,6 +766,8 @@ class Runtime:
 
         `level` 只对主动搭话有意义（0 严格 / 1 中性 / 2 软化），被动回复恒为 0。
         """
+        if not self._message_space_current(msg):
+            return None, ''
         try:
             messages = self.prompt_builder.build(
                 msg, is_active=(kind == 'active'), active_level=level)
@@ -790,7 +867,7 @@ class Runtime:
             return
         try:
             self.store.add_turn(msg.session.as_text(), 'user', msg.text,
-                                msg.sender_id, msg.sender_name)
+                                msg.sender_id, msg.sender_name, metadata=self._user_memory_metadata(msg))
         except Exception:  # noqa: BLE001 - 记账失败不该挡住回复
             logger.exception('记录私聊用户轮失败')
 
@@ -831,6 +908,12 @@ class Runtime:
             return None
 
     def process_job(self, msg: IncomingMessage, kind: str) -> None:
+        if not self._message_space_current(msg):
+            logger.info('空间或代际已更新，丢弃排队任务 | %s', msg.session.as_text()[-16:])
+            return
+        # 旧调用方也在本次生成前冻结，避免模型在途切换后误发。
+        if not getattr(msg, 'memory_space_id', ''):
+            msg = self._freeze_message_space(msg)
         cfg = self.config
         # 命令重载后组件重新读取最新配置
         self.prompt_builder.config = cfg
@@ -839,12 +922,20 @@ class Runtime:
         session_key = msg.session.as_text()
         # 私聊先记账：后面有六条早退分支，以前每一条都会把她这句话弄丢
         remember_user = not msg.is_group
-        # 在写本轮用户消息之前冻结前序历史；后台评审延迟时也不会读到未来轮次。
+        # 后台评审延迟时也不会读到未来轮次；私聊这一轮**已经**在到达时落库了，
+        # 所以要把本轮自己从历史里剥掉，否则复读判定会拿这句话和它自己比。
         relationship_history = ()
         interaction_at = time.time()
         if remember_user:
-            relationship_history = tuple(dict(turn) for turn in self.store.recent_turns(session_key, limit=8))
-            self._remember_user_turn(msg)
+            pre_recorded = bool(getattr(msg, 'history_pre_recorded', False))
+            relationship_history = tuple(
+                dict(turn) for turn in self.store.recent_turns(session_key, limit=8)
+                if ((turn.get('metadata') or {}).get('space_id') or 'chat') == msg.memory_space_id
+            )
+            if pre_recorded:
+                relationship_history = strip_current_turn(relationship_history, msg)
+            else:
+                self._remember_user_turn(msg)
         # 静默期内不回复：以前只有 router 拦住了**新到**的消息，
         # 队列里已经排着的任务照样落地（静默刚生效时最明显）。
         is_resting = getattr(self, 'is_resting', None)
@@ -900,6 +991,9 @@ class Runtime:
             retried = self._retry_if_overstep(msg, kind, cfg, rendered, result)
             if retried is not None:
                 result, text, rendered = retried
+        if not self._message_space_current(msg):
+            logger.info('生成期间空间或代际已更新，丢弃旧结果 | %s', session_key[-16:])
+            return
         # 自我保护：模型判断这个群已经待不下去（谩骂/过当调戏/纠缠等）→ 静默 + 通知骰主。
         # 放在发送之前：即使下面发送失败，静默也必须生效。
         if rendered.rest_reason:
@@ -909,7 +1003,7 @@ class Runtime:
                 # 否则静默结束后她看上下文会觉得「话说到一半断了」。
                 if not remember_user:
                     self.store.add_turn(msg.session.as_text(), 'user', msg.text,
-                                        msg.sender_id, msg.sender_name)
+                                        msg.sender_id, msg.sender_name, metadata=self._user_memory_metadata(msg))
                 return
         if is_active:
             row_id = self.attention.record_model(
@@ -928,16 +1022,31 @@ class Runtime:
         plain_reply = op_codes_to_plain(rendered.text, names={msg.sender_id: msg.sender_name})
         content_to_record = plain_reply
         # 网关已独立记录每次调用用量；发送失败只阻止已发事实，不抹除生成成本。
+        if not self._message_space_current(msg):
+            return
+        assistant_metadata = self._assistant_memory_metadata(msg)
         delivery = self.reply(msg, rendered.text)
         if not delivery.accepted:
             return
+        # 发送完成后短事务复核代际并提交证据，遗忘不会夹在检查与落库之间。
         # 普通 OlivOS send 返回 None：这里只确认 API 无异常返回，未获得平台 ack。
-        if not remember_user:
-            self.store.add_turn(session_key, 'user', msg.text, msg.sender_id, msg.sender_name)
-        self.store.add_turn(
-            session_key, 'assistant', content_to_record,
-            model=result.model, in_tokens=result.input_tokens, out_tokens=result.output_tokens,
-        )
+        with self.store.transaction():
+            if not self._message_space_current(msg):
+                return
+            if not remember_user:
+                self.store.add_turn(session_key, 'user', msg.text, msg.sender_id, msg.sender_name,
+                                    metadata=self._user_memory_metadata(msg))
+            self.store.add_turn(
+                session_key, 'assistant', content_to_record,
+                model=result.model, in_tokens=result.input_tokens, out_tokens=result.output_tokens,
+                metadata=assistant_metadata,
+            )
+            if self._memory_tracking_on(msg):
+                self.curator.buffer_assistant(session_key, plain_reply, metadata=assistant_metadata)
+            if msg.is_group:
+                self.live_context.append_assistant(
+                    session_key, msg.arrival_seq, content_to_record, space_id=msg.memory_space_id,
+                )
         # 私聊 galgame：回复发出后异步评审（不增加回复延迟，结果影响下一轮）
         if not msg.is_group:
             try:
@@ -974,18 +1083,6 @@ class Runtime:
         self.attention.note_spoken(msg.session.as_text())
         # 记下「刚和这个会话说过话」，供下一轮时间感知算间隔
         self.prompt_builder.mark_talked(msg.session.as_text())
-        # 歌伊自己的话也进缓冲：提炼器必须能区分「谁说的」，
-        # 否则会把 AI 说的话记成某个用户的事实（调研里的最高危污染）。
-        # ⚠️ 必须和用户消息用**同一个门**：私聊开关关掉 / 记忆关掉时，这里要是照写，
-        # 那个会话就只剩「她自己的话」的缓冲，而 should_run 又永远不会去提炼它
-        # → 越攒越多且没人清（2026-11-04 复查发现）。
-        if self._memory_tracking_on(msg):
-            self.curator.buffer_assistant(msg.session.as_text(), op_codes_to_plain(rendered.text))
-        if msg.is_group:
-            self.live_context.append_assistant(
-                msg.session.as_text(), msg.arrival_seq, content_to_record
-            )
-
         # 文字提交完成后再排语音；快回调也只会追加独立事实，不会重写后续轮次。
         if rendered.voice_payload:
             self._dispatch_reply_voice(msg, rendered.voice_payload)
@@ -997,7 +1094,9 @@ class Runtime:
         # 默认参数绑定冻结会话/文本；回调执行时不读取可变化的 rendered/result/config。
         def on_success(_key, sent_emotion, sent_text, snapshot=msg):
             self._track_self_sent(
-                snapshot.session, f'[VOICE:{sent_emotion}|{sent_text}]', snapshot.is_group)
+                snapshot.session, f'[VOICE:{sent_emotion}|{sent_text}]', snapshot.is_group,
+                space_id=snapshot.memory_space_id,
+            )
 
         group_name = ''
         if msg.is_group:
@@ -1046,7 +1145,7 @@ class Runtime:
                 if self._inflight_self_sent[cache_key] <= 0:
                     del self._inflight_self_sent[cache_key]
 
-    def _track_self_sent(self, session, text: str, is_group: bool) -> None:
+    def _track_self_sent(self, session, text: str, is_group: bool, space_id: str = '') -> None:
         """把她自己发出的一句话记进「她说过什么」的账本。
 
         正常回复走 reply() + process_job 那套（去重缓存 / turns / 旁观窗口）；
@@ -1065,14 +1164,15 @@ class Runtime:
                 self._recent_self_sent.append((session.as_text(), plain, time.time()))
         except Exception:  # noqa: BLE001 - 记账失败不能影响已经发出去的消息
             pass
+        metadata = {'space_id': space_id or current_space(self.store, session.as_text())}
         try:
-            self.store.add_turn(session.as_text(), 'assistant', plain)
+            self.store.add_turn(session.as_text(), 'assistant', plain, metadata=metadata)
         except Exception:  # noqa: BLE001
             logger.debug('戳一戳回复写入 turns 失败', exc_info=True)
         if is_group:
             try:
                 self.live_context.append_assistant(
-                    session.as_text(), self._next_arrival_seq(), plain)
+                    session.as_text(), self._next_arrival_seq(), plain, space_id=metadata['space_id'])
             except Exception:  # noqa: BLE001
                 logger.debug('戳一戳回复写入旁观窗口失败', exc_info=True)
 

@@ -457,7 +457,7 @@ class RelationshipService:
                         total.stage_after = rel.stage
             else:
                 # 刷屏不再吞掉「今日首次互动」的加成：以前 spam 会连 +1 一起跳过，
-                # 等于同一件事罚两次（回归样例：一次互动不应同时承担两次扣分）。
+                # 等于同一件事罚两次（2026-11-10 抽查：748048217 只说了 1 句就从 2.0 掉到 1.0）。
                 if not trivial and day_key(now) != rel.last_day:
                     applied += apply_presence(rel, now, p).applied
                 out = apply_delta(rel, raw, tag, now, p)

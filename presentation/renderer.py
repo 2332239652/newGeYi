@@ -120,7 +120,7 @@ AT_TAG_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)[^\]]*\]')
 AT_CODE_RE = re.compile(r'\[(?:OP:at,id|CQ:at,qq)=([^,\]]+)((?:,[^\]]*)?)\]')
 # 输出侧：模型爱写 `【@123456】` / `【@某人】`，括号+数字对读者毫无意义
 AT_BRACKET_RE = re.compile(r'[\[【［]\s*@\s*([^\]】］\s]{1,40})\s*[\]】］]')
-# 输出侧：没括号的光杆 @数字（`@123456789 你好`）
+# 输出侧：没括号的光杆 @数字（`@2309394954 我错了`）
 AT_BARE_NUMBER_RE = re.compile(r'(?<![\w@])@(\d{5,12})(?!\d)')
 FENCE_RE = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
@@ -254,12 +254,14 @@ def sanitize_religion(text: str) -> tuple[str, int]:
     return text, hits
 
 
-# ===== 写稿备忘检测 =====
-# 合成样本：模型误把写作指导发成回复。
-#     作为歌伊，可以结合测试话题回复。
-#     - 风格：口语、30~70字以内，自然，不换行。
-#     - 注意情绪立绘：惊讶或死鱼眼。
-#     - 构思：用简短语句回应测试话题。
+# ===== 「把写稿备忘当台词发出去」检测（2026-11-01 线上实测）=====
+# 小群 957309761，一条 B 站愚人节剧情视频触发的**主动搭话**，模型把写给自己的提纲整段发了出去：
+#
+#     （或者顺着刚才聊的边狱话题发出来的），作为歌伊，可以结合愚人节剧情被创飞的梗、
+#     或者画风突变女仆卡戎/马娘那些离谱镜像世界来吐槽或搭话。
+#     - 风格：口语、30~70字以内，自然，不换行，可带一个动作或[EMOTE]。
+#     - 注意情绪立绘：惊讶/死鱼眼/晕乎乎等。选“惊讶”或“死鱼眼”都很贴切。
+#     - 构思：这个愚人节剧情简直精神污染啊，看完感觉整个人都要被卡戎的车来回碾两遍了
 #
 # 现有的三道清洗都拦不住它：不是 `【…】` 方括号（`_strip_thinking_process` ②），
 # 不是 `<think>`，也不是「条列提纲 + 短标题」那种（`_strip_outline_draft` 要求有
@@ -305,11 +307,11 @@ INNER_MONOLOGUE_RE = re.compile(
 
 
 # ===== 英文推理前言 =====
-# 合成回归场景：模型会把「先写一段英文计划、再给中文台词」
+# 线上实测（2026-10-28，Gemini 系走中转站）：模型会把「先写一段英文计划、再给中文台词」
 # 整段吐出来，形如
 #
 #     **My Response**
-#     Okay, so the user thinks I and 角色甲 are cute... I need to sound cute.
+#     Okay, so the user thinks I and 伊尔达 are cute... I need to sound cute.
 #     （叉腰气鼓鼓）才不是什么外国歌伊啦！
 #
 # 它既不是 <think> 标签，也不是【…】方括号，原来的规则一条都拦不住。
@@ -318,7 +320,7 @@ _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff]')
 _BOLD_LINE_RE = re.compile(r'^\*\*[^*\n]{2,80}\*\*$')
 _LATIN_RE = re.compile(r'[A-Za-z]')
 # 判「这一行是英文写的」：字母够多，且中文字数远少于字母数
-# （不能要求纯 ASCII——“I and 角色甲”这种夹了人名的英文句也得认出来）
+# （不能要求纯 ASCII——“I and 伊尔达”这种夹了人名的英文句也得认出来）
 _REASON_OPENERS_RE = re.compile(
     r'^\s*(?:Okay|Ok|Alright|So|The user|User |They|He |She |I need|I should|I must'
     r'|I\'ll|Let me|Now|Given|Since|This is|We |Looking)', re.I)
@@ -352,7 +354,7 @@ def strip_english_preamble(text: str) -> str:
     lines = text.split('\n')
     first_reply = None
     for index, line in enumerate(lines):
-        # 「有中文」还不够——英文前言里常夹着人名（"I and 角色甲 are cute"），
+        # 「有中文」还不够——英文前言里常夹着人名（"I and 伊尔达 are cute"），
         # 所以要求这一行有中文**且不像英文**才算回复本体。
         if _CJK_RE.search(line) and not looks_english_line(line):
             first_reply = index
@@ -385,8 +387,8 @@ def strip_english_preamble(text: str) -> str:
 # 模型偶尔会把心里那份计划原样吐出来，而不是直接说话。方括号版草稿（【拟定回复】…）
 # 有专门规则拦，但纯文本提纲以前一条都拦不住：
 #
-#     测试用户：
-#     - 说明合成测试话题，准备简短回复
+#     赛博刀子：
+#     - 夸歌伊厉害，但安抚熠暗"你们的赛道暂时不相交"
 #     歌伊的反应：
 #     - 长度约 40-60 字。一条一段。
 #     - 是否发立绘？…
@@ -401,9 +403,9 @@ _OUTLINE_META_RE = re.compile(
 )
 _OUTLINE_HEADER_RE = re.compile(r'^[^\s：:]{1,16}[：:]\s*$')
 _OUTLINE_BULLET_RE = re.compile(r'^[-*•·]\s+\S')
-# 同一行里「英文前言 + 中文台词」。两种合成示例：
-#   ① `I should be straightforward. 你好，今天一起练习吗？`（句号收尾）
-#   ② `Here's what I'll say: "你好，我准备好了。"`（**冒号 + 引号**收尾，合成冒号样例）
+# 同一行里「英文前言 + 中文台词」。两种真实形态都出现过：
+#   ① `I should be straightforward. 诶？今天是万圣节吗？`（句号收尾）
+#   ② `Here's what I'll say: "哼哼，这种事情不用搜也是…"`（**冒号 + 引号**收尾，2026-10-30 大群事故）
 # 以前按行判断（strip_english_preamble）抓不到——英文和中文在同一行里。
 _LEAD_EN_CHUNK_RE = re.compile(r'^\s*([^\u4e00-\u9fff【]{1,240})')
 _LEAD_EN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")
@@ -493,7 +495,7 @@ def op_codes_to_plain(text: str, names: dict | None = None) -> str:
     """把收到的码转成模型能看懂的标记（入参前清洗，OP 为主、兼容 CQ）。
 
     `@` 一律折成 **`@名字`**：一开始这里写的是 `【@<id>】`，等于把一串数字喂给模型，
-    模型可能仿写为 `【@123456789】`；此处使用合成格式示例。
+    模型照猫画虎，自己回复里也开始 `【@2309394954】`（2026-11-04 线上原话）。
     QQ 的 `[OP:at,id=…,name=…]` 本来就带昵称，没理由丢掉；
     实在没有昵称（少数协议端不上报）才退成 `@某用户`，绝不再吐数字。
     """
@@ -838,7 +840,7 @@ class Renderer:
         text = OP_TAG_RE.sub(' ', text)
         text = CQ_TAG_RE.sub(' ', text)
         # 模型会把「@某人」写成【@数字】——她是照着上下文里 `【@<id>】` 的旧格式学的
-        # 合成格式示例：`【@123456789】你好`。
+        # （2026-11-04 线上原话：`【@2309394954】我刚才明明讲了流血电弧…`）。
         # 数字对群里读者没有意义，所以这里统一收口：
         #   @到当前发言人 → 他的昵称；不认识的人 → @某用户；括号一律去掉。
         source = text
@@ -865,7 +867,7 @@ class Renderer:
             if (m.group(1) == str(msg.sender_id) and msg.sender_name) else '@某用户',
             text,
         )
-        # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(123456789)" -> "某人"）
+        # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(1000000001)" -> "某人"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张
         session = msg.session.as_text()

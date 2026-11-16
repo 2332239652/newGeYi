@@ -32,7 +32,14 @@ def _ensure_offline_requests_stub() -> None:
     class Session:
         def __init__(self):
             self.headers = {}
-            self.trust_env = True
+            self.adapters = {}
+            self.trust_env = False
+
+        def mount(self, prefix, adapter):
+            self.adapters[prefix] = adapter
+
+        def close(self):
+            pass
 
         def request(self, *args, **kwargs):
             raise ConnectionError('offline test environment')

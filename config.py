@@ -28,7 +28,7 @@ DATA_DIR_NAME = 'newGeYi'
 # 2026-10-30：上一轮发了 v2.6.0 但只改了 app.json，这里还留在 2.5.0，
 # 于是日志/「歌伊状态」全都是 v2.5.0，和 GitHub 上的 tag 对不上。
 # 现在启动时会主动比对两个版本号，不一致就打 warning（见 version_mismatch）。
-PLUGIN_VERSION = '2.9.20'
+PLUGIN_VERSION = '2.10.1'
 
 # 主动搭话的“无事可说不回复”标记（模型只需输出这一行即表示忽略）
 SKIP_ACTIVE = '【歌伊忽略】'
@@ -191,6 +191,11 @@ DEFAULT_CONFIG = {
     'mention_on_at_all': False,
     'ignore_sender_ids': [],
     'private_enabled': False,
+    # 私聊回合调度：合并短时间连发，再用本地线索决定是否接话。
+    'private_companion_mode': 'natural',  # warm / natural / focused
+    'private_companion_debounce_seconds': 2.5,
+    'private_companion_invite_delay_seconds': 0.6,
+    'private_companion_max_wait_seconds': 5.0,
     # ===== 私聊闸门（并发保护）=====
     # 私聊以前是「每句都回」，调度器只有 6 个 worker，人一多就排队、表现为"她不理人"。
     # 下面这几个开关是同一个目的：把"每句都回"降级成可控的频次。
@@ -266,8 +271,8 @@ DEFAULT_CONFIG = {
     'galgame_shadow': True,
     # 主人豁免：不评分、不注入关系块，世界书按最高阶段放行。
     'galgame_owner_exempt': True,
-    # 额外豁免名单（默认为空；owner_ids 中的账号自动豁免）
-    'galgame_exempt_ids': [],
+    # 额外豁免名单（role_prompt 里写死的主人 QQ；owner_ids 里的人也自动豁免）
+    'galgame_exempt_ids': ['2332239652'],
     # 评审用的模型（留空沿用 fast_model）；它走 kind='affection'，可用 affection_provider 指到便宜渠道
     'galgame_judge_model': '',
     'galgame_judge_max_tokens': 1024,
@@ -303,6 +308,8 @@ DEFAULT_CONFIG = {
     # 8 轮历史能横跨好几天，三天后重复一句口头禅被判 spam -1）。
     'galgame_repeat_window_seconds': 1800,
     'memory_enabled': True,
+    # 共同经历与约定：只从启用后有完整来源的对话积累，复用现有后台提炼。
+    'memory_episodes_enabled': True,
     # 注意：`auto_memory_enabled` 已经废除了——它从 v2.5 起就没有任何代码读，
     # 用户设 true 以为开了自动记忆，实际生效的一直是 memory_curator_enabled。
     # load_config 会把只写了旧键的老配置迁移成 memory_curator_enabled（见 _migrate_legacy_keys）。

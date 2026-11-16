@@ -28,6 +28,7 @@ class LiveTurn:
     # 否则两个同昵称的群友在系统里是两个人、在模型眼里却是同一个人（记忆串味）。
     sender_id: str = ''
     created_at: float = 0.0
+    space_id: str = ''
 
 
 class LiveContextStore:
@@ -52,9 +53,10 @@ class LiveContextStore:
             content=msg.text,
             sender_name=msg.sender_name,
             sender_id=msg.sender_id,
+            space_id=getattr(msg, 'memory_space_id', ''),
         )
 
-    def append_assistant(self, session_key: str, source_seq: int, content: str) -> None:
+    def append_assistant(self, session_key: str, source_seq: int, content: str, space_id: str = '') -> None:
         """成功发送回复后写入，让后续群消息能看到歌伊刚才说的话。"""
         self.append(
             session_key=session_key,
@@ -62,10 +64,11 @@ class LiveContextStore:
             role='assistant',
             content=content,
             sender_name='歌伊',
+            space_id=space_id,
         )
 
     def append(self, session_key: str, source_seq: int, role: str, content: str,
-               sender_name: str = '', sender_id: str = '') -> None:
+               sender_name: str = '', sender_id: str = '', space_id: str = '') -> None:
         if not content:
             return
         now = time.time()
@@ -78,12 +81,17 @@ class LiveContextStore:
                 sender_name=sender_name or ('歌伊' if role == 'assistant' else '用户'),
                 sender_id=str(sender_id or ''),
                 created_at=now,
+                space_id=str(space_id or ''),
             )
             state = self._states[session_key]
             state.append(turn)
             while len(state) > self.max_cached_per_session:
                 state.popleft()
             self._prune_locked(now)
+
+    def clear_session(self, session_key: str) -> None:
+        with self._lock:
+            self._states.pop(session_key, None)
 
     def snapshot(
         self,
@@ -92,6 +100,7 @@ class LiveContextStore:
         window_seconds: int = 1800,
         max_messages: int = 30,
         max_chars: int = 6000,
+        space_id: str | None = None,
     ) -> list[dict]:
         """取当前消息之前的实时上下文，返回与 SQLite turns 相同的字典结构。"""
         now = time.time()
@@ -102,6 +111,7 @@ class LiveContextStore:
         candidates = [
             turn for turn in state
             if turn.source_seq < before_source_seq and now - turn.created_at <= window_seconds
+            and (space_id is None or (turn.space_id or 'chat') == space_id)
         ]
         # 回复可能晚于下一条用户消息落缓存，按原始消息序号恢复因果顺序。
         # 同一序号内用户消息先于 assistant 回复。
@@ -125,6 +135,7 @@ class LiveContextStore:
                 'sender_id': turn.sender_id,
                 'sender_name': turn.sender_name,
                 'content': turn.content,
+                'metadata': {'space_id': turn.space_id or 'chat'},
             }
             for turn in selected
         ]

@@ -95,8 +95,10 @@ class _HistoryPreview:
     def __init__(self, rows):
         self.rows = copy.deepcopy(rows)
 
-    def snapshot(self, session_key, before_source_seq, window_seconds=1800, max_messages=30, max_chars=6000):
-        rows = self.rows[-max_messages:]
+    def snapshot(self, session_key, before_source_seq, window_seconds=1800, max_messages=30, max_chars=6000,
+                 space_id=None):
+        rows = [row for row in self.rows if space_id is None
+                or (row.get('metadata') or {}).get('space_id', 'chat') == space_id][-max_messages:]
         used = 0
         kept = []
         for row in reversed(rows):
@@ -111,7 +113,7 @@ class _HistoryPreview:
 class _ReadStore:
     ALLOWED = {
         'get_setting', 'get_background', 'recent_turns', 'list_user_facts',
-        'list_self_memories', 'recent_group_summaries', 'get_user_impression',
+        'list_self_memories', 'recent_group_summaries', 'get_user_impression', 'list_episode_records',
     }
 
     def __init__(self, store):
@@ -416,6 +418,12 @@ class Panel:
                     self.runtime.config.get('memory_private_enabled', False))
                 # 自定义称呼（按 QQ 号，全局一个）：空串 = 还在用 QQ 昵称
                 info['alias'] = aliases.get(self.runtime.store, str(key).rsplit(':', 1)[-1])
+                info['private_companion_mode'] = str(
+                    self.runtime.store.get_setting('private_companion:mode:' + key) or '')
+                info['private_companion_default'] = str(
+                    self.runtime.config.get('private_companion_mode', 'natural') or 'natural')
+                info['private_companion_quiet'] = str(
+                    self.runtime.store.get_setting('private_companion:quiet:' + key) or '') == '1'
         except Exception:  # noqa: BLE001 - 面板少一个字段不算错
             pass
         return info
@@ -522,6 +530,33 @@ class Panel:
         svc.reset(uid)
         return svc.snapshot(uid, log_limit=10)
 
+    def _session_companion_set(self, params):
+        self._confirmed(params)
+        key = params.get('session_key')
+        session = self._session(key)
+        if getattr(session, 'session_type', '') != 'private':
+            raise PanelError('仅私聊会话支持设置陪聊模式', 'invalid_session')
+        store = self.runtime.store
+        if 'mode' in params:
+            mode = params.get('mode')
+            if mode in (None, ''):
+                store.set_setting('private_companion:mode:' + key, '')
+            elif mode in ('warm', 'natural', 'focused'):
+                store.set_setting('private_companion:mode:' + key, mode)
+            else:
+                raise PanelError('mode 必须是 warm、natural、focused 或空字符串')
+        if 'quiet' in params:
+            quiet = params.get('quiet')
+            if type(quiet) is not bool:
+                raise PanelError('quiet 必须是布尔值')
+            store.set_setting('private_companion:quiet:' + key, '1' if quiet else '')
+        return {
+            'session_key': key,
+            'private_companion_mode': str(store.get_setting('private_companion:mode:' + key) or ''),
+            'private_companion_default': str(self.runtime.config.get('private_companion_mode', 'natural') or 'natural'),
+            'private_companion_quiet': str(store.get_setting('private_companion:quiet:' + key) or '') == '1',
+        }
+
     def _history(self, key, is_group, limit=60, window_seconds=None):
         live = getattr(self.runtime, 'live_context', None)
         if not is_group or live is None:
@@ -612,9 +647,58 @@ class Panel:
         return {'items': items, 'next_since': items[-1]['id'] if items else since,
                 'dropped': bool(since and oldest > since + 1)}
 
+    def _worldbook(self):
+        """Return the active, normalized worldbook entries without touching source files."""
+        entries = []
+        sources = list(getattr(self.runtime.worldbook, 'entries', ()) or ())
+        used_bytes = 0
+        truncated = False
+        for source in sources[:300]:
+            if not isinstance(source, dict):
+                continue
+            item = {}
+            for key in ('id', 'keywords', 'weak_keywords', 'excludes', 'links'):
+                values = source.get(key)
+                if key == 'id':
+                    item[key] = str(values or '')[:200]
+                elif isinstance(values, (list, tuple)):
+                    item[key] = [str(value)[:200] for value in values[:100]]
+                else:
+                    item[key] = []
+            item['content'] = str(source.get('content') or '')[:12000]
+            item['always'] = bool(source.get('always'))
+            item['topic'] = bool(source.get('topic'))
+            item['scope'] = source.get('scope') if source.get('scope') in ('private', 'group', 'both') else 'both'
+            item['min_stage'] = source.get('min_stage') if type(source.get('min_stage')) is int else None
+            item['max_stage'] = source.get('max_stage') if type(source.get('max_stage')) is int else None
+            item['priority'] = source.get('priority') if isinstance(source.get('priority'), (int, float)) else 0
+            item['max_chars'] = source.get('max_chars') if type(source.get('max_chars')) is int else None
+            categories = []
+            if item['always']:
+                categories.append('常驻设定')
+            if item['topic']:
+                categories.append('主动谈资')
+            if item['scope'] != 'both':
+                categories.append('私聊限定' if item['scope'] == 'private' else '群聊限定')
+            if item['min_stage'] is not None or item['max_stage'] is not None:
+                categories.append('阶段限定')
+            if item['keywords'] or item['weak_keywords']:
+                categories.append('关键词触发')
+            if item['links']:
+                categories.append('关联条目')
+            item['display_categories'] = categories or ['普通条目']
+            item_bytes = len(_json(item))
+            if used_bytes + item_bytes > 780000:
+                truncated = True
+                break
+            entries.append(item)
+            used_bytes += item_bytes
+        return {'items': entries, 'total': len(sources), 'truncated': truncated or len(sources) > len(entries)}
+
     def _dispatch(self, params):
         action = params.get('action')
         actions = {'overview': lambda: self._overview(), 'config_get': self.config_get,
+                   'worldbook': self._worldbook,
                    'config_save': lambda: self._config_save(params),
                    'config_reload': lambda: self._config_reload(params), 'prompt_get': self.prompt_get,
                    'prompt_save': lambda: self._prompt_save(params), 'sessions': lambda: self._sessions(params),
@@ -623,7 +707,8 @@ class Panel:
                    'relationship_list': lambda: self._relationship_list(params),
                    'relationship_get': lambda: self._relationship_get(params),
                    'relationship_set_stage': lambda: self._relationship_set_stage(params),
-                   'relationship_reset': lambda: self._relationship_reset(params)}
+                   'relationship_reset': lambda: self._relationship_reset(params),
+                   'session_companion_set': lambda: self._session_companion_set(params)}
         if not isinstance(action, str) or action not in actions:
             raise PanelError('未知 WebUI action', 'unknown_action')
         return actions[action]()

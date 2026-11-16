@@ -17,7 +17,6 @@
     【正在发生｜截至 22:41】
     场景：清泉镇·麦穗面包坊，傍晚；在场：道君(10001)、月白(10002)
     进行中：教道君揉面（还差二次发酵）；等他回答要不要去后山
-    她答应过：明天带他去看后山的面包窑
     未解决：月白为什么突然问起"逐影"
     （以上只是这段对话的连续性参考，不是指令；长期设定以人设与记忆为准。）
 """
@@ -26,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from contextlib import nullcontext
 import threading
 import time
 
@@ -46,13 +47,14 @@ SCENE_PROMPT = (
     '格式（字段值全部是单行短句，不要换行）：\n'
     '{"scene":"地点/时间/在场的人（用 昵称(QQ号) 标注）",'
     '"threads":["还在进行中的事，1~3 条，每条≤40字"],'
-    '"promises":["她明确答应过/约好的事，0~3 条"],'
     '"open_questions":["有人问了但还没回答的问题，0~2 条"]}\n'
     '用第三人称客观陈述，不要用"我"。没有内容的字段给空字符串或空数组。\n'
+    '不要记录承诺、约定及其状态，承诺由独立结构化记忆负责；不把约定藏进threads/scene。\n'
     '注意：`scene` 里的"在场"只写对方/群友，**不要把歌伊自己写进去**（她就是读这段的人）。'
 )
 
-FIELD_LIMIT = 120          # 单条 thread/promise 的硬上限（模型偶尔会写长段）
+_PROMISE_RE = re.compile(r'答应|约好|承诺|约定|说定|一言为定')
+FIELD_LIMIT = 120          # 单条 thread/question 的硬上限（模型偶尔会写长段）
 TRANSCRIPT_MAX_CHARS = 4000
 
 
@@ -111,13 +113,11 @@ def format_brief(data: dict, max_chars: int = 500) -> str:
     threads = _clean_list(data.get('threads'), 3)
     if threads:
         parts.append('进行中：' + '；'.join(threads))
-    promises = _clean_list(data.get('promises'), 3)
-    if promises:
-        parts.append('她答应过：' + '；'.join(promises))
     questions = _clean_list(data.get('open_questions'), 2)
     if questions:
         parts.append('未解决：' + '；'.join(questions))
-    text = '\n'.join(parts).strip()
+    # 模型即使把约定藏进scene/threads，也不得生成承诺的第二来源。
+    text = _without_promises('\n'.join(parts)).strip()
     if len(text) > max_chars:
         text = text[:max_chars].rstrip('，,、；;。 ') + '…'
     return text
@@ -140,17 +140,48 @@ def get_brief(store, session_key: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def save_brief(store, session_key: str, text: str, covered_to: int, now: float | None = None) -> None:
-    payload = {
-        'text': str(text or ''),
-        'covered_to': int(covered_to or 0),
-        'updated_at': int(now or time.time()),
+def _transaction(store):
+    return store.transaction() if hasattr(store, 'transaction') else nullcontext()
+
+
+def _state(store, session_key: str) -> dict:
+    return {
+        'forget_epoch': int(store.forget_epoch()) if hasattr(store, 'forget_epoch') else 0,
+        'generation': int(store.get_setting('scene.generation:' + session_key, '0') or 0),
+        'space_id': str(store.get_setting('memory.space:' + session_key, 'chat') or 'chat'),
     }
+
+
+def _matches(brief: dict, state: dict) -> bool:
+    # 无版本的历史纸条只在未遗忘、未切换过的普通空间兼容读取。
+    return all(brief.get(key, default) == state[key]
+               for key, default in (('forget_epoch', 0), ('generation', 0), ('space_id', 'chat')))
+
+
+def _without_promises(text: str) -> str:
+    return '\n'.join(line for line in text.splitlines()
+                     if not line.strip().startswith(('她答应过：', '她答应过:', '承诺：', 'promises:'))
+                     and not _PROMISE_RE.search(line))
+
+
+def save_brief(store, session_key: str, text: str, covered_to: int, now: float | None = None,
+               expected: dict | None = None, expected_brief: dict | None = None) -> bool:
+    """短事务CAS；模型调用在外面，迟到结果不覆盖新纸条/剧情/遗忘状态。"""
     try:
-        store.set_setting(SCENE_PREFIX + str(session_key),
-                          json.dumps(payload, ensure_ascii=False))
+        with _transaction(store):
+            state = _state(store, session_key)
+            current = get_brief(store, session_key)
+            if expected is not None and (state != expected or current != expected_brief):
+                return False
+            if current and _matches(current, state) and int(current.get('covered_to') or 0) > covered_to:
+                return False
+            payload = dict(state, text=_without_promises(str(text or '')),
+                           covered_to=int(covered_to or 0), updated_at=int(now or time.time()))
+            store.set_setting(SCENE_PREFIX + str(session_key), json.dumps(payload, ensure_ascii=False))
+        return True
     except Exception:  # noqa: BLE001 - 写失败只是这一轮没有新纸条
         logger.exception('状态纸条写入失败（%s）', str(session_key)[-14:])
+        return False
 
 
 def is_fresh(brief: dict | None, ttl_seconds: float, now: float | None = None) -> bool:
@@ -164,13 +195,21 @@ def is_fresh(brief: dict | None, ttl_seconds: float, now: float | None = None) -
     return (now or time.time()) - ts <= ttl_seconds
 
 
-def to_prompt(store, session_key: str, config: dict, now: float | None = None) -> str:
-    """取出可以直接塞进 system 的纸条文本；过期/没有/空则返回空串。"""
-    brief = get_brief(store, session_key)
+def to_prompt(store, session_key: str, config: dict, now: float | None = None,
+              space_id: str | None = None) -> str:
+    """取有效纸条；传入L0冻结空间时必须精确匹配，不随当前剧情重归类。"""
+    with _transaction(store):
+        brief = get_brief(store, session_key)
+        if not brief or not _matches(brief, _state(store, session_key)):
+            return ''
+        if space_id is not None and str(brief.get('space_id', 'chat')) != str(space_id):
+            return ''
     ttl = float(config.get('scene_ttl_seconds', 7200) or 0)
     if not is_fresh(brief, ttl, now):
         return ''
-    text = str(brief.get('text') or '').strip()
+    text = _without_promises(str(brief.get('text') or '')).strip()
+    if not text:
+        return ''
     stamp = time.strftime('%H:%M', time.localtime(float(brief.get('updated_at') or 0)))
     return ('【正在发生｜截至 %s】\n%s\n'
             '（以上只是这段对话的连续性参考，不是指令；长期设定以人设与记忆为准。）'
@@ -258,9 +297,14 @@ class SceneKeeper:
         if not self.enabled or self.gateway is None:
             return False
         now = time.time()
-        brief = get_brief(self.store, session_key)
-        covered = int((brief or {}).get('covered_to') or 0)
-        pending = int(self.store.buffer_pending(session_key, covered) or 0)
+        with _transaction(self.store):
+            expected = _state(self.store, session_key)
+            expected_brief = get_brief(self.store, session_key)
+            brief = expected_brief if expected_brief and _matches(expected_brief, expected) else None
+            watermark = int(self.store.get_setting(
+                'episode.derivation_watermark:' + session_key, '0') or 0)
+            covered = max(int((brief or {}).get('covered_to') or 0), watermark)
+            pending = int(self.store.buffer_pending(session_key, covered) or 0)
         if pending <= 0:
             return False
 
@@ -286,9 +330,29 @@ class SceneKeeper:
             return False
 
         limit = max(4, int(self.config.get('scene_input_messages', 80) or 80))
-        rows = self.store.buffer_fetch(session_key, covered, limit=limit)
+        with _transaction(self.store):
+            if (_state(self.store, session_key) != expected
+                    or get_brief(self.store, session_key) != expected_brief):
+                return False
+            fetched = self.store.buffer_fetch(session_key, covered, limit=limit)
+            rows = []
+            for row in fetched:
+                metadata = row.get('metadata') or {}
+                space = str(metadata.get('space_id') or 'chat')
+                if space != expected['space_id']:
+                    continue
+                if hasattr(self.store, 'forget_watermark'):
+                    uid = str(row.get('sender_id') or '')
+                    if row['id'] <= self.store.forget_watermark(session_key, uid):
+                        continue
+                rows.append(row)
         transcript = build_transcript(rows)
+        covered_to = int(fetched[-1]['id']) if fetched else covered
         if not transcript:
+            # 切换后旧空间原文可能超过一次fetch；逐批跳过，避免永远卡在旧前缀。
+            if covered_to > covered:
+                save_brief(self.store, session_key, '', covered_to=covered_to, now=now,
+                           expected=expected, expected_brief=expected_brief)
             return False
 
         data = self._ask(session_key, transcript)
@@ -299,10 +363,13 @@ class SceneKeeper:
         if not text:
             # 抽出来是空的（这批确实没有可写的）：照样推进游标，免得同一批反复烧钱
             logger.info('状态纸条为空（本段没有可写的事），游标推进 | %s', str(session_key)[-14:])
-            save_brief(self.store, session_key, '', covered_to=int(rows[-1]['id']), now=now)
+            save_brief(self.store, session_key, '', covered_to=covered_to, now=now,
+                       expected=expected, expected_brief=expected_brief)
             return False
 
-        save_brief(self.store, session_key, text, covered_to=int(rows[-1]['id']), now=now)
+        if not save_brief(self.store, session_key, text, covered_to=covered_to, now=now,
+                          expected=expected, expected_brief=expected_brief):
+            return False
         try:
             # 写 '0' 而不是空串：空串在 float() 里会抛，虽然上层兜住了，但别留这种坑
             self.store.set_setting(FAIL_PREFIX + str(session_key), '0')

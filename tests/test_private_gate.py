@@ -245,6 +245,7 @@ class PrivateGateRoutingTest(unittest.TestCase):
         self.rt.config['private_daily_quota_global'] = 0
         self.uid = '9%06d' % next(_SEQ)
         self.submitted = []
+        self.rt.private_turns = None  # 本用例直测 PrivateGate 同步路由，不走防抖定时器
         self.rt.scheduler.submit = lambda msg, kind: (self.submitted.append(kind), True)[1]
 
     def _route(self, text, uid=None):
