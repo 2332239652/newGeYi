@@ -8,7 +8,7 @@
 2. **私聊当成群聊**：她在私聊里说过「这里是群诶，大家都看见了」——因为当前消息既没有
    场景说明，记忆块标题还写着「这个群最近发生过什么」。
 3. **私聊没有发言人标签 → 主人判定失效**：`昵称(QQ号)：` 只有群聊才带，
-   于是【主人】那条「只有 2332239652 是主人」在私聊里完全无从判定。
+   于是【主人】那条「只有 100000001 是主人」在私聊里完全无从判定。
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ os.environ['GEYI_DATA_DIR'] = _SCRATCH
 from newGeYi.models import IncomingMessage, SessionKey  # noqa: E402
 from newGeYi.routing.message_router import MessageRouter  # noqa: E402
 
-BOT = '53da3460cc454e12667452872284f47d'
-OWNER = '2332239652'
+BOT = '00000000000000000000000000000000'
+OWNER = '100000001'
 STRANGER = '1000000002'
 
 
@@ -149,7 +149,7 @@ class PrivatePromptTest(unittest.TestCase):
         messages = self.rt.prompt_builder.build(msg)
         system = messages[0]['content']
         current = messages[-1]['content']
-        self.assertTrue(current.startswith('歌靡(2332239652)：'), current)
+        self.assertTrue(current.startswith('歌靡(100000001)：'), current)
         self.assertNotIn('这是私聊', current)
         self.assertNotIn('这是私聊', system)
 

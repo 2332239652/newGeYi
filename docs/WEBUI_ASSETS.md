@@ -5,7 +5,7 @@
 ## 原素材审阅与选择
 
 - 总览立绘选用：[歌伊.png](<<素材目录>/歌伊.png>)。Pillow 实际识别为 **PNG**，2942 × 4035，6,992,335 bytes。
-- 导航头像选用（用户指定）：[微信图片_20260102233525_142_16.png](<<素材目录>/头像源图.png>)。Pillow 识别为 **PNG（原生 RGBA 透明底）**，2048 × 2048，802,763 bytes，Q 版眨眼比心造型非常适合侧栏圆形品牌头像。
+- 导航头像选用（用户指定）：[头像源图.png](<<素材目录>/头像源图.png>)。Pillow 识别为 **PNG（原生 RGBA 透明底）**，2048 × 2048，802,763 bytes，Q 版眨眼比心造型非常适合侧栏圆形品牌头像。
 - 原素材目录通过 glob 列出；本轮只解码像素，不读取 EXIF 提示词，不复制原图 EXIF、PNG comment、XMP 或 ICC profile。
 
 ## 交付素材
@@ -15,7 +15,7 @@
 | 文件 | 用途 | 源文件 | 原图裁切 bbox | 导出尺寸 | WebP 参数 | 字节数 |
 | --- | --- | --- | --- | --- | --- | ---: |
 | [geyi-portrait.webp](<../webui/assets/geyi-portrait.webp>) | Overview 人物展示，完整原生水彩与薄荷星芒构图 | `歌伊.png` | `(0, 0, 2942, 4035)` | 630 × 864 | quality 88 / method 6 / exact true | 62,556 |
-| [geyi-avatar.webp](<../webui/assets/geyi-avatar.webp>) | 侧栏导航圆形品牌头像（Q 版眨眼比心） | `微信图片_20260102233525_142_16.png` | `(100, 140, 1948, 1988)` | 192 × 192 | quality 92 / method 6 / exact true | 16,242 |
+| [geyi-avatar.webp](<../webui/assets/geyi-avatar.webp>) | 侧栏导航圆形品牌头像（Q 版眨眼比心） | `头像源图.png` | `(100, 140, 1948, 1988)` | 192 × 192 | quality 92 / method 6 / exact true | 16,242 |
 
 合计 **78,798 bytes**。两张文件都以真正的 WebP 编码导出，扩展名与解码格式一致，且均已通过 `data:image/webp;base64` 内嵌进 `webui/index.html`。
 

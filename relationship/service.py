@@ -26,8 +26,8 @@ from ..models import IncomingMessage, ModelRequest
 from ..runtime import sponsors
 from ..storage.database import SQLiteStore, text_similarity
 from .judge import build_judge_messages, parse_verdict
-from .stages import (FACT_LIMIT_BY_STAGE, FEELINGS, MAX_STAGE, MILESTONES, STAGE_NAMES,
-                     build_relation_block)
+from .stages import (EVENTS, FACT_LIMIT_BY_STAGE, FEELINGS, MAX_STAGE, MILESTONES,
+                     STAGE_NAMES, STAGE_UP_CUES, STAGE_UP_HINTS, build_relation_block)
 from .state import (Outcome, Relation, allowed_advance, apply_delta, apply_presence,
                     complete_event, day_key, is_narration_hijack, is_repeat, is_trivial,
                     params_from_config, set_stage)
@@ -37,6 +37,22 @@ logger = logging.getLogger('newGeYi.relationship')
 MOOD_HOURS = 6
 TOPIC_TURNS_PER_DAY = 2
 TOPIC_TOLD_KEEP = 40
+# 刚升级后，"关系"指令里的那句关系提示保留多久（之后自然不再出现，不写数据库）。
+STAGE_UP_HINT_SECONDS = 24 * 3600
+
+
+def _merge_notes(*parts) -> str:
+    """合并评审 note 与状态机写回的限流 note（去空、去重、按顺序用空格连起来）。
+
+    2026-11 修复：以前 `verdict['note']` 会把 apply_delta 写回的
+    diminished / daily_cap / locked 覆盖掉，日志里就看不出"这一轮为什么只加 0.x"。
+    """
+    out = []
+    for part in parts:
+        text = ' '.join(str(part or '').split())
+        if text and text not in out:
+            out.append(text)
+    return ' '.join(out)
 
 # ===== 轻微越界（2026-11-07 新增）=====
 # 数据背景：41 条扣分**全部**发生在 stage 0/1（允许 L1），其中 30 条是 L2——
@@ -174,9 +190,17 @@ class RelationshipService:
         return [dict(zip(keys, r)) for r in rows]
 
     # ==================== prompt 注入 ====================
-    def block_for(self, msg: IncomingMessage) -> str:
+    def block_for(self, msg: IncomingMessage, consume: bool = True) -> str:
+        """生成【此刻你与对方的关系】块。
+
+        `consume=False` 时完全只读：不推进 event_turns、不消费 stage_up_cue、不写谈资。
+        主回复链路一律走只读版，等回复真的发出去以后再调 `commit_prompt_effects()` ——
+        否则一次重试/失败就会把「刚升级」的演出和事件轮次各吃掉一次（双倍消耗）。
+        """
         if not self.active_for(msg):
             return ''
+        if not consume:
+            return self.preview_block_for(msg)
         try:
             now = time.time()
             with self._lock_for(msg.sender_id), self.store.transaction():
@@ -187,10 +211,24 @@ class RelationshipService:
                 if event:
                     rel.flags['event_turns'] = int(rel.flags.get('event_turns') or 0) + 1
                     dirty = True
-                topic, changed = self._topic_for(rel, now)
+                # 刚升级那一轮只演"关系近了一步"：一次性取出，并把每日谈资顺延到下一轮
+                # （两段戏一起灌进去会把人设演碎，见设计文档备注）。
+                stage_up = ''
+                cue_stage = int(rel.flags.get('stage_up_cue') or 0)
+                if 0 < cue_stage <= MAX_STAGE:
+                    stage_up = STAGE_UP_CUES[cue_stage]
+                    rel.flags.pop('stage_up_cue', None)
+                    dirty = True
+                if stage_up:
+                    topic, changed = '', False
+                elif rel.flags.get('topic_spoken'):
+                    # 今天这条已经讲过了：即使 date 变了也不再抽（同一天内讲过就是讲过）
+                    topic, changed = '', False
+                else:
+                    topic, changed = self._topic_for(rel, now)
                 if dirty or changed:
                     self.save(rel)
-            block = build_relation_block(rel.stage, mood, event, topic)
+            block = build_relation_block(rel.stage, mood, event, topic, stage_up)
             # 上一轮对方有点太亲近（轻微越界）：这一轮让她有点小反应，读一次就消掉
             note = self._take_mild_note(msg, now)
             return (block + '\n' + note).strip() if note else block
@@ -199,7 +237,12 @@ class RelationshipService:
             return ''
 
     def preview_block_for(self, msg: IncomingMessage) -> str:
-        """只读预览版 block_for：供调试台预览使用，不产生任何数据库写入或状态变更。"""
+        """只读预览版 block_for：不产生任何数据库写入或状态变更。
+
+        预览也不**抽**当天的谈资：抽签本身会写一条「今日谈资」记录，
+        拼一次 prompt 就顺手把当天的谈资定下来，等于用读操作改了状态。
+        当天还没抽时这里按同样的规则算出一条候选，但不落库。
+        """
         if not self.active_for(msg):
             return ''
         try:
@@ -208,12 +251,93 @@ class RelationshipService:
                 rel = self.load(msg.sender_id)
                 mood = rel.mood if rel.mood_until > now else ''
                 event = str(rel.flags.get('pending_event') or '')
-                topic, _ = self._topic_for(rel, now, readonly=True)
-            block = build_relation_block(rel.stage, mood, event, topic)
+                # 预览不消耗一次性状态：刚升级的 cue 只读展示，等真正说话时才清掉
+                stage_up = ''
+                cue_stage = int(rel.flags.get('stage_up_cue') or 0)
+                if 0 < cue_stage <= MAX_STAGE:
+                    stage_up = STAGE_UP_CUES[cue_stage]
+                if stage_up:
+                    topic = ''
+                elif rel.flags.get('topic_day') == day_key(now):
+                    # 当天已抽过：走同一套判定（讲过 / 轮次用尽都返回空）
+                    topic, _ = self._topic_for(rel, now, readonly=True)
+                elif rel.flags.get('topic_spoken'):
+                    topic = ''
+                else:
+                    # 今天还没抽过：只算候选，不写库（真抽签留给 commit_prompt_effects）
+                    topic = self._peek_topic(rel, now)
+            block = build_relation_block(rel.stage, mood, event, topic, stage_up)
             note = self._peek_mild_note(msg, now)
             return (block + '\n' + note).strip() if note else block
         except Exception:  # noqa: BLE001
             return ''
+
+    def _peek_topic(self, rel: Relation, now: float) -> str:
+        """按今天的抽签规则算出谈资，但不落任何状态。"""
+        if self.worldbook is None:
+            return ''
+        day = day_key(now)
+        pool = self.worldbook.topics(stage=rel.stage, scope='private')
+        told = list(rel.flags.get('told_topics') or [])
+        fresh = [t for t in pool if t['id'] not in told]
+        if not fresh and pool:
+            fresh = list(pool)
+        last_unspoken = str(rel.flags.get('last_unspoken_topic') or '')
+        if last_unspoken and len(fresh) > 1:
+            alt = [t for t in fresh if t['id'] != last_unspoken]
+            if alt:
+                fresh = alt
+        if not fresh:
+            return ''
+        pick = min(fresh, key=lambda t: hashlib.md5(
+            f'{rel.user_id}{day}{t["id"]}'.encode('utf-8')).hexdigest())
+        return (pick['content'] or '')[:240]
+
+    def commit_prompt_effects(self, msg: IncomingMessage, now: float | None = None) -> None:
+        """回复成功发出后，才真正消费这一轮 prompt 里一次性用掉的关系状态。
+
+        与 `block_for(consume=True)` 等价的那部分写入，但没有"每轮必加"的副作用：
+          * 有在途事件 → event_turns += 1（超时兜底与裁判判据都靠它计数）；
+          * stage_up_cue 正好是当前阶段 → 消费掉（"刚升级"的演出只演一轮）；
+          * 当天还没抽谈资时抽一次（抽签要落库，读操作里不能抽）；
+          * 消费一次性的轻度越界提示。
+        这样 LLM 报错、重试、并发攒批都只是多算了一次 prompt，不会白吃状态。
+        """
+        if msg.is_group or not self.enabled() or self.is_exempt(msg.sender_id):
+            return
+        if not msg.sender_id:
+            return
+        now = time.time() if now is None else float(now)
+        try:
+            with self._lock_for(msg.sender_id), self.store.transaction():
+                rel = self.load(msg.sender_id)
+                changed = False
+                cue = int(rel.flags.get('stage_up_cue') or 0)
+                # 谈资放进 prompt 算一轮：读操作不计数，这里补记（否则「今天最多提三轮」永不生效）
+                topic_shown = bool(
+                    not cue and rel.flags.get('topic_text')
+                    and not rel.flags.get('topic_spoken')
+                    and int(rel.flags.get('topic_n') or 0) < TOPIC_TURNS_PER_DAY)
+                # 今天还没抽谈资、而这一轮 prompt 里又没有升级演出 → 现在真的抽一条
+                # （抽签要落库，只读的 preview 里只能算候选）
+                if not cue and rel.flags.get('topic_day') != day_key(now):
+                    self._topic_for(rel, now)
+                    changed = True
+                    topic_shown = True
+                if rel.flags.get('pending_event'):
+                    rel.flags['event_turns'] = int(rel.flags.get('event_turns') or 0) + 1
+                    changed = True
+                if cue == rel.stage:
+                    rel.flags.pop('stage_up_cue', None)
+                    changed = True
+                if topic_shown and not rel.flags.get('topic_spoken'):
+                    rel.flags['topic_n'] = int(rel.flags.get('topic_n') or 0) + 1
+                    changed = True
+                if changed:
+                    self.save(rel)
+            self._take_mild_note(msg, now)
+        except Exception:  # noqa: BLE001 - 记账失败不能挡住已经发出去的回复
+            logger.exception('提交关系状态失败')
 
     def _mark_mild_overstep(self, session_key: str, now: float) -> None:
         """记一笔「对方刚才那句比现在的关系更近一点」，下一轮让她有点小反应。
@@ -300,10 +424,9 @@ class RelationshipService:
         if rel.flags.get('topic_spoken'):
             return '', changed
         text = str(rel.flags.get('topic_text') or '')
+        # 计数只在 commit_prompt_effects 里加：读操作（preview_block_for）不能推进轮次，
+        # 否则调试台预览几次就把「今天最多提三轮」用光了。
         if text and int(rel.flags.get('topic_n') or 0) < TOPIC_TURNS_PER_DAY:
-            if not readonly:
-                rel.flags['topic_n'] = int(rel.flags.get('topic_n') or 0) + 1
-                changed = True
             return text, changed
         return '', changed
 
@@ -462,6 +585,9 @@ class RelationshipService:
                     applied += apply_presence(rel, now, p).applied
                 out = apply_delta(rel, raw, tag, now, p)
                 applied += out.applied
+                # apply_delta 会写回 diminished/daily_cap/locked 等限流 note，不能丢：
+                # 和评审 note 合并成一条（评审 note 在前），日志和 relationship_log 都看得到。
+                note = _merge_notes(note, out.note)
                 total.event_started = out.event_started
                 if verdict and verdict.get('mood'):
                     rel.mood, rel.mood_until = verdict['mood'], now + MOOD_HOURS * 3600
@@ -469,11 +595,19 @@ class RelationshipService:
                 pending = str(rel.flags.get('pending_event') or '')
                 if pending:
                     turns_done = int(rel.flags.get('event_turns') or 0)
+                    # 超时兜底只在"这一轮是正常互动"时才放行：
+                    # 否则刷屏、挑衅、旁白劫持、评审宕机拖到第 6 轮，都会把事件白白送过去。
+                    bad_tag = (str(tag) in ('rude', 'lie', 'spam', 'flirt_early', 'pushy',
+                                            'overstep', 'judge_fail'))
+                    timeout_ok = (turns_done >= p.event_timeout_turns
+                                  and not spam and not hijack and not bad_tag)
                     if ((verdict and verdict.get('event_done') and turns_done >= 1)
-                            or turns_done >= p.event_timeout_turns):
+                            or timeout_ok):
                         ev_out = complete_event(rel, pending, now, p)
                         applied += ev_out.applied
-                        note = (note + f' event_{pending}_done').strip()
+                        note = _merge_notes(note, ev_out.note or f'event_{pending}_done')
+                    elif turns_done >= p.event_timeout_turns:
+                        note = _merge_notes(note, 'event_timeout_blocked')
                 total.stage_after = rel.stage
 
             # 主动谈资消耗判定：若本轮回复里已经实际提起了今日谈资，标记为已讲并停止后续轮次重复注入；
@@ -492,11 +626,18 @@ class RelationshipService:
                 elif int(rel.flags.get('topic_n') or 0) >= TOPIC_TURNS_PER_DAY and t_id:
                     rel.flags['last_unspoken_topic'] = t_id
 
+            if rel.stage > stage_before:
+                # 下一轮注入一次"关系近了一步"的演出提示（block_for 读完即清），
+                # 同时让「关系」指令在 24 小时内带上对应的一句关系提示。
+                rel.flags['stage_up_cue'] = int(rel.stage)
+                rel.flags['stage_up_hint'] = int(rel.stage)
+                rel.flags['stage_up_hint_at'] = float(now)
             self.save(rel)
             self._log(uid, delta_raw=raw, delta_applied=applied, tag=tag, level=level,
                       aff_before=aff_before, aff_after=rel.affection,
                       stage_before=stage_before, stage_after=rel.stage, shadow=shadow,
                       note=note, user_text=user_text, reply_text=reply_text)
+            logger.debug('关系结算 %s applied=%+.1f tag=%s note=%s', uid, applied, tag, note)
             if rel.stage > stage_before:
                 self._on_stage_up(session_key, name, rel.stage)
             if rel.stage != stage_before:
@@ -556,6 +697,11 @@ class RelationshipService:
         if rel.flags.get('impression_dirty'):
             text += ('你们的关系刚刚进入新的阶段：即使这批聊天没有新内容，也请为他输出一条'
                      '符合该阶段的完整新印象。\n')
+        # 待演出的小事件：别让记忆提炼把"还没发生的事"当成已经发生（演完了下一轮才清）。
+        pending = str(rel.flags.get('pending_event') or '')
+        if pending in EVENTS:
+            text += (f'你们之间还有一件还没演完的小事「{EVENTS[pending]["title"]}」：'
+                     '写他的印象时，不要把这件还没发生的事写成已经发生。\n')
         return text
 
     def mark_impression_done(self, session_key: str) -> None:
@@ -588,7 +734,22 @@ class RelationshipService:
             if gain >= cap:
                 tail += '，已经满啦，明天再来吧'
             tail += '）'
-        return f'「{STAGE_NAMES[rel.stage]}」——{FEELINGS[rel.stage]}' + tail
+        hint = self._stage_up_hint(rel)
+        text = f'「{STAGE_NAMES[rel.stage]}」——{FEELINGS[rel.stage]}'
+        if hint:
+            text += '\n' + hint
+        return text + tail
+
+    @staticmethod
+    def _stage_up_hint(rel: Relation) -> str:
+        """刚升级的 24 小时内，"关系"指令里多一句关系提示（不改状态，过期自然消失）。"""
+        stage = int(rel.flags.get('stage_up_hint') or 0)
+        if not 0 < stage <= MAX_STAGE:
+            return ''
+        stamp = float(rel.flags.get('stage_up_hint_at') or 0)
+        if stamp and time.time() - stamp > STAGE_UP_HINT_SECONDS:
+            return ''
+        return STAGE_UP_HINTS[stage]
 
     def describe(self, uid: str) -> str:
         rel = self.load(uid)
@@ -627,6 +788,10 @@ class RelationshipService:
             'bad_streak': rel.bad_streak,
             'locked_until': rel.locked_until if rel.locked_until > time.time() else 0,
             'pending_event': str(rel.flags.get('pending_event') or ''),
+            'event_turns': int(rel.flags.get('event_turns') or 0),
+            # 当日谈资（与 prompt 里注入的那条一致）：私聊主动搭话要挂得上同一件事
+            'topic': (str(rel.flags.get('topic_text') or '')
+                      if str(rel.flags.get('topic_day') or '') == day_key(time.time()) else ''),
             'events_done': sorted(k for k, v in rel.flags.items()
                                   if k.startswith('event_') and k.endswith('_done') and v),
             'mood': rel.mood if rel.mood_until > time.time() else '',

@@ -351,13 +351,13 @@ class PanelTest(unittest.TestCase):
         pkey = SessionKey('bot', 'qq', 'onebot', 'private', '', uid).as_text()
         self.runtime.relationship.force_stage(uid, 3)
         before_db = '\n'.join(self.runtime.store._conn().iterdump())
-        result = self.call('debug_preview', session_key=pkey, text='你有哥哥吗？', sender_id=uid,
+        result = self.call('debug_preview', session_key=pkey, text='能聊聊示例主题吗？', sender_id=uid,
                            sender_name='测试私聊', is_group=False)
         self.assertTrue(result['ok'], result)
         sys_prompt = result['data']['messages'][0]['content']
         self.assertIn('【此刻你与对方的关系', sys_prompt)
         self.assertIn('阶段：亲近', sys_prompt)
-        self.assertIn('废墟', sys_prompt)
+        self.assertIn('仅在指定私聊阶段可用的示例。', sys_prompt)
         self.assertEqual(before_db, '\n'.join(self.runtime.store._conn().iterdump()))
 
     def test_isolated_authorization_token_and_url_password_are_redacted(self):

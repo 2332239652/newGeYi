@@ -45,7 +45,7 @@ class FakeStore:
         self.settings[key] = value
 
     # --- buffer ---
-    def add(self, role, content, sender_id='10001', sender_name='道君', created=None):
+    def add(self, role, content, sender_id='10001', sender_name='参与者甲', created=None):
         self.rows.append({
             'id': self.next_id, 'role': role, 'content': content,
             'sender_id': sender_id, 'sender_name': sender_name,
@@ -84,10 +84,10 @@ class FakeGateway:
 
 def brief_json(**kwargs):
     data = {
-        'scene': '清泉镇·麦穗面包坊，傍晚；在场：道君(10001)',
-        'threads': ['教道君揉面（还差二次发酵）'],
+        'scene': '示例地点，傍晚；在场：参与者甲(10001)',
+        'threads': ['教参与者甲揉面（还差二次发酵）'],
         'promises': ['明天带他去看后山的面包窑'],
-        'open_questions': ['月白为什么问起逐影'],
+        'open_questions': ['角色甲为什么问起角色乙'],
     }
     data.update(kwargs)
     return json.dumps(data, ensure_ascii=False)
@@ -126,12 +126,12 @@ class FormatTest(unittest.TestCase):
 class TranscriptTest(unittest.TestCase):
     def test_speaker_labels_keep_qq(self):
         rows = [
-            {'role': 'user', 'content': '晚上好', 'sender_id': '10001', 'sender_name': '道君'},
+            {'role': 'user', 'content': '晚上好', 'sender_id': '10001', 'sender_name': '参与者甲'},
             {'role': 'assistant', 'content': '晚上好呀'},
-            {'role': 'user', 'content': '', 'sender_id': '10001', 'sender_name': '道君'},
+            {'role': 'user', 'content': '', 'sender_id': '10001', 'sender_name': '参与者甲'},
         ]
         text = scene.build_transcript(rows)
-        self.assertIn('道君(10001)：晚上好', text)
+        self.assertIn('参与者甲(10001)：晚上好', text)
         self.assertIn('歌伊：晚上好呀', text)
         self.assertEqual(len(text.splitlines()), 2)
 
@@ -210,7 +210,7 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.gateway.calls[0]['kind'], 'scene')
         brief = scene.get_brief(self.store, SESSION)
         self.assertEqual(brief['covered_to'], 4)
-        self.assertIn('面包坊', brief['text'])
+        self.assertIn('示例地点', brief['text'])
         # 没有新消息就不再调
         self.assertFalse(self.keeper.consider(SESSION))
         self.assertEqual(len(self.gateway.calls), 1)
@@ -270,7 +270,7 @@ class KeeperTest(unittest.TestCase):
             self.store.add('user', '消息%d' % i)
         self.assertTrue(self.keeper.consider(SESSION))
         self.assertEqual(len(self.gateway.calls), 2, '应当重试一次')
-        self.assertIn('面包坊', scene.get_brief(self.store, SESSION)['text'])
+        self.assertIn('示例地点', scene.get_brief(self.store, SESSION)['text'])
 
     def test_reasoning_budget_is_large_enough(self):
         """400/1200 都会被思考链吃光，默认必须给到 3200（与记忆提炼同档）。"""
@@ -303,7 +303,7 @@ class PromptInjectionTest(unittest.TestCase):
         session = SessionKey(bot_hash='h', platform='qq', sdk='onebot',
                              session_type='group', host_id='-', target_id='9990001')
         return IncomingMessage(
-            session=session, message_id='1', sender_id='10001', sender_name='道君',
+            session=session, message_id='1', sender_id='10001', sender_name='参与者甲',
             text='我们刚才说到哪了', raw_text='我们刚才说到哪了', is_group=True,
             mentioned_bot=False, event=types.SimpleNamespace(send=lambda *a, **k: None),
             proc=None, arrival_seq=1, sender_is_bot=False)

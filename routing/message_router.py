@@ -32,13 +32,41 @@ class MessageRouter:
         return val != '0'
 
     def _private_gate(self):
-        """私聊闸门实例挂在 runtime 上；没有就现建一个（测试用的最小 runtime）。"""
+        """私聊闸门（惰性构建，挂到 runtime 上复用）。"""
         gate = getattr(self.r, 'private_gate', None)
         if gate is None:
-            from ..runtime.private_gate import PrivateGate
+            from ..runtime.private_gate import PrivateGate  # noqa: PLC0415 - 避免循环导入
             gate = PrivateGate(self.r.store, self.r.config)
-            self.r.private_gate = gate
+            try:
+                self.r.private_gate = gate
+            except Exception:  # noqa: BLE001 - 运行时不允许挂属性就每次重建
+                pass
         return gate
+
+    def _private_active(self):
+        """私聊主动搭话服务（惰性构建）。开关关着时返回 None，调用方直接跳过。
+
+        巡检线程在**第一条私聊**到来时顺带拉起：`runtime/` 不在本次改动范围内，
+        没法在 `Runtime.start()` 里加一行 `self.private_active.start()`，
+        而开关默认关闭时这里根本不会执行，所以对既有行为零影响。
+        """
+        service = getattr(self.r, 'private_active', None)
+        if service is None:
+            if not self.r.config.get('private_active_enabled', False):
+                return None
+            from .private_active import PrivateActiveService  # noqa: PLC0415 - 避免循环导入
+            service = PrivateActiveService(self.r, self.r.config)
+            try:
+                self.r.private_active = service
+            except Exception:  # noqa: BLE001
+                pass
+        start = getattr(service, 'start', None)
+        if callable(start):
+            try:
+                start()
+            except Exception:  # noqa: BLE001 - 线程起不来也不该挡回复
+                logger.exception('私聊主动巡检线程启动失败')
+        return service
 
     def _quota_hint(self, msg: IncomingMessage, why: str) -> str:
         """额度用尽时提示一次（每会话每天最多一次），免得用户以为她坏了。
@@ -96,6 +124,13 @@ class MessageRouter:
         if callable(is_resting) and is_resting(session_key):
             self._debug(msg, False, False, '歌伊在本群自我保护静默中')
             return
+        # 私聊主动搭话的记账：对方一开口就刷新静默计时、解除「连续冷场」熔断。
+        # 必须在下面所有 return 之前做，否则被闸门拦下的消息永远不会解除熔断。
+        # `private_active_enabled` 关着时 `_private_active()` 返回 None，什么都不做。
+        if not msg.is_group:
+            service = self._private_active()
+            if service is not None:
+                service.remember(msg)
         # 私聊里对方的每一句都是对你说的，不需要靠触发词点名。
         # 以前这里只看「有没有 @ / 有没有触发词」，结果**私聊里只要不含「歌伊」就整条丢掉**：
         # 线上实测 2026-11-01 20:47~20:50，'发语音啦'、'狗，修，金，sama~' 这样的私聊

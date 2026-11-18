@@ -28,30 +28,34 @@ ALL_TAGS = frozenset({'care', 'share', 'humor', 'curious_lore', 'respect', 'neut
 @dataclass
 class Params:
     thresholds: tuple = (0, 15, 50, 110, 190, 280)
-    min_days: tuple = (0, 1, 3, 7, 14, 21)
-    daily_cap: tuple = (12, 12, 12, 10, 9, 8)
-    stage_factor: tuple = (1.0, 1.0, 0.9, 0.8, 0.7, 0.6)
+    # 与 config.py 的线上默认保持一致；配置文件仍可按部署覆盖。
+    min_days: tuple = (0, 1, 2, 5, 10, 15)
+    daily_cap: tuple = (14, 14, 14, 12, 11, 10)
+    stage_factor: tuple = (1.0, 1.0, 0.95, 0.9, 0.85, 0.8)
     delta_min: int = -3
     # 2026-11-06：单次上限从 2 提到 3。评审给 1~3 分（1=日常有来有往，2=明显用心，
     # 3=真的走进心里、一天最多一两次），这里只做保险夹紧。
     delta_max: int = 3
-    # 同一个标签每天最多记几次分。改成 2 之后「第二次不计分」的递减整段删掉：
-    # 两次各自按自己的 delta 算（分开计算），第三次起才归零。
-    tag_daily_limit: int = 2
+    # 同一个标签每天最多记几次分。第四次起才归零，让长聊仍能稳定获得正反馈。
+    tag_daily_limit: int = 4
     max_affection: float = 300.0
     presence_bonus: int = 1
     lock_hours: float = 4.0
     bad_streak_lock: int = 3
     demote_margin: float = 25.0
-    event_stages: dict = field(default_factory=lambda: {4: 'A', 5: 'B'})
+    # 每一档"能不能升级"都要先演完一件小事件（2026-11 起改为 C~G，五档各一件；
+    # A/B 是旧版关卡，保留在 stages.EVENTS 里兼容旧存档，但不再挂到任何一档上）。
+    # 2026-11-17：「特别的人」这一档改回 B（说出心意）——最高阶段本就必须先把心意说出口，
+    # 否则用户能和歌伊升到最亲密，却从没听她说过一次喜欢。
+    event_stages: dict = field(default_factory=lambda: {1: 'C', 2: 'D', 3: 'E', 4: 'F', 5: 'B'})
     event_timeout_turns: int = 6
-    event_bonus: float = 3.0
-    # 边际递减（2026-11-11）：当天已经记过 `diminish_after` 次有效互动之后，
-    # 后续加分的增量乘以 `diminish_factor`。目的：让"前几句最值钱"，
-    # 避免 6 条普通对话就把日上限顶满（评审 70% 给 +2、上限 12 → 6 条）。
+    event_bonus: float = 4.0
+    # 边际递减：当天已经记过 `diminish_after` 次有效互动之后，
+    # 后续加分的增量乘以 `diminish_factor`。当前默认前 6 次足额、之后按 0.75 倍，
+    # 给长聊留下更多正反馈，同时仍受每日上限约束。
     # presence 不计入次数、也不打折（每天第一次来的 +1 固定）。
-    diminish_after: int = 3
-    diminish_factor: float = 0.5
+    diminish_after: int = 6
+    diminish_factor: float = 0.75
 
 
 def params_from_config(cfg: dict | None) -> Params:
@@ -71,13 +75,13 @@ def params_from_config(cfg: dict | None) -> Params:
     p.thresholds = seq('galgame_thresholds', p.thresholds, float)
     p.min_days = seq('galgame_min_days', p.min_days, int)
     p.daily_cap = seq('galgame_daily_cap', p.daily_cap, float)
-    # 同一个标签每天记几次分：只接受 1~5 的正常整数，脏值一律回默认
+    # 同一个标签每天记几次分：只接受 1~10 的正常整数，脏值一律回默认
     try:
         limit = int(cfg.get('galgame_tag_daily_limit', p.tag_daily_limit))
     except (TypeError, ValueError):
         limit = p.tag_daily_limit
-    p.tag_daily_limit = limit if 1 <= limit <= 5 else Params().tag_daily_limit
-    # 边际递减：次数 0~20，倍率 0~1（0 会把后续加分全归零，配置里允许但默认 0.5）
+    p.tag_daily_limit = limit if 1 <= limit <= 10 else Params().tag_daily_limit
+    # 边际递减：次数 0~20，倍率 0~1（0 会把后续加分全归零，配置里允许但默认 0.75）
     try:
         after = int(cfg.get('galgame_diminish_after', p.diminish_after))
     except (TypeError, ValueError):
@@ -90,6 +94,12 @@ def params_from_config(cfg: dict | None) -> Params:
     except (TypeError, ValueError):
         factor = p.diminish_factor
     p.diminish_factor = factor if 0.0 <= factor <= 1.0 else Params().diminish_factor
+    # 演完一件羁绊事件的额外好感（0~20）：走配置是为了线上不重启也能调
+    try:
+        bonus = float(cfg.get('galgame_event_bonus', p.event_bonus))
+    except (TypeError, ValueError):
+        bonus = p.event_bonus
+    p.event_bonus = bonus if 0.0 <= bonus <= 20.0 else Params().event_bonus
     # 阈值必须单调不减，否则升级逻辑会乱
     if any(b < a for a, b in zip(p.thresholds, p.thresholds[1:])):
         p.thresholds = Params().thresholds
@@ -251,10 +261,10 @@ def apply_delta(rel: Relation, delta: int, tag: str, now: float, p: Params) -> O
             seen = int(rel.tag_counts.get(tag, 0))
             limit = max(1, int(p.tag_daily_limit))
             if seen >= limit:
-                # 这个标签今天已经记满两次：不再计分（但新一轮对话可以喂别的标签）
+                # 这个标签今天已经达到上限：不再计分（但新一轮对话可以换别的标签）。
                 out.note = 'diminished'
             else:
-                # 两次独立计分：第二次照样按它自己的 delta 算，不再做「delta - 已记次数」的递减
+                # 每次在上限以内都独立计分，不按已记次数额外扣减 delta。
                 eff = delta * p.stage_factor[rel.stage]
                 # 边际递减：当天前 `diminish_after` 次有效互动足额，之后每句打折。
                 # presence 不参与（它本身就是"每天来一次"的固定小奖励）。

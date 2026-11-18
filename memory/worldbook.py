@@ -149,13 +149,8 @@ _AMBIENT_KEYWORDS = frozenset({
     '远方', '东方', '家里', '从小',
 })
 
-# 指向歌伊或异世界设定的锚点词：出现任一即说明话题与歌伊/她的世界相关，放行弱关键词。
-_PERSONA_ANCHORS = (
-    '你', '歌伊', '修女', '教会', '清泉', '圣职', '猎人', '猎人公会', '异世界', '你们那', '你那边',
-    '你们世界', '你的世界', '人家', '月白', '逐影', '格伦', '米娅', '莱妮', '罗莎', '安娜',
-    '面包屑', '天灾', '拟灾', '粒子', '化人', '麦穗', '渊海', '登仙楼', '玄门', '东陆',
-    '西陆', '西大陆', '冒险家', '神圣粒子', '治愈粒子', '苦力怕', '末影',
-)
+# 第二人称与通用角色锚点，避免把群友自述当作世界书查询。
+_PERSONA_ANCHORS = ('你', '歌伊', '人家', '异世界', '你们世界', '你的世界')
 
 # 群友自述或现代/第三方话题干扰词：当句子里没有 _PERSONA_ANCHORS，却出现这些词时，
 # 说明群友在聊自己或现代事物（如“我今天吃了个汉堡”“这款游戏的技能树”“今天学习高数”），拦截弱关键词。
@@ -189,12 +184,6 @@ _BRIDGE_CUES = (
     '与它', '比起来', '相比', '有什么区别', '怎么区分', '什么关系', '有什么关系',
     '那后来', '那然后', '那之后', '还有呢', '还有吗',
 )
-
-# 第三方人物条目的性别/指代归属，防止问“他”（哥哥/格伦）时串出月白，或问“她”时串出哥哥。
-_MALE_NPC_ENTRIES = frozenset({'origin-brother', 'origin-vague', 'town-friends'})
-_FEMALE_NPC_ENTRIES = frozenset({'friend-yuebai', 'friend-yuebai-worry', 'town-friends'})
-_ALL_NPC_ENTRIES = _MALE_NPC_ENTRIES | _FEMALE_NPC_ENTRIES
-
 
 def _positive_int(value: Any) -> int:
     """把配置里的 max_chars 解析成正整数；非法/缺省一律返回 0（表示用默认值）。"""
@@ -250,23 +239,26 @@ def _clean_str_list(raw: Any, lower: bool = True) -> list[str]:
 
 
 def is_story_mode(store: Any, session_key: str = '', user_id: str = '') -> bool:
-    """检查当前用户或会话是否开启了「剧情模式」。"""
+    """检查**这个会话**是否开启了「剧情模式」。
+
+    2026-11-17 审查：旧实现先读 `story_mode_user:<QQ>`，导致一个人在私聊开的剧情，
+    会让他在这之后说过的每个群（以及他自己未来的私聊）都变成剧情空间——跨会话串线。
+    现在只要给了 session_key 就**只认该会话自己的键**，绝不回退读用户级键；
+    user_id 参数仅为兼容旧调用保留，仅在没有 session_key 时才作为兜底。
+    """
     if store is None:
         return False
-    uid = str(user_id or '').strip()
-    if uid:
-        try:
-            val = str(store.get_setting(STORY_MODE_USER_PREFIX + uid) or '').strip()
-            if val in ('1', 'on', 'true', 'True'):
-                return True
-            if val in ('0', 'off', 'false', 'False'):
-                return False
-        except Exception:  # noqa: BLE001
-            pass
     skey = str(session_key or '').strip()
     if skey:
         try:
             val = str(store.get_setting(STORY_MODE_SESSION_PREFIX + skey) or '').strip()
+            return val in ('1', 'on', 'true', 'True')
+        except Exception:  # noqa: BLE001
+            return False
+    uid = str(user_id or '').strip()
+    if uid:
+        try:
+            val = str(store.get_setting(STORY_MODE_USER_PREFIX + uid) or '').strip()
             if val in ('1', 'on', 'true', 'True'):
                 return True
         except Exception:  # noqa: BLE001
@@ -276,26 +268,31 @@ def is_story_mode(store: Any, session_key: str = '', user_id: str = '') -> bool:
 
 def set_story_mode(store: Any, session_key: str = '', user_id: str = '',
                    enabled: bool | None = None) -> None:
-    """开启/关闭/重置某个用户（及私聊会话）的「剧情模式」。"""
+    """开启/关闭/重置**某个会话**的「剧情模式」。
+
+    私聊与群聊一律写会话级键 `story_mode:<session_key>`：群里的篇章是大家共用的，
+    开关也必须按群隔离，不能再按人全局生效。
+    `enabled is None` 表示显式清理：清空会话级键，并顺带清掉遗留的用户级键。
+    """
     if store is None:
         return
     flag = '' if enabled is None else ('1' if enabled else '')
-    uid = str(user_id or '').strip()
-    if uid:
-        try:
-            store.set_setting(STORY_MODE_USER_PREFIX + uid, flag)
-        except Exception:  # noqa: BLE001
-            pass
     skey = str(session_key or '').strip()
-    if skey and ':private:' in skey:
+    if skey:
         try:
             store.set_setting(STORY_MODE_SESSION_PREFIX + skey, flag)
+        except Exception:  # noqa: BLE001
+            pass
+    uid = str(user_id or '').strip()
+    if enabled is None and uid:
+        try:
+            store.set_setting(STORY_MODE_USER_PREFIX + uid, '')
         except Exception:  # noqa: BLE001
             pass
 
 
 def list_story_mode_users(store: Any) -> list[str]:
-    """列出当前开启了「剧情模式」的全部用户 QQ 号。"""
+    """列出遗留的用户级开关（`story_mode_user:<QQ>`，仅供重置时清理）。"""
     if store is None or not hasattr(store, 'settings_with_prefix'):
         return []
     users: list[str] = []
@@ -309,16 +306,31 @@ def list_story_mode_users(store: Any) -> list[str]:
     return sorted(set(users))
 
 
+def list_story_mode_sessions(store: Any) -> list[str]:
+    """列出当前开启了「剧情模式」的会话（`story_mode:<session_key>` 为真值）。"""
+    if store is None or not hasattr(store, 'settings_with_prefix'):
+        return []
+    sessions: list[str] = []
+    try:
+        for key, value in store.settings_with_prefix(STORY_MODE_SESSION_PREFIX):
+            skey = key[len(STORY_MODE_SESSION_PREFIX):].strip()
+            if skey and str(value or '').strip() in ('1', 'on', 'true', 'True'):
+                sessions.append(skey)
+    except Exception:  # noqa: BLE001
+        return []
+    return sorted(set(sessions))
+
+
 class _Entry:
     __slots__ = (
         'keywords', 'weak_keywords', 'excludes', 'links', 'priority',
         'content', 'max_chars', 'always', 'term_freq', 'length',
-        'id', 'min_stage', 'max_stage', 'scope', 'topic',
+        'id', 'min_stage', 'max_stage', 'scope', 'topic', 'pronouns',
     )
 
     def __init__(self, keywords, content, max_chars, always,
                  entry_id='', min_stage=None, max_stage=None, scope='both', topic=False,
-                 weak_keywords=None, excludes=None, links=None, priority=0.0):
+                 weak_keywords=None, excludes=None, links=None, priority=0.0, pronouns=None):
         self.keywords = list(keywords or [])
         self.weak_keywords = list(weak_keywords or [])
         self.excludes = list(excludes or [])
@@ -332,6 +344,7 @@ class _Entry:
         self.max_stage = max_stage
         self.scope = scope if scope in ('private', 'group') else 'both'
         self.topic = bool(topic)
+        self.pronouns = set(pronouns or ()) & {'他', '她'}
         # 文档 = 强/弱关键词 + 正文。关键词也算进词频，但命中另有显式加成。
         all_kws = ' '.join(self.keywords + self.weak_keywords)
         tokens = tokenize(all_kws + ' ' + content)
@@ -401,6 +414,7 @@ class WorldbookService:
                                 excludes=clean_excludes,
                                 links=clean_links,
                                 priority=priority,
+                                pronouns=_clean_str_list(item.get('pronouns'), lower=False),
                             )
                             entries.append(entry)
                             raw_item = {
@@ -420,6 +434,8 @@ class WorldbookService:
                                 raw_item['excludes'] = clean_excludes
                             if clean_links:
                                 raw_item['links'] = clean_links
+                            if entry.pronouns:
+                                raw_item['pronouns'] = sorted(entry.pronouns)
                             if priority:
                                 raw_item['priority'] = priority
                             raw_entries.append(raw_item)
@@ -494,10 +510,10 @@ class WorldbookService:
 
         规则：
         1. 若句子出现人称代词（他/她）且无第二人称（你/歌伊），按性别归属仅放行对应第三方人物条目，
-           避免把“她喜欢吃什么”（问月白）误当成问歌伊本人，也避免把“他平时在哪”（问哥哥）串给月白。
+           例如让使用「她」的追问优先匹配标注了该代词的第三方条目。
         2. 若句子出现事物代词（它/它们）且无第二人称：直接关键词阶段不放行角色泛词，
            但多轮追问阶段（allow_pronoun_followup=True）允许指代前文的怪物/天灾/猫咪等条目。
-        3. 若句子包含指向歌伊/异世界的锚点（你/歌伊/修女/教会/清泉/猎人…），直接放行。
+        3. 若句子包含指向歌伊/异世界的锚点（例如你或歌伊），直接放行。
         4. 若句子不含锚点，但带有明显的第一人称自述或现代生活/游戏干扰词（我今天…/我家…/这款游戏…/高数…），
            说明是群友聊自己的事，予以拦截。
         5. 其余情况（无主语提问如“平时喜欢吃什么？”或短句“这件衣服好看”），放行。
@@ -508,21 +524,16 @@ class WorldbookService:
         has_male = any(p in lowered for p in ('他', '他们'))
         has_neuter = any(p in lowered for p in ('它', '它们'))
         if (has_female or has_male) and not has_second and entry is not None:
-            allowed_npcs: set[str] = set()
-            if has_female:
-                allowed_npcs.update(_FEMALE_NPC_ENTRIES)
-            if has_male:
-                allowed_npcs.update(_MALE_NPC_ENTRIES)
-            if entry.id not in allowed_npcs:
-                # 已知专属其他性别的人物条目严禁串台（例如问“她”绝不命中哥哥，问“他”绝不命中月白）
-                if entry.id in _ALL_NPC_ENTRIES or not allow_pronoun_followup:
+            requested = ({'她'} if has_female else set()) | ({'他'} if has_male else set())
+            if entry.pronouns:
+                if not requested & entry.pronouns:
                     return False
-                # 对未登记在固定集合里的自定义/测试人物条目，仅在多轮追问且正文有对应人称特征时放行
-                content_ok = (
-                    (has_female and any(k in entry.content for k in ('她', '少女', '猫娘', '婶')))
-                    or (has_male and any(k in entry.content for k in ('他', '哥哥', '兄', '大叔', '会长', '头领')))
+            else:
+                content_matches = (
+                    (has_female and any(term in entry.content for term in ('她', '少女', '婶')))
+                    or (has_male and any(term in entry.content for term in ('他', '哥哥', '兄', '大叔', '会长', '头领')))
                 )
-                if not content_ok:
+                if not allow_pronoun_followup or not content_matches:
                     return False
         if has_neuter and not has_second and not allow_pronoun_followup:
             if not any(anchor in lowered for anchor in _PERSONA_ANCHORS):

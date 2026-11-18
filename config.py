@@ -85,48 +85,17 @@ def version_mismatch() -> str:
 
 DEFAULT_CONFIG = {
     'api_key': '',
-    'api_endpoint': 'http://localhost:8787/v1',
-    'api_protocol': 'anthropic',
+    'api_endpoint': 'https://api.example.invalid/v1/chat/completions',
+    'api_protocol': 'openai',
     # 厂商专有请求参数，会原样合并进请求体；默认留空只发标准字段。
     # 例：用 DeepSeek 官方时关闭思考模式 {'thinking': {'type': 'disabled'}}
     # ——思考模式先输出思维链、挤占 max_tokens，且此时 temperature 不生效。
     'extra_body': {},
-    # ===== 多渠道分层调用（故障转移 + 按类型分流）=====
-    # providers 非空时启用多渠道路由：按 priority 从小到大尝试，便宜的排前面。
-    # 每个渠道 = 一套 (endpoint, api_key, model)；api_key 也可用环境变量
-    # GEYI_KEY_<渠道名大写> 提供，避免明文写在配置里。
-    #
-    # ★ 渠道可选 `kinds` 字段，决定它服务哪些调用类型（2026-09-19 新增）：
-    #     不填        → 服务全部（老配置不用改）
-    #     ["chat"]    → 只服务聊天（被动回复、主动搭话、图片理解…）
-    #     ["memory_curate"] → 只服务记忆提炼
-    #
-    # 为什么要分流：聊天和提炼的成本结构完全相反。
-    #   聊天：输入大、输出小 → 缓存能省（实测官方缓存 100% vs 中转站 55%）
-    #   提炼：输入≈输出，67% 成本在输出 → 缓存打不到痛点
-    # 实测（歌伊 582 次提炼 + 904 次聊天）分流后比纯中转站便宜 4~10%，
-    # 且聊天快 5 倍（1.7s vs 8.6s）。见 _research/final_cost_v2.py。
-    #
-    # 分流配置示例（聊天走官方、提炼走中转站）：
-    #   [
-    #     {"name": "official", "kinds": ["chat"], "priority": 1,
-    #      "endpoint": "https://api.deepseek.com/v1/chat/completions",
-    #      "model": "deepseek-flash", "api_key": "sk-...",
-    #      "extra_body": {"thinking": {"type": "disabled"}}},
-    #     {"name": "relay", "kinds": ["memory_curate"], "priority": 1,
-    #      "endpoint": "https://api.ginka.cloud/v1/chat/completions",
-    #      "model": "deepseek-v4.1-flash", "api_key": "sk-...",
-    #      "extra_body": {"reasoning_effort": "low"}}
-    #   ]
-    # 注意：中转站**关不掉思考**（12 种写法实测全无效），官方可以。
-    #      官方的 temperature 在思考模式下无效，关掉思考才生效。
-    # providers 留空则退回上面的 api_endpoint / api_key / fast_model 单渠道模式。
+    # providers 非空时按 priority 路由；凭据可配置为 GEYI_KEY_<渠道名大写>。
+    # kinds 可用来区分聊天、记忆提炼、场景识别和关系评审。显式声明当前
+    # 调用类型的渠道优先，其余兼容渠道仍可作为兜底。
     'providers': [],
     'failover': {
-        # 失败几次判定该渠道不可用（防抖动）。
-        # 2026-11-07 从 1 改成 2：原来"一次超时就判死"，而上游偶发 60s 超时很常见
-        # （实测 star 站在晚上会出现 40~70s 的正常响应），一次抖动就把整条线判死 5 分钟，
-        # 多条线同时抖一下 = 「显示全部掉线」。两次才判死，抗抖动能力翻倍。
         'fail_threshold': 2,             # 连续失败几次判定该渠道不可用（防抖动）
         'probe_interval_seconds': 300,   # 后台探测间隔（秒）：5 分钟爬一级
         'probe_success_needed': 1,       # 探测成功几次算恢复并切回
@@ -152,24 +121,16 @@ DEFAULT_CONFIG = {
         'notify_owner': True,            # 所有渠道都挂时私聊通知骰主
         'notify_cooldown_seconds': 600,  # 同类通知节流间隔，防刷屏
         'switch_history_limit': 50,      # 保留多少条切换历史
-        # 「轮次循环」：一轮走到底（最后一个渠道也挂了）就回到第一个再来一轮。
-        # 骰主 2026-11-01 的口径：「第五个挂了就重回第一个开始连接」。
-        # 2 轮 = 最坏情况每个渠道试两次；只有一个渠道时自动降为 1 轮（内部已重试过）。
+        # 所有候选渠道均失败时，本次调用最多尝试的轮数。
         'full_cycles': 2,
-        # 一次 chat() 的总时长预算（秒）：超过就不再换渠道兜圈。
-        # 以前没有这条：5 候选 × 2 轮 × 单渠道超时，最坏能到 8 分钟，
-        # 而调度器的看门狗是 300 秒——任务会先被当成「卡死」踢掉。
-        # 2026-11-07 从 60 提到 150：60 秒比**单条渠道自己的超时**还小
-        # （provider.timeout 是 45~60s），第一条超时就把预算吃光，
-        # 后面几条根本没机会试——“故障转移”形同虚设，直接判成全挂。
-        # 150 秒 ≈ 两条线各超一次 + 第三条有机会回；仍在 300 秒看门狗之内。
+        # 一次调用跨渠道故障转移的总时间预算（秒）。
         'total_timeout_seconds': 150,
-        # 轮满了还全挂 → 切到这个渠道并**锁定**（不再尝试其它渠道），
-        # 直到骰主「切换渠道 <名称>」手动切回。空字符串 = 不降级，只发通知。
-        'last_resort_provider': 'official-chat',
+        # 为空时不指定兜底渠道。解除锁定后，探测成功可自动切回高优先级渠道。
+        'last_resort_provider': '',
+        'lock_last_resort': True,
     },
     # 单渠道兼容模式用的模型名：只在 providers 为空时才会被用到。
-    'fast_model': 'gemini-3.8-flash-medium',
+    'fast_model': 'example-model',
     # 记忆提炼专用的模型名。留空则沿用 fast_model。
     'curate_model': '',
     # 记忆提炼固定走哪个渠道（providers[].name）。留空 = 跟聊天用同一条。
@@ -191,6 +152,19 @@ DEFAULT_CONFIG = {
     'mention_on_at_all': False,
     'ignore_sender_ids': [],
     'private_enabled': False,
+    # ===== 私聊主动搭话 =====
+    # 她自己想起你、主动发来一句（读当天的话题线索 / 待演出的事件 / 久未说话）。
+    # 默认关：这是唯一会「不请自来」地发消息的功能，得由骰主显式打开。
+    'private_active_enabled': False,
+    # 安静满这么多小时才考虑主动开口（避免打断正在聊的人）
+    'private_active_min_silence_hours': 6.0,
+    # 同一个人每天最多主动开口几次
+    'private_active_daily_limit': 1,
+    # 免打扰时段（小时，含起点不含终点；跨零点写 23→8 这样）
+    'private_active_quiet_start': 23,
+    'private_active_quiet_end': 8,
+    # 后台巡检间隔（秒）
+    'private_active_tick_seconds': 60,
     # 私聊回合调度：合并短时间连发，再用本地线索决定是否接话。
     'private_companion_mode': 'natural',  # warm / natural / focused
     'private_companion_debounce_seconds': 2.5,
@@ -263,7 +237,7 @@ DEFAULT_CONFIG = {
     'worldbook_enabled': False,
     'worldbook_max_entries': 3,
     'worldbook_story_max_entries': 6,
-    # ===== 私聊 galgame：好感度 / 关系阶段（设计见 docs/GALGAME_PLAN.md）=====
+    # ===== 私聊 galgame：好感度 / 关系阶段=====
     # 总开关。关着时私聊和以前完全一样；世界书里 min_stage>0 的深层设定也不会放行（主人除外）。
     'galgame_enabled': False,
     # 影子模式：评审照常运行并写入 relationship_log，但**不生效**（只有"每天来"的小奖励会计分）。
@@ -271,8 +245,8 @@ DEFAULT_CONFIG = {
     'galgame_shadow': True,
     # 主人豁免：不评分、不注入关系块，世界书按最高阶段放行。
     'galgame_owner_exempt': True,
-    # 额外豁免名单（role_prompt 里写死的主人 QQ；owner_ids 里的人也自动豁免）
-    'galgame_exempt_ids': ['2332239652'],
+    # 额外豁免名单，另可通过 owner_ids 配置管理员。
+    'galgame_exempt_ids': [],
     # 评审用的模型（留空沿用 fast_model）；它走 kind='affection'，可用 affection_provider 指到便宜渠道
     'galgame_judge_model': '',
     'galgame_judge_max_tokens': 1024,
@@ -291,19 +265,22 @@ DEFAULT_CONFIG = {
     'galgame_cross_memory_min_stage': 2,
     # 难度旋钮（长度必须是 6，对应阶段 0~5；写错会自动回退默认值）：
     'galgame_thresholds': [0, 15, 50, 110, 190, 280],   # 进入各阶段所需分数
-    'galgame_min_days': [0, 1, 3, 7, 14, 21],           # 进入各阶段所需的"有效日"
-    'galgame_daily_cap': [12, 12, 12, 10, 9, 8],        # 各阶段每日最多加几分
+    'galgame_min_days': [0, 1, 2, 5, 10, 15],           # 进入各阶段所需的"有效日"
+    'galgame_daily_cap': [14, 14, 14, 12, 11, 10],      # 各阶段每日最多加几分
     # 同一个标签（care/share/humor/…）每天最多记几次分。
     # 2026-11-06 从 1 改成 2：以前同一标签当天第二次起要减掉「已记过几次」，
     # 结果是「第一次 +1、之后全 0」，实测大多数人一天只能加 3~5 点，升一档要一周。
     # 现在改成每天两次、各自独立计分（第二次不折损），第三次起归零。
-    'galgame_tag_daily_limit': 2,
+    'galgame_tag_daily_limit': 4,
     # 边际递减：当天已经记过这么多**次**有效互动后，后续每句的加分乘以 galgame_diminish_factor。
     # 2026-11-11：评审 70% 给 +2、日上限 12 → 6 条普通对话就顶满（群友反馈"几句话就满"）。
     # 前 3 次足额、之后打对折 → 大约 9~10 条才满，当天总上限不变。
     # 设为 0 关闭该机制（恢复旧行为）。presence 不计入、也不打折。
-    'galgame_diminish_after': 3,
-    'galgame_diminish_factor': 0.5,
+    'galgame_diminish_after': 6,
+    'galgame_diminish_factor': 0.75,
+    # 关系事件（告白/约定）完成时给的额外分。事件是这条线唯一的"里程碑时刻"，
+    # 原来 3 分和一次普通好互动差不多，玩家根本感觉不到变化；改成 4。
+    'galgame_event_bonus': 4.0,
     # 刷屏判定只看这么多秒内的消息（2026-11-10 抽查：以前没有时间窗，低频私聊里
     # 8 轮历史能横跨好几天，三天后重复一句口头禅被判 spam -1）。
     'galgame_repeat_window_seconds': 1800,

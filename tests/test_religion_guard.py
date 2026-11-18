@@ -86,7 +86,7 @@ class BackgroundKeptTest(unittest.TestCase):
     """人设底线：教会的底色一个都不许删。"""
 
     def test_church_vocabulary_untouched(self):
-        for sentence in ('我在清泉镇的教会当修女，每天清晨要祈祷，',
+        for sentence in ('我在示例地点的教会当修女，每天清晨要祈祷，',
                          '礼拜堂的彩绘玻璃是我擦的，',
                          '治愈粒子和净化术都会一点，圣职也算干过。'):
             text, hits = sanitize_religion(sentence)

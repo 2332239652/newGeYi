@@ -22,11 +22,11 @@ from newGeYi.memory.worldbook import WorldbookService  # noqa: E402
 from newGeYi.models import IncomingMessage, SessionKey  # noqa: E402
 from newGeYi.relationship import state as S  # noqa: E402
 from newGeYi.relationship.judge import parse_verdict  # noqa: E402
-from newGeYi.relationship.stages import (EVENTS, STAGE_NAMES, audit_overstep,  # noqa: E402
-                                         build_relation_block)
+from newGeYi.relationship.stages import (EVENTS, MAX_STAGE, STAGE_NAMES,  # noqa: E402
+                                         audit_overstep, build_relation_block)
 
 BOT = 'hash'
-OWNER = '2332239652'
+OWNER = '100000001'
 USER = '1000000002'
 DAY = 86400.0
 
@@ -64,18 +64,19 @@ class StateMachineTest(unittest.TestCase):
         self.assertAlmostEqual(rel.gain_today, total)
 
     def test_same_tag_scores_twice_then_stops(self):
-        """2026-11-06 起：同一标签每天两次、各自独立计分，第三次归零。"""
+        """旧规则回归：显式设为每天两次，第三次归零。"""
+        p = S.params_from_config({'galgame_tag_daily_limit': 2})
         rel = S.Relation('u')
-        gains = [S.apply_delta(rel, 2, 'care', at_day(0) + i, self.p).applied for i in range(4)]
+        gains = [S.apply_delta(rel, 2, 'care', at_day(0) + i, p).applied for i in range(4)]
         self.assertEqual(gains, [2.0, 2.0, 0.0, 0.0])
         # 第二次不折损：它按自己的 delta 算，跟第一次无关
         rel2 = S.Relation('u')
-        self.assertEqual(S.apply_delta(rel2, 3, 'care', at_day(0), self.p).applied, 3.0)
-        self.assertEqual(S.apply_delta(rel2, 1, 'care', at_day(0) + 1, self.p).applied, 1.0)
+        self.assertEqual(S.apply_delta(rel2, 3, 'care', at_day(0), p).applied, 3.0)
+        self.assertEqual(S.apply_delta(rel2, 1, 'care', at_day(0) + 1, p).applied, 1.0)
         # 换标签照样能记
-        self.assertEqual(S.apply_delta(rel, 2, 'share', at_day(0) + 5, self.p).applied, 2.0)
+        self.assertEqual(S.apply_delta(rel, 2, 'share', at_day(0) + 5, p).applied, 2.0)
         # 第二天重新计数
-        again = S.apply_delta(rel, 2, 'care', at_day(1), self.p).applied
+        again = S.apply_delta(rel, 2, 'care', at_day(1), p).applied
         self.assertEqual(again, 2.0)
 
     def test_tag_daily_limit_is_configurable(self):
@@ -86,7 +87,10 @@ class StateMachineTest(unittest.TestCase):
         self.assertEqual(S.apply_delta(rel, 2, 'care', at_day(0) + 1, p).applied, 0.0)
         # 脏值回默认
         for bad in (0, 99, 'x', None):
-            self.assertEqual(S.params_from_config({'galgame_tag_daily_limit': bad}).tag_daily_limit, 2)
+            self.assertEqual(
+                S.params_from_config({'galgame_tag_daily_limit': bad}).tag_daily_limit,
+                S.Params().tag_daily_limit,
+            )
 
     def test_cannot_bank_points_without_enough_days(self):
         """一晚上刷满分数也升不了级，且分数停在下一档门槛，不能存分。"""
@@ -95,30 +99,46 @@ class StateMachineTest(unittest.TestCase):
         tags = ('care', 'share', 'humor', 'curious_lore', 'respect')
         for i in range(200):
             S.apply_delta(rel, 2, tags[i % 5], now + i, self.p)
-        self.assertLessEqual(rel.affection, self.p.daily_cap[0] + 1e-9)   # 一天最多 12 分
+        self.assertLessEqual(rel.affection, self.p.daily_cap[0] + 1e-9)   # 一天最多 14 分
         self.assertEqual(rel.stage, 0)                  # 第一天连"熟人"(15 分)都到不了
         for i in range(200):
             S.apply_delta(rel, 2, tags[i % 5], at_day(1) + i, self.p)
-        self.assertEqual(rel.stage, 1)                  # 第二天到熟人，但到不了朋友
+        # 2026-11 起进"熟人"前要先演完事件 C：分数卡在门槛上，事件没演完不升级
+        self.assertEqual(rel.stage, 0)
+        self.assertAlmostEqual(rel.affection, self.p.thresholds[1])
+        self.assertEqual(rel.flags.get('pending_event'), 'C')
+        S.complete_event(rel, 'C', at_day(2), self.p)
+        self.assertEqual(rel.stage, 1)                  # 第二天演完事件才到熟人，但到不了朋友
         self.assertLessEqual(rel.affection, self.p.thresholds[2] + 1e-9)
 
     def test_one_stage_per_day_even_with_enough_points(self):
-        rel = S.Relation('u', affection=60.0, stage=0, days_active=10)
-        out = S.apply_delta(rel, 1, 'care', at_day(0), self.p)
+        rel = S.Relation('u', affection=50.0, stage=1, days_active=10)
+        rel.flags['event_C_done'] = True                # 旧版关卡，已经演完
+        S.apply_delta(rel, 1, 'care', at_day(0), self.p)
+        # 分数先卡在"朋友"门槛（50）：事件 D 没演完不升级
         self.assertEqual(rel.stage, 1)
-        out = S.apply_delta(rel, 1, 'share', at_day(0) + 5, self.p)
-        self.assertEqual(rel.stage, 1)                  # 同一天不再升
+        self.assertEqual(rel.flags.get('pending_event'), 'D')
+        self.assertLessEqual(rel.affection, self.p.thresholds[2] + 1e-9)
+        S.complete_event(rel, 'D', at_day(0), self.p)
+        self.assertEqual(rel.stage, 2)
+        S.apply_delta(rel, 1, 'share', at_day(0) + 5, self.p)
+        self.assertEqual(rel.stage, 2)                  # 同一天不再升
+        # 第二天分数够了，仍要先演完事件 E 才升级
+        rel.affection = float(self.p.thresholds[3])
         S.apply_delta(rel, 1, 'humor', at_day(1), self.p)
         self.assertEqual(rel.stage, 2)
+        self.assertEqual(rel.flags.get('pending_event'), 'E')
+        S.complete_event(rel, 'E', at_day(1), self.p)
+        self.assertEqual(rel.stage, 3)
 
     def test_event_gate_blocks_stage_4_until_event_done(self):
         rel = S.Relation('u', affection=189.0, stage=3, days_active=30)
         S.apply_delta(rel, 2, 'care', at_day(0), self.p)
         S.apply_delta(rel, 2, 'share', at_day(0) + 1, self.p)
         self.assertEqual(rel.stage, 3)
-        self.assertEqual(rel.flags.get('pending_event'), 'A')
+        self.assertEqual(rel.flags.get('pending_event'), 'F')
         self.assertLessEqual(rel.affection, self.p.thresholds[4] + 1e-9)   # 不存分
-        S.complete_event(rel, 'A', at_day(1), self.p)
+        S.complete_event(rel, 'F', at_day(1), self.p)
         self.assertEqual(rel.stage, 4)
         self.assertEqual(rel.flags.get('pending_event'), '')
 
@@ -210,7 +230,7 @@ class RepeatGuardTest(unittest.TestCase):
 
     def test_long_paraphrase_same_minute_still_caught(self):
         now = 1_700_000_000.0
-        text = '平静的生活连烦恼也是这样平静啊！清泉镇的生活真是美好呢，歌伊。'
+        text = '平静的生活连烦恼也是这样平静啊！示例地点的生活真是美好呢，歌伊。'
         self.assertTrue(S.is_repeat(text, [(text + '！', now - 120)],
                                     self.sim, window_seconds=1800, now=now))
 
@@ -223,8 +243,12 @@ class LossBudgetTest(unittest.TestCase):
     """扣分要计入当日收益，否则会出现「满额后加分全 0、只有扣分生效」。"""
 
     def setUp(self):
-        # 这里测的是"扣分与日上限的关系"，先把边际递减关掉，免得干扰预期值
-        self.p = S.params_from_config({'galgame_diminish_after': 0})
+        # 这里测的是"扣分与日上限的关系"，显式固定 12 分上限并关闭递减，
+        # 保持该规则用例的预期独立于生产环境的放宽旋钮。
+        self.p = S.params_from_config({
+            'galgame_daily_cap': [12, 12, 12, 10, 9, 8],
+            'galgame_diminish_after': 0,
+        })
 
     def test_loss_reduces_gain_today_and_frees_cap(self):
         rel = S.Relation('u')
@@ -287,8 +311,14 @@ class StagesTest(unittest.TestCase):
         for stage in range(6):
             block = build_relation_block(stage, mood='害羞')
             self.assertIn(STAGE_NAMES[stage], block)
-            self.assertIn('现在不要', block)
-            self.assertIn('不得透露存在', block)
+            if stage < MAX_STAGE:
+                # 阶段 0~4 仍然要有"现在不要"和保密条款；阶段 5 她已经把心意说清楚了，
+                # 这两条硬约束会自相矛盾（2026-11-17：最高阶段放开亲密表达）。
+                self.assertIn('现在不要', block)
+                self.assertIn('不得透露存在', block)
+            else:
+                self.assertNotIn('现在不要', block)
+                self.assertNotIn('不得透露存在', block)
             self.assertNotIn('好感度：', block)
         self.assertIn(EVENTS['A']['guide'][:10], build_relation_block(3, event_key='A'))
         self.assertIn('小事', build_relation_block(0, topic='后院的鸡蛋不见了'))
@@ -374,7 +404,7 @@ class ServiceTest(unittest.TestCase):
         from newGeYi.runtime.app import Runtime
         self.rt = Runtime()
         self.rt.config.update({'galgame_enabled': True, 'galgame_shadow': False,
-                               'worldbook_enabled': True, 'galgame_owner_exempt': True})
+                               'worldbook_enabled': True, 'galgame_owner_exempt': True, 'owner_ids': [OWNER]})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.svc.worldbook = self.rt.worldbook = self.rt.prompt_builder.worldbook = _wb([
@@ -460,6 +490,13 @@ class ServiceTest(unittest.TestCase):
         self.svc.save(rel)
         self._turn('谢谢你一直陪我聊天', verdict=self._v(2, 'care', 1))
         rel = self.svc.load(self.uid)
+        # 2026-11 起进"熟人"前要先演完事件 C：分数先压在门槛上，事件演完才升级
+        self.assertEqual(rel.stage, 0)
+        self.assertEqual(rel.flags.get('pending_event'), 'C')
+        self.svc.block_for(make_msg('嗯', sender_id=self.uid))             # 事件注入算一轮
+        self._turn('对了，今天镇上的天气倒是难得的晴', now=at_day(0) + 60,
+                   verdict=self._v(2, 'care', 1, event_done=True))
+        rel = self.svc.load(self.uid)
         self.assertEqual(rel.stage, 1)
         mems = [m['content'] for m in self.rt.store.list_self_memories(self.session, limit=10)]
         self.assertTrue(any('熟悉' in m for m in mems), mems)
@@ -472,17 +509,17 @@ class ServiceTest(unittest.TestCase):
         self.svc.force_stage(self.uid, 3)
         rel = self.svc.load(self.uid)
         rel.affection, rel.days_active = 189.0, 30
-        rel.flags['event_A_done'] = False
+        rel.flags['event_F_done'] = False
         self.svc.save(rel)
         self._turn('在呢，今天过得怎么样', now=at_day(0), verdict=self._v(2, 'care', 1))
         self._turn('我在听呢', now=at_day(0) + 60, verdict=self._v(2, 'share', 1))
         rel = self.svc.load(self.uid)
-        self.assertEqual(rel.flags.get('pending_event'), 'A')
+        self.assertEqual(rel.flags.get('pending_event'), 'F')
         block = self.svc.block_for(make_msg('嗯', sender_id=self.uid))
-        self.assertIn(EVENTS['A']['guide'][:12], block)
+        self.assertIn(EVENTS['F']['guide'][:12], block)
         self._turn('后来呢，然后他就一直没回来了吗', now=at_day(1), verdict=self._v(1, 'care', 1, event_done=True))
         rel = self.svc.load(self.uid)
-        self.assertTrue(rel.flags.get('event_A_done'))
+        self.assertTrue(rel.flags.get('event_F_done'))
         self.assertEqual(rel.flags.get('pending_event'), '')
 
     def test_prompt_contains_relation_block_and_hides_secret_until_unlocked(self):
@@ -503,7 +540,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_owner_gets_no_relation_block_but_sees_secrets(self):
         pb = self.rt.prompt_builder
-        msg = make_msg('你有哥哥吗', sender_id=OWNER, name='歌靡')
+        msg = make_msg('你有哥哥吗', sender_id=OWNER, name='测试管理员')
         text = pb.build(msg)[0]['content']
         self.assertNotIn('【此刻你与对方的关系', text)
         self.assertIn('失踪', text)
@@ -533,6 +570,10 @@ class ServiceTest(unittest.TestCase):
         self.rt.store.add_turn(self.session, 'user', msg1.text, self.uid, 'Oracle')
         sys1 = pb.build(msg1)[0]['content']
         self.assertIn('鸡蛋', sys1)
+        # 主链路不再在拼 prompt 时消费状态：拼完还是没记成"已讲"
+        self.assertFalse(self.svc.load(self.uid).flags.get('topic_spoken'))
+        # 回复真的发出去了 → 提交一次一次性状态（app.process_job 的同样时序）
+        self.svc.commit_prompt_effects(msg1, now=at_day(0))
         # 第一轮回复没有提鸡蛋：不算已讲，told_topics 仍为空
         self._turn('你好呀', reply='你好呀，今天天气真不错～', now=at_day(0), verdict=self._v(1, 'care', 1))
         rel = self.svc.load(self.uid)
@@ -544,8 +585,33 @@ class ServiceTest(unittest.TestCase):
         rel = self.svc.load(self.uid)
         self.assertTrue(rel.flags.get('topic_spoken'))
         self.assertIn('t1', rel.flags.get('told_topics') or [])
+        # 主回复链路走只读版（不推进轮次/不清一次性状态），等回复真的发出去再提交
         msg3 = make_msg('哈哈真的吗', sender_id=self.uid)
+        self.assertNotIn('【你今天想跟对方说的一件小事',
+                         self.svc.block_for(msg3, consume=False))
         self.assertNotIn('【你今天想跟对方说的一件小事', self.svc.block_for(msg3))
+
+    def test_prompt_read_is_readonly_until_committed(self):
+        """拼 prompt 不再有写副作用：重试/失败不该吃掉升级演出和事件轮次。"""
+        self.svc.force_stage(self.uid, 0)
+        rel = self.svc.load(self.uid)
+        rel.affection, rel.days_active = 14.5, 5
+        self.svc.save(rel)
+        self._turn('谢谢你一直陪我聊天', verdict=self._v(2, 'care', 1))
+        msg = make_msg('嗯', sender_id=self.uid)
+        first = self.svc.block_for(msg, consume=False)
+        second = self.svc.block_for(msg, consume=False)
+        self.assertEqual(first, second, '只读读两次必须完全一样')
+        rel = self.svc.load(self.uid)
+        self.assertEqual(int(rel.flags.get('event_turns') or 0), 0, 'event_turns 不该被拼 prompt 推进')
+        self.assertEqual(int(rel.flags.get('stage_up_cue') or 0), rel.stage, '升级演出还没被消费')
+        # 提交一次：event_turns +1、升级演出清掉
+        self.svc.commit_prompt_effects(msg, now=at_day(0) + 60)
+        rel = self.svc.load(self.uid)
+        self.assertEqual(int(rel.flags.get('event_turns') or 0), 1)
+        self.assertFalse(int(rel.flags.get('stage_up_cue') or 0))
+        third = self.svc.block_for(msg, consume=False)
+        self.assertNotIn('【你们的关系刚刚近了一步', third)
 
     def test_memory_policy_limits_by_stage(self):
         low = self.svc.memory_policy(make_msg('hi', sender_id=self.uid))
@@ -570,7 +636,7 @@ class ServiceTest(unittest.TestCase):
         self.assertIn('朋友', self.svc.describe(self.uid))
 
     def test_story_mode_toggle_and_prompt_injection(self):
-        msg = make_msg('跟我讲讲清泉镇', sender_id=self.uid)
+        msg = make_msg('跟我讲讲示例地点', sender_id=self.uid)
         # 开启前：日常模式，不注入【剧情探索模式】
         sys_before = self.rt.prompt_builder.build(msg)[0]['content']
         self.assertNotIn('【剧情探索模式', sys_before)
@@ -594,226 +660,44 @@ class ServiceTest(unittest.TestCase):
 
 
 class ShippedWorldbookTest(unittest.TestCase):
-    """随插件发布的 data/worldbook.json：防止以后手滑把深层设定写成"所有人可见"。"""
+    """公开世界书示例验证加载、关联扩展和私聊阶段限制。"""
 
     @classmethod
     def setUpClass(cls):
         path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             'data', 'worldbook.json')
-        with open(path, 'r', encoding='utf-8') as f:
-            cls.raw = json.load(f)['entries']
+        with open(path, 'r', encoding='utf-8') as stream:
+            cls.entries = json.load(stream)['entries']
         cls.wb = WorldbookService(path)
 
     def test_ids_unique_and_all_entries_load(self):
-        ids = [e['id'] for e in self.raw]
+        ids = [entry['id'] for entry in self.entries]
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertEqual(len(self.wb.entries), len(self.raw))
+        self.assertEqual(len(self.wb.entries), len(ids))
 
-    def test_content_fits_its_budget(self):
-        for e in self.raw:
-            limit = e.get('max_chars') or 800
-            self.assertLessEqual(len(e['content']), limit, e['id'])
+    def test_related_entry_loads_in_story_mode(self):
+        normal = self.wb.lookup('示例主题', stage=0, scope='group', max_entries=1)
+        story = self.wb.lookup('示例主题', stage=0, scope='group', story_mode=True)
+        self.assertIn('世界书公开示例。', normal)
+        self.assertNotIn('故事模式关联条目示例。', normal)
+        self.assertIn('故事模式关联条目示例。', story)
 
-    def test_personal_secrets_are_stage_gated_and_private_only(self):
-        deep = ('村子', '废墟', '冒险家考核', '发誓要复仇')      # 身世层：亲近(3)才开放
-        family = ('哥哥', '逐影')                           # 家人层：朋友(2)才开放
-        for e in self.raw:
-            if e.get('max_stage') is not None and e.get('min_stage') is None:
-                continue                      # "含糊版本"本来就是给陌生人看的
-            if any(w in e['content'] for w in deep):
-                self.assertGreaterEqual(e.get('min_stage') or 0, 3, f'{e["id"]} 泄露了身世')
-                self.assertEqual(e.get('scope'), 'private', e['id'])
-            elif any(w in e['content'] for w in family):
-                self.assertGreaterEqual(e.get('min_stage') or 0, 2, f'{e["id"]} 泄露了家人')
-                self.assertEqual(e.get('scope'), 'private', e['id'])
-
-    def test_real_name_never_invented_and_no_removed_character(self):
-        blob = ' '.join(e['content'] for e in self.raw)
-        self.assertNotIn('阿骨', blob)
-        self.assertIn('真名', blob)
-        self.assertIn('月白', blob)
-        self.assertIn('骷髅', blob)
-        self.assertIn('支部长', blob)
-
-    def test_vague_entries_do_not_leak(self):
-        for e in self.raw:
-            if e.get('max_stage') is not None and e.get('min_stage') is None:
-                for w in ('逐影', '村子被', '废墟', '失踪', '复仇', '冒险家'):
-                    if e['id'].startswith('origin-vague'):
-                        self.assertNotIn(w, e['content'], e['id'])
-
-    def test_vague_entry_deflects_but_never_denies_family(self):
-        """真模型验收发现：陌生阶段被问"有哥哥吗"她会答"没有"——那是撒谎，后面揭晓会自相矛盾。"""
-        vague = next(e for e in self.raw if e['id'] == 'origin-vague')
-        self.assertIn('不会说「没有」', vague['content'])
-        self.assertIn('哥哥', vague['keywords'])
-        hits = self.wb.lookup('你有哥哥吗', stage=0, scope='private')
-        self.assertTrue(any('不会说「没有」' in h for h in hits))
-
-    def test_no_software_wording(self):
-        for e in self.raw:
-            for w in ('程序', '代码', '服务器', '数据库', '语言模型', 'AI', '接口', '法器'):
-                self.assertNotIn(w, e['content'], f'{e["id"]} 出现「{w}」')
-
-    def test_trpg_and_cross_world_entries_hit_cleanly(self):
-        tech = ' '.join(self.wb.lookup('你们那有手机吗？你是怎么跟我们聊天的', stage=0, scope='group'))
-        self.assertIn('跨界线路', tech)
-        dice = ' '.join(self.wb.lookup('歌伊今天骰运怎么这么差，又出大失败了', stage=0, scope='group'))
-        self.assertIn('叛逆期', dice)
-        coc = ' '.join(self.wb.lookup('刚才跑团过理智检定掉san直接撕卡了', stage=0, scope='group'))
-        self.assertIn('净化术', coc)
-        fortune = ' '.join(self.wb.lookup('今天今日运势好低啊', stage=0, scope='group'))
-        self.assertIn('晨祷', fortune)
-
-    def test_story_mode_expands_worldbook_cluster_and_commands(self):
-        # 日常模式最多 3 条；剧情探索模式自动按 links 一跳/二跳展开到最多 6 条
-        normal_hits = self.wb.lookup('跟我讲讲清泉镇吧', stage=0, scope='private', story_mode=False)
-        story_hits = self.wb.lookup('跟我讲讲清泉镇吧', stage=0, scope='private', story_mode=True)
-        self.assertLessEqual(len(normal_hits), 3)
-        self.assertGreater(len(story_hits), len(normal_hits))
-        self.assertLessEqual(len(story_hits), 6)
-        joined_story = ' '.join(story_hits)
-        self.assertIn('泉边星', joined_story)
-        self.assertIn('麦穗面包坊', joined_story)
-        self.assertIn('面包屑', joined_story)
-        # 哪怕在剧情模式下，低阶段仍然绝不泄露深层身世
-        stranger_story = ' '.join(self.wb.lookup('你有哥哥吗？你的父母呢？', stage=0, scope='private', story_mode=True))
-        for w in ('逐影', '废墟', '发誓要复仇', '冒险家考核'):
-            self.assertNotIn(w, stranger_story)
-
-    def test_stranger_cannot_extract_secrets_by_any_probe(self):
-        for q in ('你有哥哥吗', '你的父母呢', '你的身世', '你小时候的事', '你的村子怎么了', '哥哥为什么复仇',
-                  '逐影是谁'):
-            for stage in (None, 0, 1, 2):
-                hits = self.wb.lookup(q, stage=stage, scope='private')
-                joined = ' '.join(hits)
-                for w in ('废墟', '失踪', '冒险家考核', '发誓要复仇'):
-                    self.assertNotIn(w, joined, f'{q!r} @stage={stage}')
-            for stage in (None, 0, 1):
-                joined = ' '.join(self.wb.lookup(q, stage=stage, scope='private'))
-                self.assertNotIn('逐影', joined, f'{q!r} @stage={stage}')
-        always = ' '.join(self.wb.always_entries(stage=0, scope='private'))
-        self.assertNotIn('哥哥', always)
-        self.assertNotIn('逐影', always)
-
-    def test_common_questions_hit_something(self):
-        for q in ('什么是粒子', '讲讲天灾', '你喜欢吃什么', '你是哪里人', '猎人是怎么分级的',
-                  '你们那有手机吗', '今天打雷了好怕'):
-            self.assertTrue(self.wb.lookup(q, stage=0, scope='private'), q)
-
-    def test_topic_pool_covers_each_stage(self):
-        for stage in range(6):
-            self.assertTrue(self.wb.topics(stage=stage, scope='private'), stage)
-
-    def test_group_and_stage2_family_queries_have_guidance_without_leaking_village(self):
-        for q in ('歌伊你有哥哥吗？', '你父母呢？', '你老家是哪里的？', '你是孤儿吗？'):
-            group_hits = self.wb.lookup(q, stage=None, scope='group')
-            self.assertTrue(any('不会说「没有」' in h for h in group_hits), f'群聊漏防线: {q}')
-        for q in ('你父母呢？', '你小时候住哪？', '你有哥哥吗？'):
-            s2_hits = self.wb.lookup(q, stage=2, scope='private')
-            self.assertTrue(any('逐影' in h for h in s2_hits), f'Stage 2 漏命中: {q}')
-            self.assertFalse(any('废墟' in h for h in s2_hits), f'Stage 2 泄露废墟: {q}')
-
-    def test_followup_and_links_work_on_shipped_worldbook(self):
-        s3_followup = self.wb.lookup('那后来呢？详细说说', recent=['你有哥哥吗'], stage=3, scope='private')
-        self.assertTrue(any('逐影' in h for h in s3_followup))
-        self.assertTrue(any('废墟' in h for h in s3_followup))
-        yuebai_followup = self.wb.lookup('她平时喜欢干嘛呀', recent=['月白是谁呀'], stage=2, scope='private')
-        self.assertTrue(any('巨弓' in h for h in yuebai_followup))
-
-    def test_everyday_chat_noise_does_not_false_trigger(self):
-        noisy = (
-            '我今天怪累的，先去洗个澡',
-            '刚才上海那边下雨了，海风挺大',
-            '我手机没电了，充会儿电',
-            '我今天吃了个汉堡，晚饭还没着落',
-            '我家小猫今天吐毛球了',
-            '这款游戏的技能树点错了',
-            '今天学习了好久的高数，头都大了',
-            '我刚完成了一个任务，好爽',
-            '我崇拜的大神今天更新了',
-            '今天穿的这件T恤有点大',
-        )
-        for q in noisy:
-            self.assertEqual(self.wb.lookup(q, stage=0, scope='group'), [], f'日常闲聊误触发: {q}')
-
-    def test_topic_switch_cuts_off_stale_recent_context_even_in_story_mode(self):
-        # 切换新强关键词话题时（即使带「跟我讲讲」且在剧情模式下），不应把旧话题硬拖进来
-        hits = self.wb.inspect_lookup(
-            '跟我讲讲麦穗面包坊吧',
-            recent=['什么是天灾？', '天灾是五十年一遇的巨型灾害……'],
-            stage=2,
-            scope='private',
-            story_mode=True,
-        )
-        ids = [h['id'] for h in hits]
-        self.assertIn('town-bakery', ids)
-        self.assertNotIn('world-disaster', ids)
-        self.assertNotIn('lore-abyss', ids)
-
-        # 多轮历史里先聊了粒子，后切换到月白，再追问「那后来呢」只应聚焦最近锚点，不应把 4 轮前的粒子拖回来
-        anchor_hits = self.wb.inspect_lookup(
-            '她平时常来镇上吗？',
-            recent=['什么是粒子？', '粒子是构成生命的能量……', '月白是谁呀？', '月白是我的挚友，一只超可爱的白猫娘猎人～'],
-            stage=2,
-            scope='private',
-            story_mode=False,
-        )
-        anchor_ids = [h['id'] for h in anchor_hits]
-        self.assertIn('friend-yuebai', anchor_ids)
-        self.assertNotIn('world-particles', anchor_ids)
-
-    def test_pronoun_gender_routing_blocks_cross_npc_leakage(self):
-        # 问女性代词「她」绝不误拉男性条目（哥哥），问男性代词「他」绝不误拉女性条目（月白）
-        she_hits = self.wb.inspect_lookup(
-            '她多大了，性格怎么样？',
-            recent=['月白是谁呀？'],
-            stage=3,
-            scope='private',
-        )
-        she_ids = [h['id'] for h in she_hits]
-        self.assertIn('friend-yuebai', she_ids)
-        self.assertNotIn('origin-brother', she_ids)
-
-        he_hits = self.wb.inspect_lookup(
-            '他现在在哪里工作呀？',
-            recent=['你有哥哥吗？'],
-            stage=3,
-            scope='private',
-        )
-        he_ids = [h['id'] for h in he_hits]
-        self.assertIn('origin-brother', he_ids)
-        self.assertNotIn('friend-yuebai', he_ids)
-        self.assertNotIn('friend-yuebai-worry', he_ids)
-
-    def test_direct_hits_outrank_link_expansion_and_new_noise_blocked(self):
-        # 同一句同时问两个明确设定时，直接命中必须排在一跳 link 之前，不被关联图谱挤出前 3
-        hits = self.wb.inspect_lookup(
-            '讲讲粒子和麦穗面包坊',
-            stage=0,
-            scope='private',
-            story_mode=False,
-        )
-        ids = [h['id'] for h in hits]
-        self.assertIn('world-particles', ids)
-        self.assertIn('town-bakery', ids)
-
-        extra_noisy = (
-            '这个特效的粒子特效太炫了，显卡要烧了',
-            '搬家今天去当苦力搬了一下午箱子',
-            '我们学校学生会和行业协会今天开会',
-            '这本小说世界观设定好宏大，这番剧也好看',
-            '今晚打公会战刷副本太坐牢了',
-        )
-        for q in extra_noisy:
-            self.assertEqual(self.wb.lookup(q, stage=0, scope='group'), [], f'现代语境误触发: {q}')
+    def test_private_entry_only_loads_for_eligible_private_stage(self):
+        private = '仅在指定私聊阶段可用的示例。'
+        for stage, scope in ((0, 'private'), (3, 'group')):
+            self.assertNotIn(private, self.wb.lookup('示例主题', stage=stage, scope=scope))
+        self.assertIn(private, self.wb.lookup('示例主题', stage=3, scope='private'))
 
 
 class DiminishingTest(unittest.TestCase):
-    """边际递减：前 3 次足额、之后打对折（2026-11-11，防"几句话就顶满"）。"""
+    """边际递减规则：显式固定前 3 次足额、之后打对折。"""
 
     def setUp(self):
-        self.p = S.Params()
+        # 该测试覆盖旧规则本身，不绑定生产环境当前的放宽旋钮。
+        self.p = S.params_from_config({
+            'galgame_diminish_after': 3,
+            'galgame_diminish_factor': 0.5,
+        })
 
     def test_after_three_scored_turns_gain_is_halved(self):
         rel = S.Relation('u')
@@ -847,7 +731,7 @@ class DiminishingTest(unittest.TestCase):
             self.assertEqual(p.diminish_factor, S.Params().diminish_factor, bad)
 
     def test_cap_still_binds(self):
-        """递减之后日上限仍然生效：一天最多还是 12 分。"""
+        """递减之后日上限仍然生效：默认一天最多 14 分。"""
         rel = S.Relation('u')
         now = at_day(0)
         tags = ('care', 'share', 'humor', 'curious_lore', 'respect', 'neutral')

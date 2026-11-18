@@ -170,6 +170,28 @@ class CycleAndEscalateTest(unittest.TestCase):
         self.assertIn('所有模型渠道都连不上', notes[0])
         self.assertIn('official-chat', notes[0])
 
+    def test_non_locking_last_resort_can_probe_back_to_primary(self):
+        """生产链路的官方兜底不应阻塞后台探测和自动回切。"""
+        gw, store, _session, _notes = build(
+            retry_before_hold_seconds=0,
+            lock_last_resort=False,
+        )
+        # 生产官方条目参与自动链路；测试夹具默认把它标成 manual_only，先改成真实语义。
+        official = next(provider for provider, _ in gw._pairs if provider.name == 'official-chat')
+        official.manual_only = False
+        result = ask(gw)
+        self.assertFalse(result.ok)
+        self.assertEqual(gw._current_name, 'official-chat')
+        self.assertEqual(gw._hold_name, '')
+        self.assertEqual(store.settings.get('gw.hold'), '')
+
+        with gw._lock:
+            for _provider, state in gw._pairs:
+                state.cooldown_until = 0.0
+        gw._probe_provider = lambda provider: provider.name == 'p1'
+        self.assertEqual(gw.probe_once(), ['p1'])
+        self.assertEqual(gw._current_name, 'p1')
+
     def test_locked_gateway_only_uses_official(self):
         gw, store, session, notes = build()
         ask(gw)

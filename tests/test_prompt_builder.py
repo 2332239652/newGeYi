@@ -155,7 +155,7 @@ class ActiveInstructionLevelTest(unittest.TestCase):
         )
         session_key = priv_session.as_text()
         self.rt.store.add_turn(session_key, 'user', '你好呀', uid, 'Tester')
-        self.rt.store.add_turn(session_key, 'assistant', '今天刚和月白一起喝了麦茶～')
+        self.rt.store.add_turn(session_key, 'assistant', '今天刚和角色甲一起喝了麦茶～')
         self.rt.store.add_turn(session_key, 'user', '哦？真的吗', uid, 'Tester')
         self.rt.store.add_turn(session_key, 'assistant', '嗯嗯，还在镇口聊了会儿呢！')
         priv_msg = IncomingMessage(
@@ -174,8 +174,8 @@ class ActiveInstructionLevelTest(unittest.TestCase):
         )
         self.rt.store.add_turn(session_key, 'user', priv_msg.text, uid, 'Tester')
         recent = builder._recent_texts(priv_msg, limit=6)
-        # 保留最近两轮 assistant 回复，保证隔一轮简短附和后追问代词仍能找到「月白」锚点
-        self.assertIn('今天刚和月白一起喝了麦茶～', recent)
+        # 保留最近两轮 assistant 回复，保证隔一轮简短附和后追问代词仍能找到「角色甲」锚点
+        self.assertIn('今天刚和角色甲一起喝了麦茶～', recent)
         self.assertIn('嗯嗯，还在镇口聊了会儿呢！', recent)
 
         set_story_mode(self.rt.store, session_key, uid, True)

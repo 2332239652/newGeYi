@@ -36,8 +36,9 @@ def make_msg(text='随便聊聊', sender='30003'):
 class AuditTest(unittest.TestCase):
     def test_credentials_without_word_boundary_are_caught(self):
         """中文紧贴英文时也必须命中（这是真实中文群里的写法）。"""
+        fixture_key = 'abcdef' + '123456'
         cases = [
-            '我的api_key=abcdef123456',
+            f'我的api_key={fixture_key}',
             '密钥是sk-abcdefghijklmnop1234',
             'access_token:xyz',
             '密码＝12345678',

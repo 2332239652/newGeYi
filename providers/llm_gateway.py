@@ -460,7 +460,7 @@ class LLMGateway:
 
     def _last_resort_name(self) -> str:
         """兜底渠道名（`failover.last_resort_provider`），没配就是空串。"""
-        return str(self._failover_cfg.get('last_resort_provider', 'official-chat') or '').strip()
+        return str(self._failover_cfg.get('last_resort_provider', '') or '').strip()
 
     def set_notify(self, callback) -> None:
         """注入「通知骰主」的回调：callback(text) -> None。"""
@@ -550,9 +550,19 @@ class LLMGateway:
                 logger.warning('手动锚点 %s 之下没有其他渠道，本轮忽略锚点限制',
                                self._anchor_name)
 
+        # 有渠道显式声明当前类型时优先使用，保留兼容渠道作为兜底。
+        # 先比较显式声明，再比较固定的当前渠道。
+        explicit = kind and any(
+            p[0].kinds is not None and kind in p[0].kinds for p in pairs
+        )
+
         def rank(pair):
             provider, state = pair
+            wildcard = 0
+            if explicit and not (provider.kinds is not None and kind in provider.kinds):
+                wildcard = 1      # 只靠 'chat' 通配才接这个 kind 的渠道
             return (
+                wildcard,
                 0 if provider.name == current else 1,
                 1 if not state.healthy else 0,
                 provider.priority,
@@ -934,7 +944,7 @@ class LLMGateway:
         """待重试时的候选顺序：锚点排第一，其余按优先级（绝不越过锚点往上）。
 
         **锚点即使标了 `manual_only` 也要试**：骰主手动切过去的那条本来就可能带这个标记
-        （线上 official-chat 就是 manual_only），把它过滤掉等于「从锚点重试」却一次都不碰锚点。
+        （锚点可能被设为 manual_only），把它过滤掉等于「从锚点重试」却一次都不碰锚点。
         """
         with self._lock:
             pairs = list(self._pairs)
@@ -999,17 +1009,12 @@ class LLMGateway:
                 self._pending_retry_running = False
 
     def _escalate_to_last_resort(self, error_code: str, deferred: list | None = None) -> None:
-        """候选渠道全挂 → 通知骰主 + 切到兜底渠道并锁定（等人手动切回）。
+        """候选渠道全挂 → 切到兜底；可选是否锁定。
 
-        骰主原话：「五个全测了一轮都挂了就给骰主发一条通知然后切换官方 Deepseek 为锚点
-        不再尝试，直到我手动切回那五个中的一个为锚点」。
-
-        实现要点：
-        - **锁定**（`gw.hold`）而不是普通锚点：官方 DeepSeek 排在最后，普通锚点的
-          「不许越过它往上」语义在这里会被 "之下没有渠道" 的兜底逻辑绕过；
-        - 锁定期间 `probe_once` 不再自动爬回，`_switch_locked` 也不再把渠道切走；
-        - 解除只有一条路：骰主「切换渠道 X」或「切换渠道 自动」。
+        `failover.lock_last_resort` 默认为 true。设为 false 可继续探测更高优先级渠道，
+        并在其恢复后自动切回。
         """
+        lock = bool(self._failover_cfg.get('lock_last_resort', True))
         name = self._last_resort_name()
         if not name:
             self._notify_all_down(error_code, deferred=deferred)
@@ -1020,37 +1025,38 @@ class LLMGateway:
                 # 没配兜底渠道：退回老行为（只发通知）
                 self._notify_all_down(error_code, deferred=deferred)
                 return
-            if self._hold_name == name and self._current_name == name:
+            if lock and self._hold_name == name and self._current_name == name:
                 self._notify_all_down(error_code, deferred=deferred)
                 return
             old = self._current_name
             self._current_name = name
-            self._hold_name = name
-            # 2026-11-12：**不再清掉手动锚点**。锁定期间 `_ordered_pairs` 只看 hold，
-            # 锚点本来就无效；清掉只会让骰主解锁后发现「我设的锚点没了」。
-            self._pending_hold_at = 0.0      # 已经真锁了，待重试状态收掉
+            if lock:
+                self._hold_name = name
+            else:
+                self._hold_name = ''
+            # 兜底渠道已接管当前请求，清掉待锁定计时；非锁定模式下后续由
+            # probe_once() 按周期探测高优先级渠道并自动回切。
+            self._pending_hold_at = 0.0
             self._pending_error = ''
+            self._pending_from = ''
             state = next(st for p, st in self._pairs if p.name == name)
             state.healthy = True
             state.fail_count = 0
             state.last_error = ''
             self._append_history_locked(old, name, 'all_down', error_code)
             self._persist_locked()
-        logger.warning('候选渠道两轮全挂（%s），已切到兜底渠道 %s 并锁定；'
-                       '「切换渠道 X」可解除', error_code, name)
+        suffix = '并锁定' if lock else '，后台会继续探测并自动回切'
+        logger.warning('候选渠道两轮全挂（%s），已切到兜底渠道 %s%s', error_code, name, suffix)
         cfg = self._failover_cfg
         if not cfg.get('notify_owner', True) or self._notify_cb is None:
             return
         tried = '、'.join(dict.fromkeys(p.name for p, _ in self._pairs)) or '（无）'
-        # 走统一入口：以前这里直接 `_notify_cb(...)`，**绕过 600 秒冷却**——
-        # 结果是每挂一次发一条（19:37、19:38、19:39 连着三条），看起来像"老是掉线"。
-        # 手动切回会让 _hold_name 清空，下一次全挂又走这条路径，冷却形同虚设。
-        self._notify_all_down(
-            error_code,
-            detail=(f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
-                    f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。'),
-            tried=tried, deferred=deferred,
-        )
+        detail = (f'已自动切到兜底渠道「{name}」并锁定，不再尝试其它渠道。\n'
+                  f'想切回：在群里发「切换渠道 <名称>」（先「渠道状态」看列表）。')
+        if not lock:
+            detail = (f'已自动切到兜底渠道「{name}」，后台会继续定期探测优先级更高的渠道，'
+                      '恢复后自动切回。')
+        self._notify_all_down(error_code, detail=detail, tried=tried, deferred=deferred)
 
     def _call_provider(self, provider: Provider, state: ProviderState,
                        req: ModelRequest, kind: str, session_key: str,

@@ -32,6 +32,7 @@ BOOL_KEYS = {
     'active_escalate_enabled', 'gate_scorer_enabled', 'group_quota_enabled',
     'collapse_short_multiline', 'strip_repeated_ellipsis', 'strip_trailing_period',
     'scene_enabled',
+    'private_active_enabled',
 }
 # 数字键 = (最小值, 最大值, 必须整数)。只开放确有热更新语义的字段。
 NUMBER_KEYS = {
@@ -65,9 +66,10 @@ NUMBER_KEYS = {
     'panel_local_port': (0, 65535, True),
     'worldbook_max_entries': (1, 15, True), 'worldbook_story_max_entries': (1, 20, True),
     'galgame_judge_min_chars': (1, 50, True), 'galgame_cross_memory_min_stage': (0, 5, True),
-    'galgame_tag_daily_limit': (1, 5, True),
+    'galgame_tag_daily_limit': (1, 10, True),
     'galgame_diminish_after': (0, 20, True),
     'galgame_diminish_factor': (0, 1, False),
+    'galgame_event_bonus': (0, 20, False),
     'galgame_repeat_window_seconds': (0, 86400, True),
     'galgame_mild_gap': (0, 3, True),
     'voice_poke_rate': (0, 1, False), 'voice_speed': (0.5, 2, False), 'voice_timeout': (1, 120, False),
@@ -93,6 +95,12 @@ NUMBER_KEYS = {
     'private_companion_debounce_seconds': (0, 30, False),
     'private_companion_invite_delay_seconds': (0, 30, False),
     'private_companion_max_wait_seconds': (0, 60, False),
+    # 私聊主动搭话
+    'private_active_min_silence_hours': (0.5, 72.0, False),
+    'private_active_daily_limit': (0, 10, True),
+    'private_active_quiet_start': (0, 23, True),
+    'private_active_quiet_end': (0, 23, True),
+    'private_active_tick_seconds': (10, 3600, True),
     'scene_retry_seconds': (0, 86400, True),
 }
 ENUM_KEYS = {

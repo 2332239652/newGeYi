@@ -15,11 +15,15 @@ from ..config import SKIP_ACTIVE
 from ..context import aliases
 from ..memory.exporter import export_memory
 from ..memory.repository import SHARE_OVERRIDE_PREFIX
-from ..memory.spaces import current_space, ensure_space, list_stories, new_story, pause_story, resume_story
-from ..memory.worldbook import is_story_mode, list_story_mode_users, set_story_mode
+from ..memory.spaces import (SPACE_PREFIX, current_space, ensure_space, list_stories, new_story,
+                             pause_story, resume_story)
+from ..memory.worldbook import (is_story_mode, list_story_mode_sessions, list_story_mode_users,
+                                set_story_mode)
 from ..models import IncomingMessage
+from ..presentation.renderer import escape_message_text
 from ..presentation.renderer import load_emote_table  # noqa: F401  （保留导出）
 from ..runtime import sponsors
+from . import group_other_ai
 
 logger = logging.getLogger('newGeYi.commands')
 
@@ -44,6 +48,31 @@ KIND_LABELS = {
 
 # 按会话维度拆账的标签
 SCOPE_LABELS = {'group': '群聊', 'private': '私聊', 'other': '其它'}
+
+# 群聊「其他 AI」名单的指令名（群管工具，名单与断词见 routing/group_other_ai.py）
+OTHER_AI_CMD = '本群其他AI'
+OTHER_AI_PRIVATE_HINT = f'「{OTHER_AI_CMD}」是群设置，请在群聊中使用。'
+
+# 群聊「其他 AI」过滤档位：高=全拦、低=限流、关=只保留名单
+AI_FILTER_CMD = 'ai过滤'
+AI_FILTER_PRIVATE_HINT = f'「{AI_FILTER_CMD}」是群设置，请在群聊中使用。'
+AI_FILTER_USAGE = f'用法：{AI_FILTER_CMD} 高/低/关'
+AI_FILTER_DESC = {
+    group_other_ai.MODE_HIGH: '名单里的 QQ 发言一律不进入插件，回复里它们的昵称全部断词。',
+    group_other_ai.MODE_LOW: '每个登记 QQ 30 分钟放行 1 条发言；每个昵称 30 分钟保留 1 次原样提及，其余断词。',
+    group_other_ai.MODE_OFF: '名单仍保留，但发言照常处理、昵称不再断词。',
+}
+
+# 群聊里会改动「全群共享空间」的剧情指令：只允许群管/骰主执行。
+# 私聊不设限——那是本人自己的空间。
+STORY_SWITCH_OPEN_COMMANDS = ('新建剧情', '重开剧情', '续接剧情')
+STORY_SWITCH_COMMANDS = frozenset((
+    '剧情模式开', '开启剧情模式', '进入剧情模式', '探索模式开', '开启探索模式', '故事模式开',
+    '剧情模式关', '关闭剧情模式', '退出剧情模式', '探索模式关', '关闭探索模式', '故事模式关',
+))
+GROUP_STORY_SWITCH_DENY = (
+    '群里的剧情篇章是大家共用的，要群管或骰主才能开启、切换或暂停哦～想一个人开新篇章的话，可以私聊我试试。'
+)
 
 
 def fmt_tokens(value) -> str:
@@ -155,6 +184,8 @@ class CommandRouter:
             '（「本群」几条群管就能用，其余需要骰主/主人）',
             '',
             '[本群] 本群被动开/关 | 本群主动开/关 | 查看群背景 | 设置群背景 <文本>',
+            '[本群] 本群其他AI 添加 <QQ> <昵称> | 删除 <QQ> | 列表 | 清空',
+            '[本群] ai过滤 高/低/关',
             '[私聊] 开启/关闭私聊 | 私聊用量（额度与触发词模式） | 私聊触发词开/关',
             '[记忆] 记忆状态 | 导出记忆 | 群聊记忆列表 | 群聊记忆重置 <QQ/全部>',
             '[称呼] 称呼列表 | 称呼重置 <QQ>',
@@ -743,8 +774,8 @@ class CommandRouter:
 
     def _cmd_episode_list(self, msg: IncomingMessage, kind: str) -> str:
         session_key = msg.session.as_text()
-        space_id = ensure_space(self.r.store, session_key,
-                                is_story_mode(self.r.store, session_key, msg.sender_id))
+        # 只读命令：只读当前空间，绝不因为查一眼就在新会话里建出篇章
+        space_id = current_space(self.r.store, session_key)
         uid = str(msg.sender_id or '').strip()
         if not uid:
             return '未获取到你的账号信息。'
@@ -776,8 +807,8 @@ class CommandRouter:
             return usage
         session_key = msg.session.as_text()
         uid = str(msg.sender_id or '').strip()
-        space_id = ensure_space(self.r.store, session_key,
-                                is_story_mode(self.r.store, session_key, uid))
+        # 只读命令：同上，只读当前空间，不建篇章
+        space_id = current_space(self.r.store, session_key)
         if not uid:
             return '未获取到你的账号信息。'
         memory = self._episode_memory()
@@ -982,17 +1013,21 @@ class CommandRouter:
         count = len(self.r.worldbook.entries)
         normal_n = int(self.r.config.get('worldbook_max_entries', 3))
         story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
-        story_on = is_story_mode(self.r.store, msg.session.as_text(), msg.sender_id)
+        skey = msg.session.as_text()
+        story_on = (current_space(self.r.store, skey) != 'chat'
+                    or is_story_mode(self.r.store, skey, ''))
         mode_str = f'剧情探索模式（单轮最多 {story_n} 条）' if story_on else f'日常模式（单轮最多 {normal_n} 条）'
-        return (f'世界书: {"开" if on else "关"} | 已加载条目: {count} | 当前你的模式: {mode_str}\n'
+        return (f'世界书: {"开" if on else "关"} | 已加载条目: {count} | 当前会话模式: {mode_str}\n'
                 f'（发「剧情模式开」可深入探索歌伊的世界与故事；未命中零成本）')
 
     def _cmd_story_mode_status(self, msg: IncomingMessage) -> str:
-        story_on = is_story_mode(self.r.store, msg.session.as_text(), msg.sender_id)
+        session_key = msg.session.as_text()
+        # 只读：旧实现调 ensure_space，一次查询就能给新群建出篇章并把全群带进剧情
+        space_id = current_space(self.r.store, session_key)
+        story_on = (space_id != 'chat') or is_story_mode(self.r.store, session_key, '')
         normal_n = int(self.r.config.get('worldbook_max_entries', 3))
         story_n = int(self.r.config.get('worldbook_story_max_entries', 6))
-        space_id = ensure_space(self.r.store, msg.session.as_text(), story_on)
-        chapter = next((row['title'] for row in list_stories(self.r.store, msg.session.as_text())
+        chapter = next((row['title'] for row in list_stories(self.r.store, session_key)
                         if row['space_id'] == space_id), '日常聊天')
         state_text = '开启' if story_on else '关闭（日常模式）'
         lines = [
@@ -1001,12 +1036,7 @@ class CommandRouter:
             f'【剧情探索模式】当前状态：{state_text}',
             f'· 效果：与歌伊对话时，世界书设定注入上限由 {normal_n} 条提升至 {story_n} 条，'
             '自动展开关联设定簇，她也会多聊一些细节与见闻。',
-            '· 可试着聊起的话题线索：',
-            '  1. 清泉镇风物：清泉镇、教会日常、麦穗面包坊、圣职学院、丰收祭典',
-            '  2. 身边的人：好朋友月白、老猎人格伦、同屋修女米娅、莱妮院长、橘猫「面包屑」',
-            '  3. 异世界与本职：治愈粒子与净化术、猎人公会与等级、冒险家协会、外派小队任务',
-            '  4. 历史与传说：天灾、拟灾、渊海、玄门之战（崇）、公会历史、化人与主和派',
-            '  （私聊里随着关系一步步变亲近，还能慢慢解锁她不轻易对外人提起的身世与心愿）',
+            '· 话题可从本地世界书已有的线索开始。私聊仍遵循各条目的关系阶段门槛。',
             '· 指令：发「剧情模式开」开启，「剧情模式关」切回日常模式。',
         ]
         return '\n'.join(lines)
@@ -1053,41 +1083,78 @@ class CommandRouter:
         verb = '续接' if resume else '新开'
         return f'📖 已{verb}「{self._plain_command_text(title)}」。经历和约定按当前篇章保存。'
 
+    def _active_story_sessions(self) -> list[str]:
+        """当前处于剧情的会话：开关为真的 + 空间停在 story:* 的（两者取并集去重）。"""
+        sessions = set(list_story_mode_sessions(self.r.store))
+        for key, val in self.r.store.settings_with_prefix(SPACE_PREFIX):
+            if str(val or '').startswith('story:'):
+                sessions.add(key[len(SPACE_PREFIX):])
+        return sorted(sessions)
+
     def _cmd_story_mode_list(self, msg: IncomingMessage) -> str:
-        users = list_story_mode_users(self.r.store)
-        if not users:
-            return '目前没有人开启「剧情探索模式」（全部处于默认日常模式）。'
-        lines = [f'【剧情探索模式 · 已开启用户（共 {len(users)} 人）】']
-        for uid in users[:40]:
-            alias = aliases.get(self.r.store, uid)
-            suffix = f'（{self._plain_command_text(alias)}）' if alias else ''
-            lines.append(f'  · {uid}{suffix}')
-        if len(users) > 40:
-            lines.append(f'  ……还有 {len(users) - 40} 人')
+        active_sessions = self._active_story_sessions()
+        if not active_sessions:
+            return '目前没有会话开启「剧情探索模式」（全部处于默认日常模式）。'
+        lines = [f'【剧情探索模式 · 已开启会话（共 {len(active_sessions)} 个）】']
+        for skey in active_sessions[:40]:
+            if ':private:' in skey:
+                uid = skey.rsplit(':', 1)[-1]
+                alias = aliases.get(self.r.store, uid)
+                suffix = f'（{self._plain_command_text(alias)}）' if alias else ''
+                lines.append(f'  · 私聊 {uid}{suffix} [{skey}]')
+            else:
+                gid = skey.rsplit(':', 1)[-1]
+                lines.append(f'  · 群聊 {gid} [{skey}]')
+        if len(active_sessions) > 40:
+            lines.append(f'  ……还有 {len(active_sessions) - 40} 个会话')
         return '\n'.join(lines)
 
     def _cmd_story_mode_reset(self, msg: IncomingMessage, arg: str) -> str:
         target = str(arg or '').strip()
         users = list_story_mode_users(self.r.store)
+        current_key = msg.session.as_text()
         if target in ('', '全部', 'all', 'ALL'):
+            reset_sessions: set[str] = set()
             with self.r.store.transaction():
+                # 1) 清遗留的用户级开关（旧版本按人全局生效的键）
                 for uid in users:
                     set_story_mode(self.r.store, '', uid, None)
+                # 2) 清全部会话级开关
                 for key, _ in self.r.store.settings_with_prefix('story_mode:'):
                     self.r.store.set_setting(key, '')
-                # 当前会话空间是共享边界；主控重置时一并暂停，不删除原始聊天。
-                pause_story(self.r.store, msg.session.as_text())
-            return f'✅ 已重置全部 {len(users)} 位用户的剧情模式（当前会话回到日常模式）'
+                    reset_sessions.add(key[len('story_mode:'):])
+                # 3) 把所有停在 story:* 的会话退回日常（不删原始聊天）
+                for key, val in self.r.store.settings_with_prefix(SPACE_PREFIX):
+                    if str(val or '').startswith('story:'):
+                        skey = key[len(SPACE_PREFIX):]
+                        pause_story(self.r.store, skey)
+                        reset_sessions.add(skey)
+                # 4) 保底：当前会话一定回日常
+                pause_story(self.r.store, current_key)
+                reset_sessions.add(current_key)
+            return (f'✅ 已重置全部 {len(reset_sessions)} 个会话的剧情模式，'
+                    f'并清理了 {len(users)} 条旧用户开关记录（所有会话均已回到日常模式）')
         if not target.isdigit():
             return '格式：剧情模式重置 <QQ号>，或「剧情模式重置 全部」'
+        target_sessions: set[str] = set()
         with self.r.store.transaction():
+            # 1) 清该 QQ 的遗留用户级开关
             set_story_mode(self.r.store, '', target, None)
+            # 2) 找这个 QQ 的私聊会话（开关表 + 空间表）
             for key, _ in self.r.store.settings_with_prefix('story_mode:'):
-                if key.rsplit(':', 1)[-1] == target:
-                    self.r.store.set_setting(key, '')
-                    pause_story(self.r.store, key[len('story_mode:'):])
-            pause_story(self.r.store, msg.session.as_text())
-        return f'✅ 已重置 QQ {target} 的剧情模式（当前会话回到日常模式）'
+                skey = key[len('story_mode:'):]
+                if ':private:' in skey and skey.rsplit(':', 1)[-1] == target:
+                    target_sessions.add(skey)
+            for key, val in self.r.store.settings_with_prefix(SPACE_PREFIX):
+                skey = key[len(SPACE_PREFIX):]
+                if (str(val or '').startswith('story:') and ':private:' in skey
+                        and skey.rsplit(':', 1)[-1] == target):
+                    target_sessions.add(skey)
+            # 3) 只动这个 QQ 的私聊会话，绝不误伤操作者当前所在会话
+            for skey in sorted(target_sessions):
+                self.r.store.set_setting('story_mode:' + skey, '')
+                pause_story(self.r.store, skey)
+        return f'✅ 已重置 QQ {target} 的私聊剧情模式（{len(target_sessions)} 个私聊会话已回到日常模式）'
 
     # ------------- 私聊关系（galgame）-------------
     def _cmd_relation(self, msg: IncomingMessage) -> str:
@@ -1297,6 +1364,87 @@ class CommandRouter:
         bg = self.r.store.get_background(msg.session.as_text())
         return f'本群背景:\n{bg}' if bg else '本群尚未设置背景'
 
+    def _other_ai_receipt(self, session_key: str, text: str) -> str:
+        masked = group_other_ai.mask_other_ai_names(
+            text, self.r.store, session_key, protected_re=None)
+        return escape_message_text(masked)
+
+    def _cmd_group_other_ai(self, msg: IncomingMessage, arg: str) -> str:
+        """本群「其他 AI」名单维护：添加 <QQ> <昵称> | 删除 <QQ> | 列表 | 清空。
+
+        添加即启用、清空/删空即停用；名单只存 QQ+昵称，按会话隔离。
+        权限（群管/骰主）和私聊指路在 _dispatch 里判，这里只管格式与读写。
+        """
+        session_key = msg.session.as_text()
+        action, _, rest = arg.partition(' ')
+        action = action.strip()
+        rest = rest.strip()
+        if not action or action == '列表':
+            entries = group_other_ai.load_entries(self.r.store, session_key)
+            if not entries:
+                return (f'本群{OTHER_AI_CMD}名单是空的。\n'
+                        f'添加：{OTHER_AI_CMD} 添加 <QQ> <昵称>')
+            lines = [f'本群{OTHER_AI_CMD}名单（{len(entries)} 个）：']
+            lines.extend(f'{index}. {entry["nickname"]}（{entry["qq"]}）'
+                         for index, entry in enumerate(entries, 1))
+            return self._other_ai_receipt(session_key, '\n'.join(lines))
+        if action == '清空':
+            if rest:
+                return f'格式：{OTHER_AI_CMD} 清空'
+            removed = group_other_ai.clear_entries(self.r.store, session_key)
+            if removed is None:
+                return '⚠️ 名单清空失败，稍后再试试。'
+            if not removed:
+                return f'本群{OTHER_AI_CMD}名单本来就是空的。'
+            return f'✅ 已清空本群其他AI名单（{removed} 个）。'
+        if action == '添加':
+            parts = rest.split(maxsplit=1)
+            if len(parts) != 2:
+                return f'格式：{OTHER_AI_CMD} 添加 <QQ> <昵称>'
+            qq = group_other_ai.normalize_qq(parts[0])
+            if not qq:
+                return (f'QQ 号要填 {group_other_ai.QQ_MIN_LEN}-{group_other_ai.QQ_MAX_LEN} 位数字哦，'
+                        f'例如：{OTHER_AI_CMD} 添加 10000 示例助手')
+            nickname = group_other_ai.normalize_nickname(parts[1])
+            if not nickname:
+                return (f'昵称要 {group_other_ai.NAME_MIN_LEN}-{group_other_ai.NAME_MAX_LEN} 个字符，'
+                        '且不能带换行或控制字符哦～')
+            status = group_other_ai.add_entry(self.r.store, session_key, qq, nickname)
+            if status is None:
+                return '⚠️ 名单保存失败，稍后再试试。'
+            action_label = '更新其他AI昵称' if status == 'updated' else '登记其他AI'
+            return self._other_ai_receipt(session_key, f'✅ 已{action_label}：{nickname}（{qq}）')
+        if action == '删除':
+            qq = group_other_ai.normalize_qq(rest)
+            if not qq:
+                return f'格式：{OTHER_AI_CMD} 删除 <QQ>'
+            status = group_other_ai.remove_entry(self.r.store, session_key, qq)
+            if status is None:
+                return '⚠️ 名单保存失败，稍后再试试。'
+            if status == 'missing':
+                return f'未登记 {qq} 哦。'
+            return f'✅ 已删除其他AI登记：{qq}'
+        return (f'「{OTHER_AI_CMD}」用法：\n'
+                f'添加 <QQ> <昵称> | 删除 <QQ> | 列表 | 清空\n'
+                '登记过的机器人发言不会再触发我，我回复里的名字也会被断开。')
+
+    def _cmd_ai_filter(self, msg: IncomingMessage, arg: str) -> str:
+        """本群「其他 AI」过滤档位：高/低/关（默认高，兼容升级前行为）。"""
+        session_key = msg.session.as_text()
+        mode = group_other_ai.normalize_mode(arg)
+        if not arg:
+            current = group_other_ai.get_mode(self.r.store, session_key)
+            label = group_other_ai.MODE_LABELS.get(current, current)
+            return (f'本群其他AI过滤模式：{label}\n'
+                    f'{AI_FILTER_DESC.get(current, "")}\n'
+                    f'切换：{AI_FILTER_CMD} 高/低/关')
+        if not mode:
+            return AI_FILTER_USAGE
+        if not group_other_ai.set_mode(self.r.store, session_key, mode):
+            return '⚠️ 过滤模式保存失败，稍后再试试。'
+        label = group_other_ai.MODE_LABELS.get(mode, mode)
+        return f'✅ 本群其他AI过滤模式已设为：{label}\n{AI_FILTER_DESC.get(mode, "")}'
+
     # ------------- 伴生原声语音 -------------
     def _cmd_voice_status(self, msg: IncomingMessage) -> str:
         vm = getattr(self.r, 'voice_manager', None)
@@ -1372,6 +1520,23 @@ class CommandRouter:
         if hasattr(self.r, 'voice_manager'):
             self.r.voice_manager.reload(self.r.config)
         return "✅ 已重新加载语音配置与预设词库"
+
+    def _story_switch_allowed(self, msg: IncomingMessage) -> bool:
+        """群聊切换共享篇章的权限：骰主或本群管理员。私聊永远是本人自己的空间。"""
+        if not msg.is_group:
+            return True
+        perm = getattr(self.r, 'permissions', None)
+        if perm is None:
+            return False
+        try:
+            if perm.is_master(msg):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return bool(perm.is_group_admin(msg))
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------- 分发 -------------
     _OWNER_CMD_EXACT = {
@@ -1571,6 +1736,14 @@ class CommandRouter:
         if text in ('剧情篇章', '我的剧情', '篇章列表'):
             self.r.reply(msg, self._cmd_story_chapters(msg))
             return True
+        # 群聊的篇章是大家共用的：切换类操作要群管/骰主；只读查询谁都能看。
+        # 私聊是本人自己的空间，自己说了算。
+        if msg.is_group and not self._story_switch_allowed(msg):
+            story_switch = text in STORY_SWITCH_COMMANDS or any(
+                text == cmd or text.startswith(cmd + ' ') for cmd in STORY_SWITCH_OPEN_COMMANDS)
+            if story_switch:
+                self.r.reply(msg, GROUP_STORY_SWITCH_DENY)
+                return True
         for command, resume in (('新建剧情', False), ('重开剧情', False), ('续接剧情', True)):
             if text == command or text.startswith(command + ' '):
                 self.r.reply(msg, self._cmd_story_open(msg, text[len(command):].strip(), resume=resume))
@@ -1603,6 +1776,31 @@ class CommandRouter:
                 self.r.reply(msg, self._cmd_group_background_view(msg))
             else:
                 self.r.reply(msg, self._cmd_group_background_set(msg, text[6:]))
+            return True
+
+        # 本群「其他 AI」名单：群设置，私聊一律明确指路（不静默丢弃）；
+        # 群内维护权限 = 骰主 or 群管，普通群成员只能看到拒绝。同样放在非主人早退之前。
+        if text == OTHER_AI_CMD or text.startswith(OTHER_AI_CMD + ' '):
+            if not msg.is_group:
+                self.r.reply(msg, OTHER_AI_PRIVATE_HINT)
+                return True
+            if not (is_master or p.is_group_admin(msg)):
+                self.r.reply(msg, deny)
+                return True
+            self.r.reply(msg, self._cmd_group_other_ai(msg, text[len(OTHER_AI_CMD):].strip()))
+            return True
+
+        # 本群过滤档位：与名单同权限（骰主 or 群管），同样放在非主人早退之前。
+        # 指令名里的 ai 是 ASCII，大小写都认（AI过滤 / Ai过滤）。
+        lowered = text.lower()
+        if lowered == AI_FILTER_CMD or lowered.startswith(AI_FILTER_CMD + ' '):
+            if not msg.is_group:
+                self.r.reply(msg, AI_FILTER_PRIVATE_HINT)
+                return True
+            if not (is_master or p.is_group_admin(msg)):
+                self.r.reply(msg, deny)
+                return True
+            self.r.reply(msg, self._cmd_ai_filter(msg, text[len(AI_FILTER_CMD):].strip()))
             return True
 
         # 骰主/主人命令

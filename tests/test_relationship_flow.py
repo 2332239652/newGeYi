@@ -15,6 +15,7 @@ import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ['GEYI_DATA_DIR'] = tempfile.mkdtemp(prefix='geyi_relpanel_import_')
 
@@ -24,7 +25,7 @@ from newGeYi.panel import EVENT_NAME, Panel  # noqa: E402
 from newGeYi.panel_helpers import PanelError, validate_patch  # noqa: E402
 from newGeYi.runtime.app import Runtime  # noqa: E402
 
-OWNER = '2332239652'
+OWNER = '100000001'
 
 
 class FakeEvent:
@@ -73,7 +74,7 @@ class Base(unittest.TestCase):
         self.rt = Runtime()
         self.rt.config.update({'private_enabled': True, 'galgame_enabled': True, 'galgame_shadow': False,
                                'worldbook_enabled': True, 'time_awareness_enabled': False,
-                               'emote_enabled': False, 'voice_enabled': False})
+                               'emote_enabled': False, 'voice_enabled': False, 'owner_ids': [OWNER]})
         self.rt.prompt_builder.set_role_prompt('你是歌伊，测试人设。')
         self.svc = self.rt.relationship
         self.uid = str(int(time.time() * 1000) % 10 ** 9 + 300000)
@@ -227,19 +228,14 @@ class EndToEndTest(Base):
 
     def test_secret_lore_is_absent_from_stranger_prompt_in_real_flow(self):
         self.rt.worldbook.load()
-        gateway, _ = self.run_job('你有哥哥吗？你的父母呢？小时候发生过什么？', replies=('这个嘛……',),
-                                  verdict={'delta': 0, 'tag': 'neutral', 'advance_level': 0, 'mood': '',
-                                           'event_done': False, 'note': ''})
-        system = gateway.chat_requests[0].messages[0]['content']
-        for word in ('逐影', '废墟', '发誓要复仇', '冒险家考核'):
-            self.assertNotIn(word, system)
+        verdict = {'delta': 0, 'tag': 'neutral', 'advance_level': 0, 'mood': '',
+                   'event_done': False, 'note': ''}
+        private = '仅在指定私聊阶段可用的示例。'
+        gateway, _ = self.run_job('能聊聊示例主题吗？', replies=('这个嘛……',), verdict=verdict)
+        self.assertNotIn(private, gateway.chat_requests[0].messages[0]['content'])
         self.svc.force_stage(self.uid, 3)
-        gateway, _ = self.run_job('你有哥哥吗？你的父母呢？小时候发生过什么？', replies=('这个嘛……',),
-                                  verdict={'delta': 0, 'tag': 'neutral', 'advance_level': 0, 'mood': '',
-                                           'event_done': False, 'note': ''})
-        system = gateway.chat_requests[0].messages[0]['content']
-        self.assertIn('逐影', system)
-        self.assertIn('废墟', system)
+        gateway, _ = self.run_job('能聊聊示例主题吗？', replies=('这个嘛……',), verdict=verdict)
+        self.assertIn(private, gateway.chat_requests[0].messages[0]['content'])
 
     def test_forget_me_resets_relationship(self):
         self.svc.force_stage(self.uid, 2)
@@ -321,7 +317,7 @@ class PanelRelationshipTest(Base):
             self.assertIn(key, cfg['editable_keys'])
         current = dict(self.rt.config)
         validate_patch({'galgame_thresholds': [0, 20, 60, 120, 200, 290]}, current)
-        validate_patch({'galgame_exempt_ids': ['2332239652']}, current)
+        validate_patch({'galgame_exempt_ids': ['100000001']}, current)
         for bad in ({'galgame_thresholds': [0, 20, 60]},
                     {'galgame_thresholds': [0, 50, 10, 99, 100, 200]},
                     {'galgame_min_days': [0, 1, 3, 7, 14, -5]},
@@ -447,11 +443,13 @@ class ScoringFixTest(Base):
     def test_feeling_shows_today_progress(self):
         self._seed(affection=20.0, stage=1)
         rel = self.svc.load(self.uid)
-        rel.gain_today = 12.0
+        # 用当前阶段的日上限而不是写死 12：上限本身是可调的（2026-11-17 放宽到 14）
+        cap = int(self.svc.params().daily_cap[rel.stage])
+        rel.gain_today = float(cap)
         rel.last_day = time.strftime('%Y-%m-%d')
         self.svc.save(rel)
         text = self.svc.feeling(self.uid)
-        self.assertIn('+12/12', text)
+        self.assertIn(f'+{cap}/{cap}', text)
         self.assertIn('已经满啦', text)
 
     def test_feeling_ignores_yesterday_gain(self):
@@ -482,6 +480,85 @@ class ScoringFixTest(Base):
                                                                   'advance_level': 1, 'mood': '',
                                                                   'event_done': False, 'note': ''})
         self.assertNotEqual(out['tag'], 'spam', '跨天的重复不该算刷屏')
+
+
+class PromptEffectsTest(Base):
+    """拼 prompt 只读、回复发出后才提交：
+
+    以前 block_for() 每被调用一次就 event_turns += 1、把「刚升级」的演出用掉，
+    而 process_job 里越界重写会再拼一次 prompt —— 等于一轮吃两次。
+    """
+
+    def _seed_pending_event(self, stage=1):
+        rel = self.svc.load(self.uid)
+        rel.stage = stage
+        rel.affection = 60.0
+        rel.days_active = 30
+        rel.flags['pending_event'] = 'C'
+        rel.flags['event_turns'] = 0
+        rel.flags['stage_up_cue'] = stage
+        self.svc.save(rel)
+
+    def test_retry_does_not_double_consume_event_turns(self):
+        self._seed_pending_event()
+        msg = private_msg('嗯嗯', self.uid, FakeEvent())
+        self.svc.block_for(msg, consume=False)
+        self.svc.block_for(msg, consume=False)
+        rel = self.svc.load(self.uid)
+        self.assertEqual(0, int(rel.flags.get('event_turns') or 0),
+                         '只拼 prompt 不该推进事件轮次')
+        self.assertEqual(1, int(rel.flags.get('stage_up_cue') or 0),
+                         '只拼 prompt 不该吃掉升级演出')
+
+    def test_commit_after_delivery_consumes_once(self):
+        self._seed_pending_event()
+        msg = private_msg('嗯嗯', self.uid, FakeEvent())
+        self.svc.block_for(msg, consume=False)
+        self.svc.commit_prompt_effects(msg)
+        rel = self.svc.load(self.uid)
+        self.assertEqual(1, int(rel.flags.get('event_turns') or 0))
+        self.assertFalse(int(rel.flags.get('stage_up_cue') or 0))
+
+    def test_rejected_delivery_keeps_state(self):
+        """发失败了就不提交 —— 这一轮的状态留给下一次真正发出去的那一轮。"""
+        self._seed_pending_event()
+        self.rt.reply = lambda msg, text: SimpleNamespace(accepted=False, error='fixture reject')
+        gateway, event = self.run_job('嗯嗯', replies=())
+        rel = self.svc.load(self.uid)
+        self.assertEqual(0, len(event.sent), '被拒的投递不该真的发出去')
+        self.assertEqual(0, int(rel.flags.get('event_turns') or 0),
+                         '没发出去就不该推进事件轮次')
+        self.assertEqual(1, int(rel.flags.get('stage_up_cue') or 0),
+                         '没发出去就不该吃掉升级演出')
+
+    def test_prompt_builder_uses_readonly_block(self):
+        self._seed_pending_event(stage=2)
+        msg = private_msg('今天有点累', self.uid, FakeEvent())
+        prompt = self.rt.prompt_builder.build(msg)[0]['content']
+        self.assertIn('【这一轮你心里有件事】', prompt)
+        rel = self.svc.load(self.uid)
+        self.assertEqual(0, int(rel.flags.get('event_turns') or 0))
+
+
+class HighStageBudgetTest(Base):
+    """高好感放宽：阶段 4 起放宽上下文与截断，阶段 5 再放一档；群聊不享受。"""
+
+    def _render_len(self, stage, text_len=2000):
+        rel = self.svc.load(self.uid)
+        rel.stage = stage
+        rel.affection = min(300.0, float([0, 15, 50, 110, 190, 280][stage]) + 10)
+        rel.days_active = 60
+        self.svc.save(rel)
+        msg = private_msg('说点什么', self.uid, FakeEvent())
+        rendered = self.rt.renderer.render('字' * text_len, msg)
+        return len(rendered.text)
+
+    def test_higher_stage_gets_longer_replies(self):
+        low = self._render_len(0)
+        mid = self._render_len(4)
+        high = self._render_len(5)
+        self.assertGreater(mid, low, '阶段 4 的截断上限应当放宽')
+        self.assertGreater(high, mid, '阶段 5 再放宽一档')
 
 
 if __name__ == '__main__':

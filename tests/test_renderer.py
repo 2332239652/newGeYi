@@ -22,6 +22,8 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 # 与 test_config 一样：必须在 import newGeYi 之前把状态目录指到临时目录
 os.environ.setdefault('GEYI_DATA_DIR', tempfile.mkdtemp(prefix='geyi_render_tests_'))
@@ -33,6 +35,8 @@ from newGeYi.presentation.renderer import (  # noqa: E402
     looks_like_plan,
     op_codes_to_plain,
 )
+from newGeYi.routing import group_other_ai  # noqa: E402
+from newGeYi.storage.database import SQLiteStore  # noqa: E402
 
 # 线上原样（去掉了群号等无关内容）
 LEAK = (
@@ -235,6 +239,86 @@ class AtCodeTest(unittest.TestCase):
         out = self.renderer.render('（探头）在呢！', fake_msg())
         self.assertIsNotNone(out)
         self.assertEqual(out.text, '（探头）在呢！')
+
+
+class OtherAiNicknameTest(unittest.TestCase):
+    def setUp(self):
+        self.renderer = Renderer({})
+        self.store = SQLiteStore(':memory:')
+        self.addCleanup(self.store.close)
+        self.renderer.store = self.store
+        self.session = SESSION.as_text()
+        group_other_ai.add_entry(self.store, self.session, '1000000001', '小星')
+        self.msg = replace(fake_msg(), sender_name='小星')
+
+    def test_numeric_mentions_follow_high_and_off_modes(self):
+        for raw in ('【@1000000001】好呀', '@1000000001 好呀'):
+            with self.subTest(raw=raw):
+                group_other_ai.set_mode(self.store, self.session, '高')
+                self.assertEqual(self.renderer.render(raw, self.msg).text, '@小\u200b星 好呀')
+                group_other_ai.set_mode(self.store, self.session, '关')
+                self.assertEqual(self.renderer.render(raw, self.msg).text, '@小星 好呀')
+
+    def test_low_shares_one_allowance_between_mentions_and_body(self):
+        group_other_ai.set_mode(self.store, self.session, '低')
+        raw = '【@1000000001】小星[OP:at,id=1000000001]小星'
+        self.assertEqual(self.renderer.render(raw, self.msg).text,
+                         '@小星 小\u200b星[CQ:at,qq=1000000001]小\u200b星')
+        self.assertEqual(self.renderer.render('@1000000001 好呀', self.msg).text,
+                         '@小\u200b星 好呀')
+
+    def test_removed_emote_can_join_a_name_but_real_emote_separates_text(self):
+        raw = '小[EMOTE:小星]星'
+        image = '[CQ:image,file=file:///小星.png]'
+        with patch.object(self.renderer, 'emote_message', side_effect=['', image]):
+            self.assertEqual(self.renderer.render(raw, self.msg).text, '小\u200b星')
+            self.assertEqual(self.renderer.render(raw, self.msg).text, f'小{image}星')
+
+    def test_truncated_name_does_not_use_its_low_mode_allowance(self):
+        group_other_ai.set_mode(self.store, self.session, '低')
+        self.renderer.config['max_reply_chars'] = 4
+        self.assertEqual(self.renderer.render('你好，小星', self.msg).text, '你好，小…')
+        self.assertEqual(self.renderer.render('小星好呀', self.msg).text, '小星好呀')
+        self.assertEqual(self.renderer.render('小星好呀', self.msg).text, '小\u200b星好呀')
+
+    def test_action_like_nickname_still_masks_as_literal_text(self):
+        msg = replace(self.msg, sender_name='[EMOTE:小星]')
+        with patch.object(self.renderer, 'emote_message') as emote:
+            out = self.renderer.render('【@1000000001】好呀', msg)
+        emote.assert_not_called()
+        self.assertEqual(out.text, '@&#91;EMOTE:小\u200b星&#93; 好呀')
+
+    def test_audit_fallback_masks_even_inside_literal_action_like_text(self):
+        self.renderer.config['reply_audit_fallback'] = '[EMOTE:小星]'
+        for rejected in ('构思：这剧情太创了', 'password=12345678'):
+            with self.subTest(rejected=rejected):
+                self.assertEqual(self.renderer.render(rejected, self.msg).text,
+                                 '&#91;EMOTE:小\u200b星&#93;')
+
+
+class MultilineReplyTest(unittest.TestCase):
+    """群聊输出必须是一段，私聊仍保留显式分段。"""
+
+    def test_group_reply_collapses_all_newline_forms(self):
+        renderer = Renderer({'collapse_short_multiline': False})
+        raw = '第一句\r\n\r\n第二句\n第三句\r第四句'
+        out = renderer.render(raw, fake_msg())
+        self.assertIsNotNone(out)
+        self.assertNotIn('\n', out.text)
+        self.assertNotIn('\r', out.text)
+        self.assertEqual(out.text, '第一句 第二句 第三句 第四句')
+
+    def test_private_reply_keeps_intentional_paragraphs(self):
+        renderer = Renderer({'collapse_short_multiline': False})
+        private_session = SessionKey('hash', 'qq', 'onebot', 'private', '-', '1000000001')
+        msg = IncomingMessage(
+            session=private_session, message_id='1', sender_id='1000000001', sender_name='赛博刀子',
+            text='你好', raw_text='', is_group=False, mentioned_bot=False,
+            event=None, proc=None, arrival_seq=1, sender_is_bot=False,
+        )
+        out = renderer.render('第一段\n第二段', msg)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.text, '第一段\n第二段')
 
 
 if __name__ == '__main__':

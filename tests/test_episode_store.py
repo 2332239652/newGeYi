@@ -10,7 +10,7 @@ import unittest
 
 os.environ.setdefault('GEYI_DATA_DIR', tempfile.mkdtemp(prefix='geyi_episode_data_'))
 
-from newGeYi.memory.episodes import EpisodeMemory
+from newGeYi.memory.episodes import EpisodeMemory, _RESIDENT_MARK
 from newGeYi.storage.database import SQLiteStore
 
 SESSION = 'bot:qq:onebot:group:-:100'
@@ -336,7 +336,10 @@ class EpisodeStoreTest(unittest.TestCase):
     def test_recall_relevance_and_no_mutating_hits(self):
         rows = self.pair()
         self.apply(rows, [self.event(rows)], [self.commitment(rows)])
-        self.assertEqual('', self.episodes.build_block(SESSION, UID, 'chat', '量子计算论文'))
+        # 常驻名额：与当前消息没有共同二字词时，也会带上最近一条约定和一条共同经历
+        resident = self.episodes.build_block(SESSION, UID, 'chat', '量子计算论文')
+        self.assertEqual(2, resident.count(_RESIDENT_MARK))
+        self.assertNotIn('量子计算论文', resident)
         block = self.episodes.build_block(SESSION, UID, 'chat', '再做上次那个面包')
         self.assertIn('烤面包', block)
         self.assertIn('已答应', block)
@@ -402,7 +405,10 @@ class EpisodeStoreTest(unittest.TestCase):
         block = self.episodes.build_block(SESSION, UID, 'chat', '烤面包')
         self.assertIn('条件：如果明天天晴', block)
         self.assertIn('期限：明天', block)
-        self.assertEqual('', self.episodes.build_block(SESSION, UID, 'chat', '继续讲解数据库索引'))
+        # 无关续聊：只剩常驻名额里的那一条约定（本例没有共同经历可让位）
+        unrelated = self.episodes.build_block(SESSION, UID, 'chat', '继续讲解数据库索引')
+        self.assertEqual(1, unrelated.count(_RESIDENT_MARK))
+        self.assertNotIn('数据库索引', unrelated)
         self.assertEqual('', EpisodeMemory(self.store, {'memory_episodes_enabled': False}).build_block(SESSION, UID, 'chat', '面包'))
 
     def test_known_context_budget_keeps_json_valid(self):

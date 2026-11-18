@@ -398,7 +398,7 @@ class MemoryRepository:
         }
 
     def build_block(self, msg: IncomingMessage, max_chars: int | None = None,
-                    relation: dict | None = None) -> str:
+                    relation: dict | None = None, high_stage: int = 0) -> str:
         """拼成注入 system 的记忆块；注入过的条目会刷新命中时间。"""
         cfg = self.config
         if max_chars is None:
@@ -412,11 +412,22 @@ class MemoryRepository:
         # 新经历优先留出小而有界的空间，仍计入原记忆总预算。
         session = msg.session.as_text()
         space_id = getattr(msg, 'memory_space_id', '') or current_space(self.store, session)
+        # 高好感私聊：约定/经历这类"只有你们俩知道的事"才是她该多记的东西，
+        # 所以按阶段把经历块自身的预算与条数一起放宽（总预算仍受 max_chars 约束）。
+        eff_stage = high_stage or (int(relation['stage'])
+                                   if isinstance(relation, dict) and 'stage' in relation else 0)
+        if eff_stage >= 5:
+            ep_budget, ep_events, ep_commits, ep_res = min(2600, max_chars), 4, 4, 400
+        elif eff_stage == 4:
+            ep_budget, ep_events, ep_commits, ep_res = min(2000, max_chars), 3, 3, 300
+        else:
+            ep_budget, ep_events, ep_commits, ep_res = min(1200, max_chars), 2, 2, None
         episode_block = ''
         if cfg.get('memory_episodes_enabled', True) and max_chars > 0:
             episode_block = EpisodeMemory(self.store, cfg).build_block(
                 session, str(msg.sender_id), space_id, msg.text,
-                max_chars=min(1200, max_chars), max_events=2, max_commitments=2,
+                max_chars=ep_budget, max_events=ep_events, max_commitments=ep_commits,
+                resident_chars=ep_res,
             )
         # 旧 L1/L3 无篇章、参与者和证据：只在普通聊天作旧资料参考，不能给新剧情定案。
         if space_id != 'chat':

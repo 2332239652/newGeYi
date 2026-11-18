@@ -38,6 +38,7 @@ from ..presentation.renderer import Renderer, is_silent_reply, op_codes_to_plain
 from ..providers.llm_gateway import LLMGateway
 from ..relationship.service import RelationshipService
 from ..relationship.stages import audit_overstep
+from ..routing import group_other_ai
 from ..routing.attention import AttentionGate
 from ..routing.commands import CommandRouter
 from ..routing.message_router import MessageRouter
@@ -163,6 +164,10 @@ class Runtime:
         self.relationship = RelationshipService(
             self.config, self.store, self.gateway, self.worldbook, self.permissions)
         self.prompt_builder.relationship = self.relationship
+        # 渲染器也要知道关系阶段：高好感的私聊回复不该被 1200 字通用上限截断
+        self.renderer.relationship = self.relationship
+        # 群聊「其他 AI」名单也要在渲染层断词（见 routing/group_other_ai.py）
+        self.renderer.store = self.store
         self.curator.relationship = self.relationship
         self.prompt_builder.set_role_prompt(self.load_role_prompt())
         self.commands = CommandRouter(self)
@@ -275,9 +280,16 @@ class Runtime:
                     self.log(1, f'⚠ 配置文件缺少 {len(missing)} 个新字段（本次按默认值运行）：{shown}')
         except Exception:  # noqa: BLE001 - 打印路径失败不影响启动
             logger.exception('打印数据路径失败')
+        # 多渠道模式下每个 provider 可以独立持有 key；不能只看遗留的顶层 api_key。
+        provider_keys = self.config.get('providers')
+        has_provider_key = any(
+            isinstance(item, dict) and str(item.get('api_key', '') or '').strip()
+            for item in provider_keys
+        ) if isinstance(provider_keys, list) else False
         has_key = bool(
             os.environ.get('GEYI_API_KEY', '').strip()
             or str(self.config.get('api_key', '') or '').strip()
+            or has_provider_key
         )
         if not has_key:
             self.log(1, '未配置 API Key：可用「设置key <key>」指令，或环境变量 GEYI_API_KEY')
@@ -623,6 +635,19 @@ class Runtime:
                 arrival_seq=self._next_arrival_seq(),
                 sender_is_bot=self._is_bot_sender(sender_id, sender),
             )
+            # 群聊「其他 AI」防互触发：按本群档位决定是否整条丢弃——必须在命令、
+            # 上下文、记忆缓冲之前，否则它的指令会被当命令、它的话会被记进记忆。
+            # 高=名单 QQ 全丢；低=每个 QQ 30 分钟放行 1 条；关=不拦。
+            # 名单/时间戳读坏时 should_drop_message 自己 fail-open，这里再兜一层并留日志。
+            if msg.is_group:
+                try:
+                    other_ai = group_other_ai.should_drop_message(
+                        self.store, msg.session.as_text(), msg.sender_id)
+                except Exception:  # noqa: BLE001 - 名单坏了不能误滤正常群消息
+                    logger.warning('群其他AI过滤检查失败，本条按正常消息处理', exc_info=True)
+                    other_ai = False
+                if other_ai:
+                    return
             # 管理命令不进入聊天上下文；普通消息到达即写旁观窗口与记忆缓冲
             if self.commands.try_handle(msg):
                 return
@@ -650,7 +675,8 @@ class Runtime:
     def _freeze_message_space(self, msg: IncomingMessage) -> IncomingMessage:
         session_key = msg.session.as_text()
         with self.store.transaction():
-            ensure_space(self.store, session_key, is_story_mode(self.store, session_key, msg.sender_id))
+            # 只读本会话自己的开关：绝不能把发言者个人（或别的会话）的剧情模式带进当前会话
+            ensure_space(self.store, session_key, is_story_mode(self.store, session_key, ''))
             state = snapshot_space(self.store, session_key)
         return replace(msg, memory_space_id=state['space_id'], space_generation=state['generation'])
 
@@ -779,7 +805,7 @@ class Runtime:
         # 悄悄退回小额度，而空回复的锅会记到模型头上（实测踩过）。
         req = ModelRequest(
             messages=messages,
-            model=cfg.get('fast_model', 'gemini-3.8-flash-medium'),
+            model=cfg.get('fast_model', plugin_config.DEFAULT_CONFIG['fast_model']),
             temperature=float(cfg.get('fast_temperature', 0.7)),
             max_tokens=int(cfg.get('fast_max_tokens', 8192)),
         )
@@ -967,7 +993,7 @@ class Runtime:
             if not (text or '').strip():
                 # 空内容要显式记一笔。以前这里走的是「render 返回 None → 静默 return」，
                 # 没日志没回复，排查时看起来就像「她根本没反应」。
-                # 实测（2026-09 ginka + dsv4.1-flash）：思考模式关不掉，思维链会吃光
+                # 某些多模态模型的思考输出会占用
                 # max_tokens，**11 次调用有 6 次返回空 content**——额度给小了尤其严重。
                 logger.warning(
                     '模型返回空内容（思考链吃光 max_tokens=%s？）session=%s kind=%s',
@@ -1028,6 +1054,15 @@ class Runtime:
         delivery = self.reply(msg, rendered.text)
         if not delivery.accepted:
             return
+        # 回复真的发出去了，才提交这一轮 prompt 里一次性用掉的关系状态
+        # （stage_up_cue / event_turns / 轻度越界提示）。放在这里而不是拼 prompt 时，
+        # 是因为重试、空回复、发送失败都不该白吃掉「刚升级」的演出和事件轮次。
+        commit_prompt_effects = getattr(self.relationship, 'commit_prompt_effects', None)
+        if callable(commit_prompt_effects):
+            try:
+                commit_prompt_effects(msg, now=interaction_at)
+            except Exception:  # noqa: BLE001 - 记账失败不能影响已经发出去的回复
+                logger.exception('提交关系状态失败')
         # 发送完成后短事务复核代际并提交证据，遗忘不会夹在检查与落库之间。
         # 普通 OlivOS send 返回 None：这里只确认 API 无异常返回，未获得平台 ack。
         with self.store.transaction():

@@ -25,12 +25,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
 
 from ..config import BASE_DIR, SKIP_ACTIVE, get_data_dir, get_state_dir
 from ..models import IncomingMessage, RenderedReply
+from ..routing.group_other_ai import mask_other_ai_names
 
 logger = logging.getLogger('newGeYi.renderer')
 
@@ -525,8 +527,11 @@ def op_codes_to_plain(text: str, names: dict | None = None) -> str:
 
 
 class Renderer:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, relationship=None):
         self.config = config
+        # 关系服务（可为 None）：只用来问"这段关系到第几阶段了"，
+        # 好让高好感的私聊不被 1200 字的通用上限砍掉半句心里话。
+        self.relationship = relationship
         # 用户通过「加载立绘」加进来的图放 state 目录 —— 放 data/ 里的话，
         # OlivOS 每次重载都会把 data/ 整个删掉重建（见 config.get_state_dir 说明）
         self.emote_dir = get_state_dir() / 'emote'
@@ -553,6 +558,9 @@ class Renderer:
         self._emote_at: dict[str, list[float]] = {}      # 发图时间戳
         self._recent_replies: dict[str, list[bool]] = {}  # 最近几条回复带没带图
         self._lock = threading.Lock()
+        # 群聊「其他 AI」名单（由 Runtime 注入）：回复里登记过的昵称要断词，
+        # 免得被对方当成关键词再唤醒一次。为 None 时整段跳过（见 routing/group_other_ai.py）
+        self.store = None
 
     # ---------------- 立绘 ----------------
     def _candidates(self, key: str) -> list[str]:
@@ -743,6 +751,13 @@ class Renderer:
         # 静默标记：主动/被动一视同仁，绝不让它漏进群里
         if is_silent_reply(text):
             return None
+        session = msg.session.as_text()
+
+        def _mask_text(value: str, *, protected_re: re.Pattern[str] | None = None) -> str:
+            if msg.is_group:
+                return mask_other_ai_names(value, self.store, session, protected_re=protected_re)
+            return value
+
         # 写稿备忘/提纲（模型把「给自己的备忘」当台词说了）：整条不发。
         # 必须放在所有清洗**之前**，对原始输出判——清洗之后它就不是这个形状了。
         plan_leak = looks_like_plan(text)
@@ -750,7 +765,7 @@ class Renderer:
             logger.warning('回复像是「写稿备忘」而不是台词，整条不发（%s）：%r',
                            plan_leak, text.strip()[:160])
             fallback_text = str(self.config.get('reply_audit_fallback', '') or '').strip()
-            return RenderedReply(text=escape_message_text(fallback_text)) if fallback_text else None
+            return RenderedReply(text=escape_message_text(_mask_text(fallback_text))) if fallback_text else None
         # 去掉代码围栏
         text = FENCE_RE.sub('', text).strip()
         # 思考过程/思维链/草稿：剥除混入的思考过程，防止模型思维链漏出到群里
@@ -806,19 +821,17 @@ class Renderer:
                 logger.warning('回复被审计拦截（%s）：%r', hit, text[:120])
                 fallback = str(self.config.get('reply_audit_fallback', '') or '').strip()
                 if fallback or rest_hit:
-                    return RenderedReply(text=escape_message_text(fallback), rest_reason=rest_reason)
+                    return RenderedReply(text=escape_message_text(_mask_text(fallback)),
+                                         rest_reason=rest_reason)
                 return None
-        # 动作暂存为不可由输入伪造的标记；直到全部文本处理完才编码文本并还原动作。
-        # 昵称、模型正文、审计回退都属于文本，只有程序构造的当前用户 at / 立绘图是动作。
-        marker = '\ue000GEYI_ACTION'
-        untrusted = text + str(msg.sender_name or '') + ''.join(map(str, self.emote_table))
-        while marker in untrusted:
-            marker += '_'
+        # 动作和昵称都用临时标记避开清洗。每次渲染生成独立前缀，避免删除标签时拼出同名标记。
+        marker = '\ue000' + secrets.token_urlsafe(8)
         actions: dict[str, str] = {}
+        mentions: dict[str, str] = {}
 
-        def _action(code: str) -> str:
-            token = f'{marker}{len(actions)}\ue001'
-            actions[token] = code
+        def _placeholder(value: str, *, action: bool) -> str:
+            token = f'{marker}{len(actions) + len(mentions)}\ue001'
+            (actions if action else mentions)[token] = value
             return token
 
         at_used = False
@@ -833,7 +846,7 @@ class Renderer:
             if at_used:
                 return ''
             at_used = True
-            return _action(SEND_AT % escape_message_text(sender_id, parameter=True))
+            return _placeholder(SEND_AT % escape_message_text(sender_id, parameter=True), action=True)
 
         text = AT_TAG_RE.sub(_at_action, text)
         # 删除完整的模型码时保留边界空格，避免删除内层后重组出外层新码。
@@ -850,7 +863,7 @@ class Renderer:
             if token.isdigit():
                 if token == str(msg.sender_id) and msg.sender_name:
                     # 昵称先冻结成文本片段，避免其中的 EMOTE 等标记再次触发动作解析。
-                    shown = _action(escape_message_text('@' + msg.sender_name))
+                    shown = _placeholder('@' + msg.sender_name, action=False)
                 else:
                     shown = '@某用户'
             else:
@@ -863,14 +876,13 @@ class Renderer:
 
         text = AT_BRACKET_RE.sub(_at_text, text)
         text = AT_BARE_NUMBER_RE.sub(
-            lambda m: _action(escape_message_text('@' + msg.sender_name))
+            lambda m: _placeholder('@' + msg.sender_name, action=False)
             if (m.group(1) == str(msg.sender_id) and msg.sender_name) else '@某用户',
             text,
         )
         # 剥除称呼时误带的纯数字 QQ 账号（例如 "某人(1000000001)" -> "某人"）
         text = re.sub(r'\s*[（(]\s*\d{5,12}\s*[）)]', '', text)
         # 表情：一条消息最多一张，同一会话不连用同一张
-        session = msg.session.as_text()
         state = {'used': False}
 
         # 兼容处理：若模型误写成了【图片:名称】或[图片:名称]，自动纠正为 [EMOTE:名称]
@@ -888,20 +900,32 @@ class Renderer:
             op = self.emote_message(match.group(1), session=session)
             if op:
                 state['used'] = True
-            return _action(op) if op else ''
+            return _placeholder(op, action=True) if op else ''
 
         text = EMOTE_RE.sub(_emote, text)
         # 彻底清除模型输出的任何裸【图片】/【表情】/（图片）及【发送了表情包:...】占位文字，杜绝将占位符发进群聊
         text = re.sub(r'[【\[［(（]\s*(?:发送了(?:表情包|表情|图片|立绘|语音)|图片|表情|立绘|image|pic)[^】\]］)）]*[】\]］)）]', '', text)
         # 记一笔「这条回复带没带图」——节流的滑动窗口要用
         self._note_reply(session, state['used'])
-        # 形态整备：折叠空行、去掉重复的开头省略号（见方法上的说明）
-        text = self._tidy_reply(text, session)
+        # 形态整备：群聊统一成单段，私聊保留正常分段（见方法说明）。
+        text = self._tidy_reply(text, session, single_paragraph=msg.is_group)
         # 长度上限
         max_len = int(self.config.get('max_reply_chars', 1200))
+        # 高阶好感放宽：最亲密的阶段正是她会大段说心事的时候，
+        # 1200 字一刀切会把话截在半句——这是玩家最容易察觉的"她话到嘴边又咽回去"。
+        if max_len > 0 and not msg.is_group and self.relationship is not None:
+            try:
+                stage = self.relationship.stage_for(msg)
+            except Exception:  # noqa: BLE001 - 读不到阶段就按通用上限走
+                stage = None
+            if stage is not None:
+                if stage >= 5:
+                    max_len = int(max_len * 2)
+                elif stage >= 4:
+                    max_len = int(max_len * 1.5)
         if len(text) > max_len:
             # 截断落进动作/昵称标记时退回片段起点，避免发出半个内部标记。
-            for token in actions:
+            for token in (*actions, *mentions):
                 start = text.find(token)
                 if start >= 0 and start < max_len < start + len(token):
                     max_len = start
@@ -910,9 +934,13 @@ class Renderer:
         text = text.strip()
         if not text:
             return _drop()
-        # 终局文本编码发生在昵称回填、删除、整理和截断之后；深层嵌套即使重组也只显示文字。
-        # 按标记切片输出，替换出来的动作不再参与后续文本变换。
-        parts = re.split('(' + re.escape(marker) + r'\d+\ue001)', text)
+        # 回填可见昵称后统一断词，低档按整条回复记一次机会。只有真实动作切开文本。
+        for token, mention in mentions.items():
+            text = text.replace(token, mention)
+        action_re = re.compile('(' + '|'.join(map(re.escape, actions)) + ')') if actions else None
+        text = _mask_text(text, protected_re=action_re)
+        # 编码用户可见文本，再原样还原程序动作。
+        parts = action_re.split(text) if action_re is not None else [text]
         text = ''.join(actions[part] if part in actions else escape_message_text(part) for part in parts)
         return RenderedReply(text=text, voice_payload=voice_payload,
                              rest_reason=rest_reason)
@@ -924,26 +952,28 @@ class Renderer:
     _ELLIPSIS_HEAD_RE = re.compile(r'^\s*(?:…{1,}|\.{3,}|。{2,})+\s*')
     _BLANK_LINE_RE = re.compile(r'\n\s*\n+')
 
-    def _tidy_reply(self, text: str, session: str) -> str:
+    def _tidy_reply(self, text: str, session: str, *, single_paragraph: bool = False) -> str:
         """把模型输出整成「一条聊天消息」的样子。
 
-        ① **折叠空行**：模型爱写成好几个段落，中间还空行，在 QQ 里看着像刷屏。
-           连续空行压成一个换行，行首行尾的空白也去掉。
+        群聊中的一条回复统一压成单段，避免模型把草稿式多行文本直接显示成
+        多条视觉消息；私聊仍按配置保留正常分段。
+        ① **折叠空行**：连续空行压成一个换行，行首行尾的空白也去掉。
         ② **剥掉重复的开头省略号**：她连着两条都以「……」开头就太假了。
-           上一条已经这么开头、这条又是，就把这条开头的省略号去掉
-           （首部省略号只是语气，剥掉不损失信息：「……嗯。」→「嗯。」）。
         ③ **剥掉结尾句号**：中文聊天里句号看着像生气或者冷淡，真人几乎不打。
-           这是中文 IM 的硬约定，模型十有八九会带，所以用代码剥。
         """
         if not text:
             return text
-        # ① 空行折叠与两段式短句合并（防两截式回复刷屏）
+        # ① 先统一换行编码，再折叠空行与两段式短句，避免裸 CR 绕过 split('\n')。
+        text = str(text).replace('\r\n', '\n').replace('\r', '\n')
         text = self._BLANK_LINE_RE.sub('\n', text)
-        if self.config.get('collapse_short_multiline', False):
-            lines = [line.strip() for line in text.split('\n') if line.strip()]
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        if single_paragraph:
+            # 群聊的一条回复就是一段；模型的普通换行不能变成多条视觉消息。
+            text = ' '.join(lines)
+        elif self.config.get('collapse_short_multiline', False):
             if len(lines) == 2 and len(text) < 70 and not any(lines[0].startswith(c) for c in ('-', '*', '1.', '2.')):
                 punc = ('，', '。', '！', '？', '…', '~', '、', ',', '!', '?')
-                first, second = lines[0], lines[1]
+                first, second = lines
                 if first.endswith(punc):
                     text = f'{first} {second}'
                 else:
@@ -951,8 +981,8 @@ class Renderer:
             else:
                 text = '\n'.join(lines)
         else:
-            text = '\n'.join(line.strip() for line in text.split('\n'))
-        text = text.strip('\n')
+            text = '\n'.join(lines)
+        text = text.strip()
         if not text:
             return text
         # ② 重复的开头省略号
